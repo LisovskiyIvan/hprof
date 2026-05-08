@@ -1,0 +1,13 @@
+{
+  "name": "@hprof/ui",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/server/index.ts",
+  "types": "src/server/index.ts",
+  "exports": {
+    ".": "./src/server/index.ts"
+  },
+  "dependencies": {
+    "@hprof/core": "workspace:*"
+  }
+}
