@@ -113,11 +113,13 @@ export function parseSnapshotMeta(filePath: string): HeapSnapshotMeta {
 
 export async function streamHeapSnapshotSummary(
   filePath: string,
-  options?: { top?: number; filter?: string },
+  options?: { top?: number; filter?: string; onProgress?: (phase: string, pct: number) => void },
 ): Promise<HeapSnapshotSummary> {
   const top = options?.top ?? 30;
   const filterRe = options?.filter ? new RegExp(options.filter, "i") : null;
+  const onProgress = options?.onProgress;
   const snapshot = parseSnapshotMeta(filePath);
+  const fileSize = fs.statSync(filePath).size;
 
   const nodeFields = snapshot.meta.node_fields;
   const nodeTypes = snapshot.meta.node_types[0]!;
@@ -147,8 +149,17 @@ export async function streamHeapSnapshotSummary(
   const topNames = new Map<number, string>();
 
   const stream = fs.createReadStream(filePath, { encoding: "utf8" });
+  let bytesRead = 0;
+  let lastProgressPct = -1;
 
   for await (const chunk of stream) {
+    bytesRead += chunk.length;
+    const pct = Math.floor((bytesRead / fileSize) * 100);
+    if (onProgress && pct !== lastProgressPct) {
+      lastProgressPct = pct;
+      const phase = mode === "seekNodes" || mode === "parseNodes" ? "nodes" : mode === "seekStrings" || mode === "parseStrings" ? "strings" : "done";
+      onProgress(phase, pct);
+    }
     let i = 0;
     while (i < chunk.length) {
       if (mode === "seekNodes") {
@@ -340,4 +351,110 @@ export async function parseHeapSnapshot(
   }
 
   return { meta, nodes, edges, strings: raw.strings };
+}
+
+export function buildRetainedSize(snapshot: HeapSnapshotResult): number[] {
+  const { nodes, edges } = snapshot;
+  const nodeCount = nodes.length;
+
+  const postOrder = new Int32Array(nodeCount);
+  const visited = new Uint8Array(nodeCount);
+  let postIdx = 0;
+
+  const stack: number[] = [0];
+  while (stack.length > 0) {
+    const nodeIdx = stack.pop()!;
+    if (nodeIdx < 0) {
+      postOrder[postIdx++] = ~nodeIdx;
+      continue;
+    }
+    if (visited[nodeIdx]) continue;
+    visited[nodeIdx] = 1;
+    stack.push(~nodeIdx);
+    let edgeOffset = 0;
+    for (let i = 0; i < nodeIdx; i++) {
+      edgeOffset += nodes[i]!.edgeCount;
+    }
+    for (let e = 0; e < nodes[nodeIdx]!.edgeCount; e++) {
+      const toNode = edges[edgeOffset + e]!.toNode;
+      if (toNode >= 0 && toNode < nodeCount && !visited[toNode]) {
+        stack.push(toNode);
+      }
+    }
+  }
+
+  const idoms = new Int32Array(nodeCount).fill(-1);
+  idoms[0] = 0;
+
+  const succs: number[][] = Array.from({ length: nodeCount }, () => []);
+  for (let n = 0; n < nodeCount; n++) {
+    let edgeOffset = 0;
+    for (let i = 0; i < n; i++) {
+      edgeOffset += nodes[i]!.edgeCount;
+    }
+    for (let e = 0; e < nodes[n]!.edgeCount; e++) {
+      const toNode = edges[edgeOffset + e]!.toNode;
+      if (toNode >= 0 && toNode < nodeCount) {
+        succs[n]!.push(toNode);
+      }
+    }
+  }
+
+  const preds: number[][] = Array.from({ length: nodeCount }, () => []);
+  for (let n = 0; n < nodeCount; n++) {
+    for (const s of succs[n]!) {
+      preds[s]!.push(n);
+    }
+  }
+
+  function intersect(a: number, b: number): number {
+    let finger1 = a;
+    let finger2 = b;
+    while (finger1 !== finger2) {
+      while (finger1 > finger2) finger1 = idoms[finger1]!;
+      while (finger2 > finger1) finger2 = idoms[finger2]!;
+    }
+    return finger1;
+  }
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let i = postIdx - 1; i >= 0; i--) {
+      const n = postOrder[i]!;
+      if (n === 0) continue;
+      const predList = preds[n]!;
+      if (!predList || predList.length === 0) continue;
+
+      let newIdom = -1;
+      for (const p of predList) {
+        if (idoms[p] === -1) continue;
+        if (newIdom === -1) {
+          newIdom = p;
+        } else {
+          newIdom = intersect(newIdom, p);
+        }
+      }
+      if (newIdom !== -1 && idoms[n] !== newIdom) {
+        idoms[n] = newIdom;
+        changed = true;
+      }
+    }
+  }
+
+  const retained = new Float64Array(nodeCount);
+  for (let i = 0; i < nodeCount; i++) {
+    retained[i] = nodes[i]!.selfSize;
+  }
+
+  for (let i = 0; i < postIdx; i++) {
+    const n = postOrder[i]!;
+    if (n === 0) continue;
+    const dom = idoms[n]!;
+    if (dom >= 0 && dom < nodeCount) {
+      retained[dom]! += retained[n]!;
+    }
+  }
+
+  return Array.from(retained);
 }

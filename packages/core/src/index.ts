@@ -49,6 +49,7 @@ export {
   parseSnapshotMeta,
   streamHeapSnapshotSummary,
   parseHeapSnapshot,
+  buildRetainedSize,
 } from "./heapsnapshot.ts";
 export type {
   HeapSnapshotMeta,

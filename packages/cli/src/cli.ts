@@ -11,26 +11,55 @@ import {
 } from "@hprof/core";
 import type { ProfileType } from "@hprof/core";
 
+const C = {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  cyan: "\x1b[36m",
+  yellow: "\x1b[33m",
+  green: "\x1b[32m",
+  red: "\x1b[31m",
+  magenta: "\x1b[35m",
+  blue: "\x1b[34m",
+  gray: "\x1b[90m",
+};
+
+function bold(s: string) { return `${C.bold}${s}${C.reset}`; }
+function cyan(s: string) { return `${C.cyan}${s}${C.reset}`; }
+function yellow(s: string) { return `${C.yellow}${s}${C.reset}`; }
+function green(s: string) { return `${C.green}${s}${C.reset}`; }
+function red(s: string) { return `${C.red}${s}${C.reset}`; }
+function dim(s: string) { return `${C.dim}${s}${C.reset}`; }
+function magenta(s: string) { return `${C.magenta}${s}${C.reset}`; }
+function gray(s: string) { return `${C.gray}${s}${C.reset}`; }
+
+function progressBar(pct: number, phase: string, width = 30) {
+  const filled = Math.round((pct / 100) * width);
+  const bar = "█".repeat(filled) + "░".repeat(width - filled);
+  process.stderr.write(`\r  ${dim(phase.padEnd(10))} ${bar} ${pct}%`);
+  if (pct >= 100) process.stderr.write("\n");
+}
+
 function printUsage() {
   console.log(`
-Usage: hprof <command> [options] <file>
+${bold("Usage:")} hprof <command> [options] <file>
 
-Commands:
-  analyze   Analyze profile file and print summary to stdout (default)
-  ui        Start web UI server for interactive analysis
-  help      Show this help message
+${bold("Commands:")}
+  ${cyan("analyze")}   Analyze profile file and print summary to stdout (default)
+  ${cyan("ui")}        Start web UI server for interactive analysis
+  ${cyan("help")}      Show this help message
 
-Options:
-  --top <n>       Number of top entries to show (default: 30)
-  --filter <re>   Filter results by regex
-  --json          Output as JSON
-  --port <port>   Port for UI server (default: 3000)
-  --open          Open browser automatically (ui command only)
+${bold("Options:")}
+  ${yellow("--top <n>")}       Number of top entries to show (default: 30)
+  ${yellow("--filter <re>")}   Filter results by regex
+  ${yellow("--json")}          Output as JSON
+  ${yellow("--port <port>")}   Port for UI server (default: 3000)
+  ${yellow("--open")}          Open browser automatically (ui command only)
 
-Supported formats:
-  .heapsnapshot   V8 heap snapshot
-  .heapprofile    V8 sampling heap profile
-  .heaptimeline   V8 heap allocation timeline
+${bold("Supported formats:")}
+  ${green(".heapsnapshot")}   V8 heap snapshot
+  ${green(".heapprofile")}    V8 sampling heap profile
+  ${green(".heaptimeline")}   V8 heap allocation timeline
 `);
 }
 
@@ -77,17 +106,32 @@ function parseArgs(argv: string[]): CliArgs {
   return args;
 }
 
-function printSection(title: string, rows: Record<string, string>[]) {
-  console.log(`\n${title}`);
-  if (!rows.length) {
-    console.log("  (empty)");
-    return;
-  }
+function printTable(headers: string[], rows: string[][]) {
+  const widths = headers.map((h, i) =>
+    Math.max(
+      h.length,
+      ...rows.map((r) => (r[i] ?? "").length),
+    ),
+  );
+
+  const headerLine = headers
+    .map((h, i) => h.padEnd(widths[i]!))
+    .join("  ");
+  console.log(`  ${dim(headerLine)}`);
+  console.log(`  ${dim("─".repeat(headerLine.length))}`);
 
   for (const row of rows) {
-    const parts = Object.entries(row).map(([key, value]) => `${key}=${value}`);
-    console.log(`  ${parts.join(" | ")}`);
+    const line = row
+      .map((cell, i) => cell.padEnd(widths[i]!))
+      .join("  ");
+    console.log(`  ${line}`);
   }
+}
+
+function printHeader(title: string, subtitle?: string) {
+  console.log();
+  console.log(`  ${bold(cyan(title))}`);
+  if (subtitle) console.log(`  ${dim(subtitle)}`);
 }
 
 function analyzeHeapProfile(filePath: string, args: CliArgs) {
@@ -98,28 +142,41 @@ function analyzeHeapProfile(filePath: string, args: CliArgs) {
   });
 
   if (args.json) {
-    const obj = {
+    console.log(JSON.stringify({
       file: filePath,
       type: "heapprofile" as ProfileType,
       totalSize: summary.totalSize,
       byFrame: [...summary.byFrame.entries()],
       byUrl: [...summary.byUrl.entries()],
       byFunction: [...summary.byFunction.entries()],
-    };
-    console.log(JSON.stringify(obj, null, 2));
+    }, null, 2));
     return;
   }
 
   const toRows = (map: Map<string, number>) =>
     [...map.entries()]
       .sort((a, b) => b[1] - a[1])
-      .map(([key, size]) => ({ size: formatBytes(size), key }));
+      .slice(0, args.top);
 
-  console.log(`\n=== ${filePath} (heapprofile) ===`);
-  console.log(`totalSize=${formatBytes(summary.totalSize)}`);
-  printSection("Top Frames", toRows(summary.byFrame));
-  printSection("Top URLs", toRows(summary.byUrl));
-  printSection("Top Functions", toRows(summary.byFunction));
+  printHeader(filePath, `heapprofile | total sampled: ${yellow(formatBytes(summary.totalSize))}`);
+
+  const frameRows = toRows(summary.byFrame);
+  printTable(
+    ["SIZE", "FRAME"],
+    frameRows.map(([key, size]) => [green(formatBytes(size)), key]),
+  );
+
+  const urlRows = toRows(summary.byUrl);
+  printTable(
+    ["SIZE", "URL"],
+    urlRows.map(([key, size]) => [green(formatBytes(size)), gray(key)]),
+  );
+
+  const fnRows = toRows(summary.byFunction);
+  printTable(
+    ["SIZE", "FUNCTION"],
+    fnRows.map(([key, size]) => [green(formatBytes(size)), magenta(key)]),
+  );
 }
 
 async function analyzeHeapSnapshot(filePath: string, args: CliArgs) {
@@ -127,10 +184,11 @@ async function analyzeHeapSnapshot(filePath: string, args: CliArgs) {
   const summary = await streamHeapSnapshotSummary(filePath, {
     top: args.top,
     filter: args.filter ?? undefined,
+    onProgress: args.json ? undefined : (phase, pct) => progressBar(pct, phase),
   });
 
   if (args.json) {
-    const obj = {
+    console.log(JSON.stringify({
       file: filePath,
       type: "heapsnapshot" as ProfileType,
       nodeCount: meta.node_count,
@@ -139,41 +197,46 @@ async function analyzeHeapSnapshot(filePath: string, args: CliArgs) {
       totalSize: summary.totalSize,
       totalCount: summary.totalCount,
       byNodeName: [...summary.byNodeName.entries()].map(([name, info]) => ({
-        name,
-        size: info.size,
-        count: info.count,
+        name, size: info.size, count: info.count,
       })),
       byNodeType: [...summary.byNodeType.entries()].map(([type, info]) => ({
-        type,
-        size: info.size,
-        count: info.count,
+        type, size: info.size, count: info.count,
       })),
-    };
-    console.log(JSON.stringify(obj, null, 2));
+    }, null, 2));
     return;
   }
 
-  console.log(`\n=== ${filePath} (heapsnapshot) ===`);
-  console.log(
-    `node_count=${meta.node_count} | edge_count=${meta.edge_count} | extra_native_bytes=${formatBytes(meta.extra_native_bytes ?? 0)}`,
+  printHeader(
+    filePath,
+    [
+      `heapsnapshot`,
+      `nodes: ${bold(meta.node_count.toLocaleString())}`,
+      `edges: ${bold(meta.edge_count.toLocaleString())}`,
+      `total self size: ${yellow(formatBytes(summary.totalSize))}`,
+    ].join(" | "),
   );
 
-  const nameRows = [...summary.byNodeName.entries()].map(([name, info]) => ({
-    size: formatBytes(info.size),
-    count: String(info.count),
-    name,
-  }));
-  printSection("Top Node Names By Self Size", nameRows);
+  const nameRows = [...summary.byNodeName.entries()].slice(0, args.top);
+  printTable(
+    ["SIZE", "COUNT", "NAME"],
+    nameRows.map(([name, info]) => [
+      green(formatBytes(info.size)),
+      dim(String(info.count)),
+      name,
+    ]),
+  );
 
   const typeRows = [...summary.byNodeType.entries()]
     .sort((a, b) => b[1].size - a[1].size)
-    .slice(0, args.top)
-    .map(([type, info]) => ({
-      size: formatBytes(info.size),
-      count: String(info.count),
-      type,
-    }));
-  printSection("Top Node Types By Self Size", typeRows);
+    .slice(0, args.top);
+  printTable(
+    ["SIZE", "COUNT", "TYPE"],
+    typeRows.map(([type, info]) => [
+      green(formatBytes(info.size)),
+      dim(String(info.count)),
+      magenta(type),
+    ]),
+  );
 }
 
 async function analyzeHeapTimeline(filePath: string, args: CliArgs) {
@@ -184,7 +247,7 @@ async function analyzeHeapTimeline(filePath: string, args: CliArgs) {
   });
 
   if (args.json) {
-    const obj = {
+    console.log(JSON.stringify({
       file: filePath,
       type: "heaptimeline" as ProfileType,
       nodeCount: meta.node_count,
@@ -192,27 +255,30 @@ async function analyzeHeapTimeline(filePath: string, args: CliArgs) {
       totalAllocated: summary.totalAllocated,
       totalFreed: summary.totalFreed,
       byType: [...summary.byType.entries()].map(([type, info]) => ({
-        type,
-        allocated: info.allocated,
-        freed: info.freed,
-        count: info.count,
+        type, allocated: info.allocated, freed: info.freed, count: info.count,
       })),
-    };
-    console.log(JSON.stringify(obj, null, 2));
+    }, null, 2));
     return;
   }
 
-  console.log(`\n=== ${filePath} (heaptimeline) ===`);
-  console.log(
-    `node_count=${meta.node_count} | edge_count=${meta.edge_count} | total_allocated=${formatBytes(summary.totalAllocated)}`,
+  printHeader(
+    filePath,
+    [
+      `heaptimeline`,
+      `nodes: ${bold(meta.node_count.toLocaleString())}`,
+      `total allocated: ${yellow(formatBytes(summary.totalAllocated))}`,
+    ].join(" | "),
   );
 
-  const typeRows = [...summary.byType.entries()].map(([type, info]) => ({
-    allocated: formatBytes(info.allocated),
-    count: String(info.count),
-    type,
-  }));
-  printSection("Allocations By Type", typeRows);
+  const typeRows = [...summary.byType.entries()].slice(0, args.top);
+  printTable(
+    ["ALLOCATED", "COUNT", "TYPE"],
+    typeRows.map(([type, info]) => [
+      green(formatBytes(info.allocated)),
+      dim(String(info.count)),
+      magenta(type),
+    ]),
+  );
 }
 
 async function main() {
@@ -249,13 +315,13 @@ async function main() {
             break;
         }
       } catch (err) {
-        console.error(`Error analyzing ${file}: ${(err as Error).message}`);
+        console.error(`  ${red("Error:")} ${(err as Error).message}`);
       }
     }
   }
 }
 
 main().catch((err) => {
-  console.error(err.message);
+  console.error(`${red("Error:")} ${err.message}`);
   process.exit(1);
 });

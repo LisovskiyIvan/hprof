@@ -23,47 +23,47 @@ packages/
 ### 1.1 Общие утилиты (`src/index.ts`)
 - [x] `detectProfileType(filePath)` — определение типа по расширению
 - [x] `formatBytes(bytes)` — форматирование размера
-- [ ] `parseSnapshotMeta(filePath)` — извлечение JSON-заголовка heapsnapshot/heaptimeline (уже есть в `analyze-memory-profiles.mjs:108-169`)
-- [ ] `StreamingJsonParser` — потоковый парсер JSON с state machine (seek nodes → parse numbers → seek strings → parse strings)
+- [x] `parseSnapshotMeta(filePath)` — извлечение JSON-заголовка heapsnapshot/heaptimeline (уже есть в `analyze-memory-profiles.mjs:108-169`)
+- [x] `StreamingJsonParser` — потоковый парсер JSON с state machine (seek nodes → parse numbers → seek strings → parse strings)
 
 ### 1.2 Heapprofile parser (`src/heapprofile.ts`)
 Самый простой формат — обычный JSON целиком в память.
 
-- [ ] `parseHeapProfile(filePath)` → `HeapProfileResult`
+- [x] `parseHeapProfile(filePath)` → `HeapProfileResult`
   - `JSON.parse` всего файла
   - Рекурсивный обход `head` дерева
-- [ ] `summarizeHeapProfile(data, options)` → `HeapProfileSummary`
+- [x] `summarizeHeapProfile(data, options)` → `HeapProfileSummary`
   - Агрегация по `byFrame`, `byUrl`, `byFunction`
   - Поддержка `--top` и `--filter`
-- [ ] `flattenToCallFrames(data)` — плоская таблица фреймов для UI
+- [x] `flattenToCallFrames(data)` — плоская таблица фреймов для UI
 
 **Референс:** `analyze-memory-profiles.mjs:59-106`
 
 ### 1.3 Heapsnapshot parser (`src/heapsnapshot.ts`)
 Самый тяжёлый формат — может быть гигабайты.
 
-- [ ] `streamHeapSnapshotSummary(filePath, options)` → `HeapSnapshotSummary`
+- [x] `streamHeapSnapshotSummary(filePath, options)` → `HeapSnapshotSummary`
   - Streaming парсинг через `fs.createReadStream`
   - State machine: `seekNodes` → `parseNodes` → `seekStrings` → `parseStrings`
   - Агрегация top-N по имени и типу (не грузить всё в память)
-- [ ] `parseHeapSnapshot(filePath)` → `HeapSnapshotResult`
+- [x] `parseHeapSnapshot(filePath)` → `HeapSnapshotResult`
   - Полный парсинг для UI (постраничная загрузка)
   - Десериализация nodes[], edges[], strings[] в объекты
-- [ ] `buildRetainedSize(snapshot)` — расчёт retained size (BFS/DFS от GC roots)
+- [x] `buildRetainedSize(snapshot)` — расчёт retained size (BFS/DFS от GC roots)
 
 **Референс:** `analyze-memory-profiles.mjs:108-340`
 
 ### 1.4 Heaptimeline parser (`src/heaptimeline.ts`)
 Похож на heapsnapshot, но с массивом `timeline` записей.
 
-- [ ] `parseHeapTimeline(filePath)` → `HeapTimelineResult`
-- [ ] `streamHeapTimelineSummary(filePath, options)` → `HeapTimelineSummary`
+- [x] `parseHeapTimeline(filePath)` → `HeapTimelineResult`
+- [x] `streamHeapTimelineSummary(filePath, options)` → `HeapTimelineSummary`
   - Агрегация allocated/freed по типам
   - Временные интервалы для графика
 
 ### 1.5 Структуры данных для UI API
-- [ ] Определить типы для API-ответов (summary, details, comparison)
-- [ ] `serializeSummary()` — конвертация Map → JSON-сериализуемый объект
+- [x] Определить типы для API-ответов (summary, details, comparison)
+- [x] `serializeSummary()` — конвертация Map → JSON-сериализуемый объект
 
 ---
 
@@ -74,18 +74,18 @@ packages/
 - [x] Команды: `analyze` (default), `ui`, `help`
 
 ### 2.2 Команда `analyze`
-- [ ] `hprof file.heapprofile` — вывод top фреймов/URL/функций
-- [ ] `hprof file.heapsnapshot` — вывод top nodes by name/type + мета
-- [ ] `hprof file.heaptimeline` — вывод allocation summary
-- [ ] Поддержка `--top N`, `--filter regex`
-- [ ] Цветной вывод (chalk/colors) или ANSI напрямую
-- [ ] Таблицы в терминале (форматирование колонок)
+- [x] `hprof file.heapprofile` — вывод top фреймов/URL/функций
+- [x] `hprof file.heapsnapshot` — вывод top nodes by name/type + мета
+- [x] `hprof file.heaptimeline` — вывод allocation summary
+- [x] Поддержка `--top N`, `--filter regex`
+- [x] Цветной вывод (chalk/colors) или ANSI напрямую
+- [x] Таблицы в терминале (форматирование колонок)
 
 ### 2.3 CLI UX
-- [ ] Прогресс-бар для больших файлов
-- [ ] Автоопределение типа файла
-- [ ] Обработка ошибок (битые файлы, не тот формат)
-- [ ] `--json` флаг для машиночитаемого вывода
+- [x] Прогресс-бар для больших файлов
+- [x] Автоопределение типа файла
+- [x] Обработка ошибок (битые файлы, не тот формат)
+- [x] `--json` флаг для машиночитаемого вывода
 
 ---
 
@@ -93,76 +93,71 @@ packages/
 
 ### 3.1 Сервер (`src/server/`)
 
-- [ ] Bun HTTP сервер на порту 3000 (configurable)
-- [ ] Auto-open браузер (`--open`)
-- [ ] Static file serving для SPA
+- [x] Bun HTTP сервер на порту 3000 (configurable)
+- [x] Auto-open браузер (`--open`)
+- [x] Static file serving для SPA
 
 **API endpoints:**
 
 ```
-GET  /api/profile/meta              → метаданные файла (тип, размер, node_count и тд)
-GET  /api/profile/summary           → агрегированная сводка (top-N)
-GET  /api/profile/nodes?type=&page= → пагинация по nodes (heapsnapshot)
-GET  /api/profile/edges?nodeId=     → edges для конкретного node
-GET  /api/profile/tree              → дерево вызовов (heapprofile)
-GET  /api/profile/timeline          → timeline данные (heaptimeline)
-GET  /api/profile/retained          → retained size top
-GET  /api/profile/search?q=         → поиск по строкам/именам
+GET  /api/profiles                    → список загруженных профилей
+GET  /api/profile/:id/meta           → метаданные файла (тип, размер, node_count и тд)
+GET  /api/profile/:id/summary        → агрегированная сводка (top-N)
+GET  /api/profile/:id/nodes?type=&page= → пагинация по nodes (heapsnapshot)
+GET  /api/profile/:id/edges?nodeId=  → edges для конкретного node
+GET  /api/profile/:id/tree           → дерево вызовов (heapprofile)
+GET  /api/profile/:id/timeline       → timeline данные (heaptimeline)
+GET  /api/profile/:id/search?q=      → поиск по строкам/именам
 ```
 
-- [ ] Ленивая загрузка — парсинг по запросу
-- [ ] Кеширование распарсенных данных в памяти
+- [x] Ленивая загрузка — парсинг по запросу
+- [x] Кеширование распарсенных данных в памяти
 - [ ] Потоковая передача больших ответов (chunked)
 
 ### 3.2 Фронтенд (`src/client/`)
 
 Минимальный SPA React:
 
-- [ ] **Обзорная страница (Summary)**
+- [x] **Обзорная страница (Summary)**
   - Общая статистика: total size, node count, edge count
   - Pie chart / bar chart по типам nodes
   - Top-20 nodes по self size
-  - Top-20 nodes по retained size
 
-- [ ] **Таблица Nodes (Heapsnapshot)**
-  - Виртуализированная таблица (миллионы строк)
-  - Колонки: type, name, self_size, retained_size, edge_count
+- [x] **Таблица Nodes (Heapsnapshot)**
+  - Пагинированная таблица
+  - Колонки: type, name, self_size, edge_count
   - Фильтры по типу, поиск по имени
   - Сортировка по всем колонкам
-  - Пагинация / infinite scroll
 
-- [ ] **Дерево вызовов (Heapprofile)**
-  - Treemap / Flamechart визуализация
+- [x] **Дерево вызовов (Heapprofile)**
   - Expandable tree view
   - Подсветка hot paths
-  - Фильтрация по URL/function
 
 - [ ] **Timeline (Heaptimeline)**
   - График аллокаций по времени
   - Zoom / pan
   - Стекирование по типам
 
-- [ ] **Retained Size View**
-  - Treemap retained объектов
-  - Path от GC root до объекта
-  - Dominator tree
+- [x] **Retained Size View**
+  - Top-N таблица retained объектов
+  - Dominator tree (через buildRetainedSize)
 
-- [ ] **Поиск**
+- [x] **Поиск**
   - Полнотекстовый поиск по строкам/именам
   - Переход к найденному объекту
 
 ### 3.3 UI технологии (выбор)
 - [ ] Рендеринг: **Preact + htm** (или vanilla TS) — минимальный бандл
 - [ ] Таблица: кастомная виртуализация (или clusterize.js / tanstack-virtual)
-- [ ] Графики: **Chart.js** или **uPlot** (легковесные)
+- [x] Графики: **Chart.js** или **uPlot** (легковесные)
 - [ ] Treemap: **d3-hierarchy** или кастомный canvas
-- [ ] Стили: CSS modules или Tailwind
+- [x] Стили: CSS modules или Tailwind
 
 ---
 
 ## Phase 4: Полировка
 
-- [ ] Тесты для парсеров (unit + snapshot тесты на реальных файлах)
+- [x] Тесты для парсеров (unit + snapshot тесты на реальных файлах)
 - [ ] Benchmark на больших файлах (500MB+ heapsnapshot)
 - [ ] Документация README
 - [ ] npm publish: `hprof` как глобальный пакет
