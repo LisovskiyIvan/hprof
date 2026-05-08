@@ -116,7 +116,7 @@ GET  /api/profile/search?q=         → поиск по строкам/имен�
 
 ### 3.2 Фронтенд (`src/client/`)
 
-Минимальный SPA без фреймворка (vanilla + htm/preact или solid):
+Минимальный SPA React:
 
 - [ ] **Обзорная страница (Summary)**
   - Общая статистика: total size, node count, edge count
