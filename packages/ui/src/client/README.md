@@ -1,20 +1,33 @@
-# Dayme
+# hprof UI Client
 
-Dayme - это простой и современный шаблон для быстрого старта React-приложений.
+React frontend for the `hprof` web UI.
 
-## Особенности
+## Install
 
-- ⚡️ [Vite](https://vitejs.dev/) - сверхбыстрый инструмент сборки
-- ⚛️ [React](https://react.dev/) 
-- 🎨 [Tailwind CSS](https://tailwindcss.com/) для стилизации
-- 📝 [TypeScript](https://www.typescriptlang.org/) для типобезопасности
-- 🔄 [React Router](https://reactrouter.com/) для маршрутизации
+```bash
+bun install
+```
 
-## Начало работы
+## Local development
 
-npm i
-npm run dev
+Start the profile API server from the repository root:
 
-## Автор
+```bash
+bun packages/cli/src/cli.ts ui snapshots/Heap-20260508T151623.heapsnapshot
+```
 
-[Dayme](https://daymedead.fun)
+Then start the Vite dev server in this directory:
+
+```bash
+bun run dev
+```
+
+The client proxies `/api` requests to `http://localhost:3000`.
+
+## Build
+
+```bash
+bun run build
+```
+
+The generated `dist/` bundle is what the `@hprof/ui` server serves in production.

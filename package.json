@@ -1,5 +1,5 @@
 {
-  "name": "hprof-monorepo",
+  "name": "hprof",
   "private": true,
   "workspaces": ["packages/*"],
   "devDependencies": {
