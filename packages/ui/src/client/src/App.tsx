@@ -1,6 +1,6 @@
-import { BrowserRouter, Navigate, Route, Routes } from "react-router"
-import Home from "./pages/Home"
-import Profile from "./pages/Profile"
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
+import Home from './pages/Home'
+import Profile from './pages/Profile'
 
 function App() {
   return (

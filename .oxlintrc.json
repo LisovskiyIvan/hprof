@@ -1,0 +1,27 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "react", "import", "unicorn"],
+  "ignorePatterns": [
+    "node_modules/**",
+    "packages/ui/src/client/node_modules/**",
+    "packages/ui/src/client/dist/**",
+    "snapshots/**"
+  ],
+  "overrides": [
+    {
+      "files": ["packages/ui/src/client/src/**/*.{ts,tsx}"],
+      "env": {
+        "browser": true
+      }
+    },
+    {
+      "files": ["**/*.{test,spec}.{ts,tsx}"],
+      "rules": {
+        "no-explicit-any": "off"
+      }
+    }
+  ],
+  "rules": {
+    "eqeqeq": "warn"
+  }
+}

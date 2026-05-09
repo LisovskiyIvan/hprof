@@ -1,13 +1,13 @@
 {
   "name": "dayme",
-  "private": true,
   "version": "0.0.0",
+  "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "lint": "oxlint src/*",
-    "fmt": "oxfmt src/*",
+    "lint": "oxlint .",
+    "fmt": "oxfmt .",
     "fmt:check": "oxfmt --check .",
     "preview": "vite preview"
   },
@@ -24,8 +24,6 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.1",
-    "oxfmt": "^0.48.0",
-    "oxlint": "^1.63.0",
     "typescript": "~6.0.3",
     "vite": "^8.0.11"
   }

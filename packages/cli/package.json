@@ -1,10 +1,10 @@
 {
   "name": "@hprof/cli",
   "version": "0.1.0",
-  "type": "module",
   "bin": {
     "hprof": "src/cli.ts"
   },
+  "type": "module",
   "dependencies": {
     "@hprof/core": "workspace:*",
     "@hprof/ui": "workspace:*"

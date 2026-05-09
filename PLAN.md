@@ -3,6 +3,7 @@
 ## Overview
 
 CLI + Web UI tool for analyzing V8 memory profiles:
+
 - `.heapsnapshot` — full heap snapshot
 - `.heapprofile` — sampling heap profile
 - `.heaptimeline` — heap allocation timeline
@@ -21,12 +22,14 @@ packages/
 ## Phase 1: `@hprof/core` — Парсеры
 
 ### 1.1 Общие утилиты (`src/index.ts`)
+
 - [x] `detectProfileType(filePath)` — определение типа по расширению
 - [x] `formatBytes(bytes)` — форматирование размера
 - [x] `parseSnapshotMeta(filePath)` — извлечение JSON-заголовка heapsnapshot/heaptimeline (уже есть в `analyze-memory-profiles.mjs:108-169`)
 - [x] `StreamingJsonParser` — потоковый парсер JSON с state machine (seek nodes → parse numbers → seek strings → parse strings)
 
 ### 1.2 Heapprofile parser (`src/heapprofile.ts`)
+
 Самый простой формат — обычный JSON целиком в память.
 
 - [x] `parseHeapProfile(filePath)` → `HeapProfileResult`
@@ -40,6 +43,7 @@ packages/
 **Референс:** `analyze-memory-profiles.mjs:59-106`
 
 ### 1.3 Heapsnapshot parser (`src/heapsnapshot.ts`)
+
 Самый тяжёлый формат — может быть гигабайты.
 
 - [x] `streamHeapSnapshotSummary(filePath, options)` → `HeapSnapshotSummary`
@@ -52,8 +56,8 @@ packages/
 - [x] `buildRetainedSize(snapshot)` — расчёт retained size (BFS/DFS от GC roots)
 
 **Референс:** `analyze-memory-profiles.mjs:108-340`
+ ### 1.4 Heaptimeline parser (`src/heaptimeline.ts`)
 
-### 1.4 Heaptimeline parser (`src/heaptimeline.ts`)
 Похож на heapsnapshot, но с массивом `timeline` записей.
 
 - [x] `parseHeapTimeline(filePath)` → `HeapTimelineResult`
@@ -62,6 +66,7 @@ packages/
   - Временные интервалы для графика
 
 ### 1.5 Структуры данных для UI API
+
 - [x] Определить типы для API-ответов (summary, details, comparison)
 - [x] `serializeSummary()` — конвертация Map → JSON-сериализуемый объект
 
@@ -70,10 +75,12 @@ packages/
 ## Phase 2: `@hprof/cli` — CLI
 
 ### 2.1 Базовая структура (`src/cli.ts`)
+
 - [x] Парсинг аргументов: `hprof [command] [options] <file>`
 - [x] Команды: `analyze` (default), `ui`, `help`
 
 ### 2.2 Команда `analyze`
+
 - [x] `hprof file.heapprofile` — вывод top фреймов/URL/функций
 - [x] `hprof file.heapsnapshot` — вывод top nodes by name/type + мета
 - [x] `hprof file.heaptimeline` — вывод allocation summary
@@ -82,6 +89,7 @@ packages/
 - [x] Таблицы в терминале (форматирование колонок)
 
 ### 2.3 CLI UX
+
 - [x] Прогресс-бар для больших файлов
 - [x] Автоопределение типа файла
 - [x] Обработка ошибок (битые файлы, не тот формат)
@@ -147,6 +155,7 @@ GET  /api/profile/:id/search?q=      → поиск по строкам/имен
   - Переход к найденному объекту
 
 ### 3.3 UI технологии (выбор)
+
 - [ ] Рендеринг: **Preact + htm** (или vanilla TS) — минимальный бандл
 - [ ] Таблица: кастомная виртуализация (или clusterize.js / tanstack-virtual)
 - [x] Графики: **Chart.js** или **uPlot** (легковесные)

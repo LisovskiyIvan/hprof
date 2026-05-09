@@ -1,36 +1,50 @@
-import { useEffect, useState } from "react";
-import { useNavigate } from "react-router";
+import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router'
+import { fetchJson } from '../lib/api'
 
 interface ProfileEntry {
-  filePath: string;
-  fileName: string;
-  fileSize: number;
-  type: string;
-  meta?: { node_count?: number; edge_count?: number };
+  filePath: string
+  fileName: string
+  fileSize: number
+  type: string
+  meta?: { node_count?: number; edge_count?: number }
 }
 
 function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes)) return String(bytes);
-  const units = ["B", "KB", "MB", "GB"];
-  let value = bytes;
-  let unit = 0;
+  if (!Number.isFinite(bytes)) return String(bytes)
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = bytes
+  let unit = 0
   while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
+    value /= 1024
+    unit += 1
   }
-  return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[unit]}`;
+  return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[unit]}`
 }
 
 export default function Home() {
-  const [profiles, setProfiles] = useState<ProfileEntry[]>([]);
-  const navigate = useNavigate();
+  const [profiles, setProfiles] = useState<ProfileEntry[]>([])
+  const navigate = useNavigate()
 
   useEffect(() => {
-    fetch("/api/profiles")
-      .then((r) => r.json())
-      .then(setProfiles)
-      .catch(() => setProfiles([]));
-  }, []);
+    let cancelled = false
+
+    fetchJson<ProfileEntry[]>('/api/profiles', { cache: false })
+      .then((data) => {
+        if (!cancelled) {
+          setProfiles(data)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setProfiles([])
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100">
@@ -47,7 +61,7 @@ export default function Home() {
         ) : (
           <div className="space-y-2">
             {profiles.map((p) => {
-              const id = encodeURIComponent(p.filePath);
+              const id = encodeURIComponent(p.filePath)
               return (
                 <button
                   key={p.filePath}
@@ -61,17 +75,17 @@ export default function Home() {
                     </div>
                     <div className="text-sm text-gray-400">
                       {formatBytes(p.fileSize)}
-                      {p.meta?.node_count != null && (
+                      {typeof p.meta?.node_count === 'number' && (
                         <span className="ml-3">{p.meta.node_count.toLocaleString()} nodes</span>
                       )}
                     </div>
                   </div>
                 </button>
-              );
+              )
             })}
           </div>
         )}
       </main>
     </div>
-  );
+  )
 }
