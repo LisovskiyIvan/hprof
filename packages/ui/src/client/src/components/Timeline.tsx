@@ -32,14 +32,28 @@ interface Bucket {
 
 export default function Timeline({ base }: { base: string }) {
   const [data, setData] = useState<TimelineData | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [bucketCount, setBucketCount] = useState(50);
   const chartRef = useRef<HTMLDivElement>(null);
   const plotRef = useRef<uPlot | null>(null);
 
   useEffect(() => {
+    setError(null);
     fetch(`${base}/timeline`)
-      .then((r) => r.json())
-      .then(setData);
+      .then(async (r) => {
+        const json = await r.json();
+        if (!r.ok) {
+          throw new Error(typeof json?.error === "string" ? json.error : `HTTP ${r.status}`);
+        }
+        return json;
+      })
+      .then((next) => {
+        setData({ timeline: Array.isArray(next?.timeline) ? next.timeline : [] });
+      })
+      .catch((e) => {
+        setData(null);
+        setError(e.message);
+      });
   }, [base]);
 
   useEffect(() => {
@@ -146,6 +160,10 @@ export default function Timeline({ base }: { base: string }) {
       plotRef.current = null;
     };
   }, [data, bucketCount]);
+
+  if (error) {
+    return <p className="text-red-400 text-sm">Failed to load timeline: {error}</p>;
+  }
 
   if (!data) return <p className="text-gray-500">Loading timeline...</p>;
 

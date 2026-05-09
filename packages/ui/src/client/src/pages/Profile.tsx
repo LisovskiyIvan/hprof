@@ -54,7 +54,7 @@ export default function Profile() {
     { key: "summary", label: "Summary", show: true },
     { key: "nodes", label: "Nodes", show: meta?.type === "heapsnapshot" },
     { key: "tree", label: "Call Tree", show: meta?.type === "heapprofile" },
-    { key: "timeline", label: "Timeline", show: meta?.type === "heaptimeline" || meta?.type === "heapsnapshot" },
+    { key: "timeline", label: "Timeline", show: meta?.type === "heaptimeline" },
     { key: "retained", label: "Retained", show: meta?.type === "heapsnapshot" },
     { key: "search", label: "Search", show: true },
   ];

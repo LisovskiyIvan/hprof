@@ -121,29 +121,34 @@ function SizeBarChart({
   total: number;
 }) {
   if (!rows.length) return null;
-  const colors = ["#6366f1", "#8b5cf6", "#a78bfa", "#c4b5fd", "#818cf8", "#6d28d9", "#4f46e5"];
+  const chartRows = rows.map(([type, info], i) => ({
+    type,
+    info,
+    color: `hsl(${(i * 47) % 360} 78% 58%)`,
+  }));
+
   return (
     <div>
       <h3 className="text-sm font-semibold text-gray-300 mb-2">Size by Node Type</h3>
       <div className="bg-gray-900 rounded-lg p-4">
         <div className="flex h-8 rounded overflow-hidden mb-3">
-          {rows.map(([type, info], i) => {
+          {chartRows.map(({ type, info, color }) => {
             const pct = total > 0 ? (info.size / total) * 100 : 0;
             if (pct < 0.5) return null;
             return (
               <div
                 key={type}
-                className="h-full"
-                style={{ width: `${pct}%`, backgroundColor: colors[i % colors.length] }}
+                className="h-full border-r border-gray-950/80 last:border-r-0"
+                style={{ width: `${pct}%`, backgroundColor: color }}
                 title={`${type}: ${formatBytes(info.size)} (${pct.toFixed(1)}%)`}
               />
             );
           })}
         </div>
         <div className="grid grid-cols-2 gap-x-6 gap-y-1">
-          {rows.map(([type, info], i) => (
+          {chartRows.map(({ type, info, color }) => (
             <div key={type} className="flex items-center text-xs gap-2">
-              <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: colors[i % colors.length] }} />
+              <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: color }} />
               <span className="text-gray-400 truncate">{type}</span>
               <span className="text-gray-300 ml-auto whitespace-nowrap">{formatBytes(info.size)}</span>
             </div>
