@@ -37,10 +37,17 @@ export interface TimeInterval {
   freed: number;
 }
 
+interface HeapTimelineRawData {
+  strings: string[];
+  timeline: TimelineEntry[];
+}
+
 export class HeapTimeline {
   readonly filePath: string;
   private _snapshot: HeapSnapshot | null = null;
   private _data: HeapTimelineResult | null = null;
+  private _rawData: HeapTimelineRawData | null = null;
+  private _rawDataPromise: Promise<HeapTimelineRawData> | null = null;
 
   constructor(filePath: string) {
     this.filePath = filePath;
@@ -145,8 +152,7 @@ export class HeapTimeline {
       const pct = Math.floor((bytesRead / fileSize) * 100);
       if (onProgress && pct !== lastProgressPct) {
         lastProgressPct = pct;
-        const phase = mode === "done" ? "done" : "nodes";
-        onProgress(phase, pct);
+        onProgress("nodes", pct);
       }
 
       let i = 0;
@@ -227,5 +233,60 @@ export class HeapTimeline {
       byType: new Map(sorted),
       intervals: [],
     };
+  }
+
+  async rawData(): Promise<HeapTimelineRawData> {
+    if (this._rawData) return this._rawData;
+    if (!this._rawDataPromise) {
+      this._rawDataPromise = Bun.file(this.filePath).json().then((raw) => {
+        const data = raw as {
+          strings?: string[];
+          timeline?: unknown[];
+        };
+
+        const timeline: TimelineEntry[] = [];
+        if (Array.isArray(data.timeline)) {
+          for (const entry of data.timeline) {
+            if (typeof entry !== "object" || entry === null) continue;
+            const e = entry as Record<string, unknown>;
+            timeline.push({
+              type: e.type === "Relocation" ? "Relocation" : "Allocation",
+              timestamp: typeof e.timestamp === "number" ? e.timestamp : 0,
+              nodeId: typeof e.nodeId === "number" ? e.nodeId : 0,
+              size: typeof e.size === "number" ? e.size : 0,
+            });
+          }
+        }
+
+        this._rawData = {
+          strings: Array.isArray(data.strings) ? data.strings : [],
+          timeline,
+        };
+
+        return this._rawData;
+      }).finally(() => {
+        this._rawDataPromise = null;
+      });
+    }
+
+    return this._rawDataPromise;
+  }
+
+  async getTimelineEntries(): Promise<TimelineEntry[]> {
+    const raw = await this.rawData();
+    return raw.timeline;
+  }
+
+  async searchStrings(query: string): Promise<Array<{ index: number; value: string }>> {
+    const raw = await this.rawData();
+    const re = new RegExp(query, "i");
+    const matches: Array<{ index: number; value: string }> = [];
+    for (let index = 0; index < raw.strings.length; index++) {
+      const value = raw.strings[index]!;
+      if (!re.test(value)) continue;
+      matches.push({ index, value });
+      if (matches.length >= 100) break;
+    }
+    return matches;
   }
 }

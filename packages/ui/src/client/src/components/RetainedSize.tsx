@@ -19,10 +19,12 @@ interface RetainedEntry {
   type: string;
   selfSize: number;
   retainedSize: number;
+  approximate: boolean;
 }
 
 export default function RetainedSize({ base }: { base: string }) {
   const [data, setData] = useState<RetainedEntry[] | null>(null);
+  const [approximate, setApproximate] = useState(false);
   const [top, setTop] = useState(50);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -30,8 +32,12 @@ export default function RetainedSize({ base }: { base: string }) {
   useEffect(() => {
     setLoading(true);
     setError(null);
-    fetchJson<{ retained: RetainedEntry[] }>(`${base}/retained?top=${top}`)
-      .then((d) => { setData(d.retained); setLoading(false); })
+    fetchJson<{ retained: RetainedEntry[]; approximate?: boolean }>(`${base}/retained?top=${top}`)
+      .then((d) => {
+        setData(d.retained);
+        setApproximate(Boolean(d.approximate));
+        setLoading(false);
+      })
       .catch((e) => { setLoading(false); setError(e.message); });
   }, [base, top]);
 
@@ -57,6 +63,12 @@ export default function RetainedSize({ base }: { base: string }) {
         </select>
         <span className="text-xs text-gray-500">Retained size = self size + size of objects exclusively retained</span>
       </div>
+
+      {approximate && (
+        <p className="text-xs text-amber-300">
+          Large snapshot mode: retained sizes are approximated from top self-size nodes to keep the view responsive under Bun.
+        </p>
+      )}
 
       <div className="bg-gray-900 rounded-lg overflow-hidden">
         <table className="w-full text-sm">

@@ -48,6 +48,10 @@ export type {
   HeapSnapshotEdge,
   HeapSnapshotResult,
   HeapSnapshotSummary,
+  HeapSnapshotNodePage,
+  HeapSnapshotNodePageOptions,
+  HeapSnapshotSearchMatch,
+  HeapSnapshotRetainedEntry,
 } from "./heapsnapshot.ts";
 
 export { HeapTimeline } from "./heaptimeline.ts";

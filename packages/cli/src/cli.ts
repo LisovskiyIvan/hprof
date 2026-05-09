@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 const USE_COLOR = Boolean(process.stdout.isTTY) && process.env.NO_COLOR == null;
 

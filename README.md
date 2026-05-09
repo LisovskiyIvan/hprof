@@ -2,6 +2,8 @@
 
 CLI and web UI for exploring V8 memory profiles.
 
+This project is Bun-first and is intended to be run with `bun`.
+
 Supports:
 
 - `.heapsnapshot`
@@ -41,6 +43,11 @@ Useful flags:
 - `--json`: print machine-readable output
 - `--port <port>`: change UI server port
 - `--open`: open the UI in a browser
+
+## Large Profiles
+
+- `summary`, `nodes`, and `search` are optimized for very large `.heapsnapshot` files under Bun
+- `retained` falls back to an approximate top-self-size view for very large snapshots so the UI stays responsive
 
 ## Development
 

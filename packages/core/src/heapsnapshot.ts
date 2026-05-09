@@ -41,11 +41,69 @@ export interface HeapSnapshotSummary {
   byNodeName: Map<string, { size: number; count: number }>;
 }
 
+export interface HeapSnapshotNodePageOptions {
+  page?: number;
+  pageSize?: number;
+  type?: string | null;
+  q?: string | null;
+  sort?: "id" | "type" | "name" | "selfSize" | "edgeCount";
+  dir?: "asc" | "desc";
+}
+
+export interface HeapSnapshotNodePage {
+  total: number;
+  page: number;
+  pageSize: number;
+  nodes: HeapSnapshotNode[];
+}
+
+export interface HeapSnapshotSearchMatch {
+  index: number;
+  value: string;
+}
+
+export interface HeapSnapshotRetainedEntry {
+  nodeIndex: number;
+  name: string;
+  type: string;
+  selfSize: number;
+  retainedSize: number;
+  approximate: boolean;
+}
+
+interface HeapSnapshotRawData {
+  meta: HeapSnapshotMeta;
+  nodes: number[];
+  edges: number[];
+  strings: string[];
+  nodeFields: string[];
+  nodeTypes: string[];
+  edgeFields: string[];
+  edgeTypes: string[];
+  nodeFieldCount: number;
+  edgeFieldCount: number;
+  nodeOffsets: {
+    type: number;
+    name: number;
+    selfSize: number;
+    id: number;
+    edgeCount: number;
+  };
+  edgeOffsets: {
+    type: number;
+    nameOrIndex: number;
+    toNode: number;
+  };
+}
+
 export class HeapSnapshot {
   readonly filePath: string;
   private _meta: HeapSnapshotMeta | null = null;
   private _data: HeapSnapshotResult | null = null;
   private _retainedSizes: number[] | null = null;
+  private _rawData: HeapSnapshotRawData | null = null;
+  private _rawDataPromise: Promise<HeapSnapshotRawData> | null = null;
+  private _edgeStarts: Uint32Array | null = null;
 
   constructor(filePath: string) {
     this.filePath = filePath;
@@ -309,6 +367,277 @@ export class HeapSnapshot {
       totalCount,
       byNodeName: new Map(sortedNames),
       byNodeType,
+    };
+  }
+
+  async rawData(): Promise<HeapSnapshotRawData> {
+    if (this._rawData) return this._rawData;
+    if (!this._rawDataPromise) {
+      this._rawDataPromise = Bun.file(this.filePath).json().then((raw) => {
+        const data = raw as {
+          snapshot: HeapSnapshotMeta;
+          nodes: number[];
+          edges: number[];
+          strings: string[];
+        };
+
+        const meta = data.snapshot;
+        const nodeFields = meta.meta.node_fields;
+        const nodeTypes = meta.meta.node_types[0]!;
+        const edgeFields = meta.meta.edge_fields;
+        const edgeTypes = meta.meta.edge_types[0]!;
+
+        const parsed: HeapSnapshotRawData = {
+          meta,
+          nodes: data.nodes,
+          edges: data.edges,
+          strings: data.strings,
+          nodeFields,
+          nodeTypes,
+          edgeFields,
+          edgeTypes,
+          nodeFieldCount: nodeFields.length,
+          edgeFieldCount: edgeFields.length,
+          nodeOffsets: {
+            type: nodeFields.indexOf("type"),
+            name: nodeFields.indexOf("name"),
+            selfSize: nodeFields.indexOf("self_size"),
+            id: nodeFields.indexOf("id"),
+            edgeCount: nodeFields.indexOf("edge_count"),
+          },
+          edgeOffsets: {
+            type: edgeFields.indexOf("type"),
+            nameOrIndex: edgeFields.indexOf("name_or_index"),
+            toNode: edgeFields.indexOf("to_node"),
+          },
+        };
+
+        this._rawData = parsed;
+        return parsed;
+      }).finally(() => {
+        this._rawDataPromise = null;
+      });
+    }
+    return this._rawDataPromise;
+  }
+
+  private createNodeFromRaw(raw: HeapSnapshotRawData, nodeIndex: number): HeapSnapshotNode {
+    const base = nodeIndex * raw.nodeFieldCount;
+    return {
+      type: raw.nodeTypes[raw.nodes[base + raw.nodeOffsets.type]!] ?? String(raw.nodes[base + raw.nodeOffsets.type]),
+      name: raw.strings[raw.nodes[base + raw.nodeOffsets.name]!] ?? `<string#${raw.nodes[base + raw.nodeOffsets.name]}>`,
+      selfSize: raw.nodes[base + raw.nodeOffsets.selfSize]!,
+      id: raw.nodes[base + raw.nodeOffsets.id]!,
+      edgeCount: raw.nodes[base + raw.nodeOffsets.edgeCount]!,
+    };
+  }
+
+  private compareNodes(
+    a: { nodeIndex: number; node: HeapSnapshotNode },
+    b: { nodeIndex: number; node: HeapSnapshotNode },
+    sort: NonNullable<HeapSnapshotNodePageOptions["sort"]>,
+    dir: NonNullable<HeapSnapshotNodePageOptions["dir"]>,
+  ): number {
+    let cmp = 0;
+    switch (sort) {
+      case "id":
+        cmp = a.node.id - b.node.id;
+        break;
+      case "type":
+        cmp = a.node.type.localeCompare(b.node.type);
+        break;
+      case "name":
+        cmp = a.node.name.localeCompare(b.node.name);
+        break;
+      case "edgeCount":
+        cmp = a.node.edgeCount - b.node.edgeCount;
+        break;
+      case "selfSize":
+      default:
+        cmp = a.node.selfSize - b.node.selfSize;
+        break;
+    }
+
+    if (cmp === 0) {
+      cmp = a.nodeIndex - b.nodeIndex;
+    }
+
+    return dir === "desc" ? -cmp : cmp;
+  }
+
+  async getNodePage(options?: HeapSnapshotNodePageOptions): Promise<HeapSnapshotNodePage> {
+    const raw = await this.rawData();
+    const page = Math.max(0, options?.page ?? 0);
+    const pageSize = Math.max(1, options?.pageSize ?? 100);
+    const sort = options?.sort ?? "selfSize";
+    const dir = options?.dir ?? "desc";
+    const filterType = options?.type ?? null;
+    const filterRe = options?.q ? new RegExp(options.q, "i") : null;
+    const wanted = (page + 1) * pageSize;
+    const selected: { nodeIndex: number; node: HeapSnapshotNode }[] = [];
+    let total = 0;
+
+    const bubbleWorstToFront = () => {
+      let worstIndex = 0;
+      for (let i = 1; i < selected.length; i++) {
+        if (this.compareNodes(selected[i]!, selected[worstIndex]!, sort, dir) > 0) {
+          worstIndex = i;
+        }
+      }
+      if (worstIndex !== 0) {
+        const worst = selected[worstIndex]!;
+        selected[worstIndex] = selected[0]!;
+        selected[0] = worst;
+      }
+    };
+
+    for (let nodeIndex = 0; nodeIndex < raw.meta.node_count; nodeIndex++) {
+      const node = this.createNodeFromRaw(raw, nodeIndex);
+      if (filterType && node.type !== filterType) continue;
+      if (filterRe && !filterRe.test(node.name)) continue;
+      total += 1;
+
+      const candidate = { nodeIndex, node };
+      if (selected.length < wanted) {
+        selected.push(candidate);
+        if (selected.length === wanted) bubbleWorstToFront();
+        continue;
+      }
+
+      if (this.compareNodes(candidate, selected[0]!, sort, dir) < 0) {
+        selected[0] = candidate;
+        bubbleWorstToFront();
+      }
+    }
+
+    selected.sort((a, b) => this.compareNodes(a, b, sort, dir));
+
+    return {
+      total,
+      page,
+      pageSize,
+      nodes: selected.slice(page * pageSize, page * pageSize + pageSize).map((entry) => entry.node),
+    };
+  }
+
+  async getNodeEdges(nodeIndex: number): Promise<{ node: HeapSnapshotNode; edges: HeapSnapshotEdge[] }> {
+    const raw = await this.rawData();
+    if (nodeIndex < 0 || nodeIndex >= raw.meta.node_count) {
+      throw new Error("Node not found");
+    }
+
+    if (!this._edgeStarts) {
+      const edgeStarts = new Uint32Array(raw.meta.node_count + 1);
+      let edgeOffset = 0;
+      for (let i = 0; i < raw.meta.node_count; i++) {
+        edgeStarts[i] = edgeOffset;
+        const base = i * raw.nodeFieldCount;
+        edgeOffset += raw.nodes[base + raw.nodeOffsets.edgeCount]!;
+      }
+      edgeStarts[raw.meta.node_count] = edgeOffset;
+      this._edgeStarts = edgeStarts;
+    }
+
+    const node = this.createNodeFromRaw(raw, nodeIndex);
+    const edgeStart = this._edgeStarts[nodeIndex]!;
+    const edgeEnd = this._edgeStarts[nodeIndex + 1]!;
+    const edges: HeapSnapshotEdge[] = [];
+
+    for (let edgeIndex = edgeStart; edgeIndex < edgeEnd; edgeIndex++) {
+      const base = edgeIndex * raw.edgeFieldCount;
+      const edgeType = raw.edgeTypes[raw.edges[base + raw.edgeOffsets.type]!] ?? String(raw.edges[base + raw.edgeOffsets.type]);
+      const nameOrIndexValue = raw.edges[base + raw.edgeOffsets.nameOrIndex]!;
+      edges.push({
+        type: edgeType,
+        nameOrIndex: edgeType === "element" || typeof nameOrIndexValue === "number"
+          ? nameOrIndexValue
+          : raw.strings[nameOrIndexValue] ?? String(nameOrIndexValue),
+        toNode: Math.floor(raw.edges[base + raw.edgeOffsets.toNode]! / raw.nodeFieldCount),
+      });
+    }
+
+    return { node, edges };
+  }
+
+  async searchStrings(query: string): Promise<HeapSnapshotSearchMatch[]> {
+    const raw = await this.rawData();
+    const re = new RegExp(query, "i");
+    const matches: HeapSnapshotSearchMatch[] = [];
+    for (let index = 0; index < raw.strings.length; index++) {
+      const value = raw.strings[index]!;
+      if (!re.test(value)) continue;
+      matches.push({ index, value });
+      if (matches.length >= 100) break;
+    }
+    return matches;
+  }
+
+  async getRetainedEntries(topN = 30): Promise<{ approximate: boolean; retained: HeapSnapshotRetainedEntry[] }> {
+    const raw = await this.rawData();
+
+    if (raw.meta.node_count > 5_000_000) {
+      const selected: { nodeIndex: number; node: HeapSnapshotNode }[] = [];
+      const bubbleWorstToFront = () => {
+        let worstIndex = 0;
+        for (let i = 1; i < selected.length; i++) {
+          if (selected[i]!.node.selfSize < selected[worstIndex]!.node.selfSize) {
+            worstIndex = i;
+          }
+        }
+        if (worstIndex !== 0) {
+          const worst = selected[worstIndex]!;
+          selected[worstIndex] = selected[0]!;
+          selected[0] = worst;
+        }
+      };
+
+      for (let nodeIndex = 0; nodeIndex < raw.meta.node_count; nodeIndex++) {
+        const node = this.createNodeFromRaw(raw, nodeIndex);
+        if (selected.length < topN) {
+          selected.push({ nodeIndex, node });
+          if (selected.length === topN) bubbleWorstToFront();
+          continue;
+        }
+
+        if (node.selfSize > selected[0]!.node.selfSize) {
+          selected[0] = { nodeIndex, node };
+          bubbleWorstToFront();
+        }
+      }
+
+      selected.sort((a, b) => b.node.selfSize - a.node.selfSize);
+      return {
+        approximate: true,
+        retained: selected.map(({ nodeIndex, node }) => ({
+          nodeIndex,
+          name: node.name,
+          type: node.type,
+          selfSize: node.selfSize,
+          retainedSize: node.selfSize,
+          approximate: true,
+        })),
+      };
+    }
+
+    const retainedSizes = this.retainedSizes;
+    const indexed = retainedSizes
+      .map((size, idx) => ({ idx, size }))
+      .sort((a, b) => b.size - a.size)
+      .slice(0, topN);
+
+    return {
+      approximate: false,
+      retained: indexed.map(({ idx, size }) => {
+        const node = this.createNodeFromRaw(raw, idx);
+        return {
+          nodeIndex: idx,
+          name: node.name,
+          type: node.type,
+          selfSize: node.selfSize,
+          retainedSize: size,
+          approximate: false,
+        };
+      }),
     };
   }
 
