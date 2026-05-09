@@ -1,14 +1,9 @@
 import {
   detectProfileType,
   formatBytes,
-  parseHeapProfile,
-  summarizeHeapProfile,
-  parseSnapshotMeta,
-  streamHeapSnapshotSummary,
-  parseHeapSnapshot,
-  buildRetainedSize,
-  parseHeapTimeline,
-  streamHeapTimelineSummary,
+  HeapProfile,
+  HeapSnapshot,
+  HeapTimeline,
 } from "@hprof/core";
 import type {
   ProfileType,
@@ -34,14 +29,15 @@ interface ProfileData {
   filePath: string;
   fileName: string;
   fileSize: number;
-  meta?: HeapSnapshotMeta;
+  profile?: HeapProfile;
+  snapshot?: HeapSnapshot;
+  timeline?: HeapTimeline;
   profileResult?: HeapProfileResult;
   snapshotResult?: HeapSnapshotResult;
   timelineResult?: HeapTimelineResult;
   profileSummary?: HeapProfileSummary;
   snapshotSummary?: HeapSnapshotSummary;
   timelineSummary?: HeapTimelineSummary;
-  retainedSizes?: number[];
 }
 
 const profiles = new Map<string, ProfileData>();
@@ -59,12 +55,22 @@ async function loadProfile(filePath: string): Promise<ProfileData> {
     fileSize: stat.size,
   };
 
-  if (type === "heapsnapshot" || type === "heaptimeline") {
-    data.meta = parseSnapshotMeta(filePath);
+  if (type === "heapprofile") {
+    data.profile = new HeapProfile(filePath);
+  } else if (type === "heapsnapshot") {
+    data.snapshot = new HeapSnapshot(filePath);
+  } else if (type === "heaptimeline") {
+    data.timeline = new HeapTimeline(filePath);
   }
 
   profiles.set(filePath, data);
   return data;
+}
+
+function getMeta(data: ProfileData): HeapSnapshotMeta | undefined {
+  if (data.snapshot) return data.snapshot.meta;
+  if (data.timeline) return data.timeline.meta;
+  return undefined;
 }
 
 function jsonResponse(data: unknown, status = 200): Response {
@@ -88,16 +94,17 @@ async function handleApiRequest(url: URL): Promise<Response> {
   if (pathname === "/api/profiles") {
     const result = [];
     for (const [filePath, data] of profiles) {
+      const meta = getMeta(data);
       result.push({
         filePath,
         fileName: data.fileName,
         fileSize: data.fileSize,
         type: data.type,
-        meta: data.meta
+        meta: meta
           ? {
-              node_count: data.meta.node_count,
-              edge_count: data.meta.edge_count,
-              extra_native_bytes: data.meta.extra_native_bytes,
+              node_count: meta.node_count,
+              edge_count: meta.edge_count,
+              extra_native_bytes: meta.extra_native_bytes,
             }
           : undefined,
       });
@@ -114,17 +121,18 @@ async function handleApiRequest(url: URL): Promise<Response> {
     const data = profiles.get(filePath);
     if (!data) return errorResponse("Profile not found", 404);
 
-    const meta: Record<string, unknown> = {
+    const meta = getMeta(data);
+    const metaObj: Record<string, unknown> = {
       fileName: data.fileName,
       fileSize: data.fileSize,
       type: data.type,
     };
-    if (data.meta) {
-      meta.node_count = data.meta.node_count;
-      meta.edge_count = data.meta.edge_count;
-      meta.extra_native_bytes = data.meta.extra_native_bytes;
+    if (meta) {
+      metaObj.node_count = meta.node_count;
+      metaObj.edge_count = meta.edge_count;
+      metaObj.extra_native_bytes = meta.extra_native_bytes;
     }
-    return jsonResponse(meta);
+    return jsonResponse(metaObj);
   }
 
   const filePath = decodeURIComponent(profileMatch[1]!);
@@ -134,26 +142,27 @@ async function handleApiRequest(url: URL): Promise<Response> {
 
   switch (action) {
     case "meta": {
-      const meta: Record<string, unknown> = {
+      const meta = getMeta(data);
+      const metaObj: Record<string, unknown> = {
         fileName: data.fileName,
         fileSize: data.fileSize,
         type: data.type,
       };
-      if (data.meta) {
-        meta.node_count = data.meta.node_count;
-        meta.edge_count = data.meta.edge_count;
-        meta.extra_native_bytes = data.meta.extra_native_bytes;
+      if (meta) {
+        metaObj.node_count = meta.node_count;
+        metaObj.edge_count = meta.edge_count;
+        metaObj.extra_native_bytes = meta.extra_native_bytes;
       }
-      return jsonResponse(meta);
+      return jsonResponse(metaObj);
     }
 
     case "summary": {
       if (data.type === "heapprofile") {
         if (!data.profileResult) {
-          data.profileResult = parseHeapProfile(filePath);
+          data.profileResult = data.profile!.data;
         }
         if (!data.profileSummary) {
-          data.profileSummary = summarizeHeapProfile(data.profileResult);
+          data.profileSummary = data.profile!.summarize();
         }
         return jsonResponse({
           totalSize: data.profileSummary.totalSize,
@@ -165,7 +174,7 @@ async function handleApiRequest(url: URL): Promise<Response> {
 
       if (data.type === "heapsnapshot") {
         if (!data.snapshotSummary) {
-          data.snapshotSummary = await streamHeapSnapshotSummary(filePath);
+          data.snapshotSummary = await data.snapshot!.streamSummary();
         }
         return jsonResponse({
           totalSize: data.snapshotSummary.totalSize,
@@ -177,7 +186,7 @@ async function handleApiRequest(url: URL): Promise<Response> {
 
       if (data.type === "heaptimeline") {
         if (!data.timelineSummary) {
-          data.timelineSummary = await streamHeapTimelineSummary(filePath);
+          data.timelineSummary = await data.timeline!.streamSummary();
         }
         return jsonResponse({
           totalAllocated: data.timelineSummary.totalAllocated,
@@ -194,7 +203,7 @@ async function handleApiRequest(url: URL): Promise<Response> {
         return errorResponse("Nodes only available for heapsnapshot");
       }
       if (!data.snapshotResult) {
-        data.snapshotResult = await parseHeapSnapshot(filePath);
+        data.snapshotResult = data.snapshot!.data;
       }
       const page = Number(url.searchParams.get("page") ?? "0");
       const pageSize = Number(url.searchParams.get("pageSize") ?? "100");
@@ -236,7 +245,7 @@ async function handleApiRequest(url: URL): Promise<Response> {
         return errorResponse("Edges only available for heapsnapshot");
       }
       if (!data.snapshotResult) {
-        data.snapshotResult = await parseHeapSnapshot(filePath);
+        data.snapshotResult = data.snapshot!.data;
       }
       const nodeId = Number(url.searchParams.get("nodeId"));
       if (!nodeId) return errorResponse("nodeId required");
@@ -261,7 +270,7 @@ async function handleApiRequest(url: URL): Promise<Response> {
         return errorResponse("Tree only available for heapprofile");
       }
       if (!data.profileResult) {
-        data.profileResult = parseHeapProfile(filePath);
+        data.profileResult = data.profile!.data;
       }
       return jsonResponse(data.profileResult.head);
     }
@@ -271,7 +280,7 @@ async function handleApiRequest(url: URL): Promise<Response> {
         return errorResponse("Timeline only available for heaptimeline");
       }
       if (!data.timelineResult) {
-        data.timelineResult = await parseHeapTimeline(filePath);
+        data.timelineResult = data.timeline!.data;
       }
       return jsonResponse({
         timeline: data.timelineResult.timeline,
@@ -284,10 +293,10 @@ async function handleApiRequest(url: URL): Promise<Response> {
 
       if (data.type === "heapsnapshot" || data.type === "heaptimeline") {
         if (!data.snapshotResult && data.type === "heapsnapshot") {
-          data.snapshotResult = await parseHeapSnapshot(filePath);
+          data.snapshotResult = data.snapshot!.data;
         }
         if (!data.timelineResult && data.type === "heaptimeline") {
-          data.timelineResult = await parseHeapTimeline(filePath);
+          data.timelineResult = data.timeline!.data;
         }
         const strings = data.snapshotResult?.strings ?? data.timelineResult?.strings ?? [];
         const re = new RegExp(q, "i");
@@ -300,10 +309,10 @@ async function handleApiRequest(url: URL): Promise<Response> {
 
       if (data.type === "heapprofile") {
         if (!data.profileResult) {
-          data.profileResult = parseHeapProfile(filePath);
+          data.profileResult = data.profile!.data;
         }
         if (!data.profileSummary) {
-          data.profileSummary = summarizeHeapProfile(data.profileResult);
+          data.profileSummary = data.profile!.summarize();
         }
         const re = new RegExp(q, "i");
         const frames = [...data.profileSummary.byFrame.entries()]
@@ -320,14 +329,12 @@ async function handleApiRequest(url: URL): Promise<Response> {
         return errorResponse("Retained size only available for heapsnapshot");
       }
       if (!data.snapshotResult) {
-        data.snapshotResult = await parseHeapSnapshot(filePath);
-      }
-      if (!data.retainedSizes) {
-        data.retainedSizes = buildRetainedSize(data.snapshotResult);
+        data.snapshotResult = data.snapshot!.data;
       }
 
+      const retainedSizes = data.snapshot!.retainedSizes;
       const topN = Number(url.searchParams.get("top") ?? "30");
-      const indexed = data.retainedSizes
+      const indexed = retainedSizes
         .map((size, idx) => ({ idx, size }))
         .sort((a, b) => b.size - a.size)
         .slice(0, topN);

@@ -3,11 +3,9 @@
 import {
   detectProfileType,
   formatBytes,
-  parseHeapProfile,
-  summarizeHeapProfile,
-  streamHeapSnapshotSummary,
-  parseSnapshotMeta,
-  streamHeapTimelineSummary,
+  HeapProfile,
+  HeapSnapshot,
+  HeapTimeline,
 } from "@hprof/core";
 import type { ProfileType } from "@hprof/core";
 
@@ -42,24 +40,24 @@ function progressBar(pct: number, phase: string, width = 30) {
 
 function printUsage() {
   console.log(`
-${bold("Usage:")} hprof <command> [options] <file>
+ ${bold("Usage:")} hprof <command> [options] <file>
 
-${bold("Commands:")}
-  ${cyan("analyze")}   Analyze profile file and print summary to stdout (default)
-  ${cyan("ui")}        Start web UI server for interactive analysis
-  ${cyan("help")}      Show this help message
+ ${bold("Commands:")}
+   ${cyan("analyze")}   Analyze profile file and print summary to stdout (default)
+   ${cyan("ui")}        Start web UI server for interactive analysis
+   ${cyan("help")}      Show this help message
 
-${bold("Options:")}
-  ${yellow("--top <n>")}       Number of top entries to show (default: 30)
-  ${yellow("--filter <re>")}   Filter results by regex
-  ${yellow("--json")}          Output as JSON
-  ${yellow("--port <port>")}   Port for UI server (default: 3000)
-  ${yellow("--open")}          Open browser automatically (ui command only)
+ ${bold("Options:")}
+   ${yellow("--top <n>")}       Number of top entries to show (default: 30)
+   ${yellow("--filter <re>")}   Filter results by regex
+   ${yellow("--json")}          Output as JSON
+   ${yellow("--port <port>")}   Port for UI server (default: 3000)
+   ${yellow("--open")}          Open browser automatically (ui command only)
 
-${bold("Supported formats:")}
-  ${green(".heapsnapshot")}   V8 heap snapshot
-  ${green(".heapprofile")}    V8 sampling heap profile
-  ${green(".heaptimeline")}   V8 heap allocation timeline
+ ${bold("Supported formats:")}
+   ${green(".heapsnapshot")}   V8 heap snapshot
+   ${green(".heapprofile")}    V8 sampling heap profile
+   ${green(".heaptimeline")}   V8 heap allocation timeline
 `);
 }
 
@@ -135,8 +133,8 @@ function printHeader(title: string, subtitle?: string) {
 }
 
 function analyzeHeapProfile(filePath: string, args: CliArgs) {
-  const data = parseHeapProfile(filePath);
-  const summary = summarizeHeapProfile(data, {
+  const profile = new HeapProfile(filePath);
+  const summary = profile.summarize({
     top: args.top,
     filter: args.filter ?? undefined,
   });
@@ -180,8 +178,9 @@ function analyzeHeapProfile(filePath: string, args: CliArgs) {
 }
 
 async function analyzeHeapSnapshot(filePath: string, args: CliArgs) {
-  const meta = parseSnapshotMeta(filePath);
-  const summary = await streamHeapSnapshotSummary(filePath, {
+  const snapshot = new HeapSnapshot(filePath);
+  const meta = snapshot.meta;
+  const summary = await snapshot.streamSummary({
     top: args.top,
     filter: args.filter ?? undefined,
     onProgress: args.json ? undefined : (phase, pct) => progressBar(pct, phase),
@@ -240,8 +239,9 @@ async function analyzeHeapSnapshot(filePath: string, args: CliArgs) {
 }
 
 async function analyzeHeapTimeline(filePath: string, args: CliArgs) {
-  const meta = parseSnapshotMeta(filePath);
-  const summary = await streamHeapTimelineSummary(filePath, {
+  const timeline = new HeapTimeline(filePath);
+  const meta = timeline.meta;
+  const summary = await timeline.streamSummary({
     top: args.top,
     filter: args.filter ?? undefined,
   });

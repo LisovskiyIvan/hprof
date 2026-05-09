@@ -2,9 +2,7 @@ import { describe, test, expect } from "bun:test";
 import {
   detectProfileType,
   formatBytes,
-  parseHeapProfile,
-  summarizeHeapProfile,
-  flattenToCallFrames,
+  HeapProfile,
 } from "../src/index.ts";
 import path from "path";
 
@@ -51,42 +49,42 @@ describe("formatBytes", () => {
   });
 });
 
-describe("heapprofile parser", () => {
+describe("HeapProfile", () => {
   const filePath = path.join(SNAPSHOTS, "Heap-20260508T151711.heapprofile");
-  let result: ReturnType<typeof parseHeapProfile>;
+  let profile: HeapProfile;
 
-  test("parseHeapProfile parses the file", () => {
-    result = parseHeapProfile(filePath);
+  test("data parses the file", () => {
+    profile = new HeapProfile(filePath);
+    const result = profile.data;
     expect(result.head).toBeDefined();
     expect(result.head.callFrame).toBeDefined();
     expect(result.head.children).toBeInstanceOf(Array);
     expect(typeof result.startTime === "number" || result.startTime === undefined).toBe(true);
   });
 
-  test("summarizeHeapProfile aggregates by frame/url/function", () => {
-    const summary = summarizeHeapProfile(result);
+  test("summarize aggregates by frame/url/function", () => {
+    const summary = profile.summarize();
     expect(summary.totalSize).toBeGreaterThan(0);
     expect(summary.byFrame.size).toBeGreaterThan(0);
     expect(summary.byUrl.size).toBeGreaterThan(0);
     expect(summary.byFunction.size).toBeGreaterThan(0);
   });
 
-  test("summarizeHeapProfile respects --top", () => {
-    const summary = summarizeHeapProfile(result, { top: 5 });
+  test("summarize respects --top", () => {
+    const summary = profile.summarize({ top: 5 });
     expect(summary.byFrame.size).toBeLessThanOrEqual(5);
     expect(summary.byUrl.size).toBeLessThanOrEqual(5);
     expect(summary.byFunction.size).toBeLessThanOrEqual(5);
   });
 
-  test("summarizeHeapProfile respects --filter", () => {
-    const summaryAll = summarizeHeapProfile(result);
-    const summaryFiltered = summarizeHeapProfile(result, { filter: "xyznonexistent" });
+  test("summarize respects --filter", () => {
+    const summaryFiltered = profile.summarize({ filter: "xyznonexistent" });
     expect(summaryFiltered.totalSize).toBe(0);
     expect(summaryFiltered.byFrame.size).toBe(0);
   });
 
-  test("flattenToCallFrames returns flat array", () => {
-    const flat = flattenToCallFrames(result);
+  test("flatten returns flat array", () => {
+    const flat = profile.flatten();
     expect(flat.length).toBeGreaterThan(0);
     expect(flat[0]).toHaveProperty("functionName");
     expect(flat[0]).toHaveProperty("selfSize");

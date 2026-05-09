@@ -1,17 +1,15 @@
 import { describe, test, expect } from "bun:test";
 import {
-  parseSnapshotMeta,
-  streamHeapSnapshotSummary,
-  parseHeapSnapshot,
-  buildRetainedSize,
+  HeapSnapshot,
 } from "../src/heapsnapshot.ts";
 import path from "path";
 
 const SNAPSHOTS = path.resolve(import.meta.dir, "../../../snapshots");const HEAP_SNAPSHOT = path.join(SNAPSHOTS, "Heap-20260508T151623.heapsnapshot");
 
-describe("parseSnapshotMeta", () => {
+describe("HeapSnapshot.meta", () => {
   test("extracts meta from heapsnapshot header", () => {
-    const meta = parseSnapshotMeta(HEAP_SNAPSHOT);
+    const snapshot = new HeapSnapshot(HEAP_SNAPSHOT);
+    const meta = snapshot.meta;
     expect(meta.node_count).toBeGreaterThan(0);
     expect(meta.edge_count).toBeGreaterThan(0);
     expect(meta.meta.node_fields).toContain("type");
@@ -22,9 +20,10 @@ describe("parseSnapshotMeta", () => {
   });
 });
 
-describe("streamHeapSnapshotSummary", () => {
+describe("HeapSnapshot.streamSummary", () => {
   test("produces summary with top-N nodes", async () => {
-    const summary = await streamHeapSnapshotSummary(HEAP_SNAPSHOT, { top: 10 });
+    const snapshot = new HeapSnapshot(HEAP_SNAPSHOT);
+    const summary = await snapshot.streamSummary({ top: 10 });
     expect(summary.totalSize).toBeGreaterThan(0);
     expect(summary.totalCount).toBeGreaterThan(0);
     expect(summary.byNodeName.size).toBeGreaterThan(0);
@@ -33,8 +32,8 @@ describe("streamHeapSnapshotSummary", () => {
   }, 60000);
 
   test("respects filter", async () => {
-    const summaryAll = await streamHeapSnapshotSummary(HEAP_SNAPSHOT, { top: 100 });
-    const summaryFiltered = await streamHeapSnapshotSummary(HEAP_SNAPSHOT, {
+    const snapshot = new HeapSnapshot(HEAP_SNAPSHOT);
+    const summaryFiltered = await snapshot.streamSummary({
       top: 100,
       filter: "xyznonexistent",
     });
@@ -42,8 +41,9 @@ describe("streamHeapSnapshotSummary", () => {
   }, 60000);
 
   test("calls onProgress callback", async () => {
+    const snapshot = new HeapSnapshot(HEAP_SNAPSHOT);
     const phases: string[] = [];
-    await streamHeapSnapshotSummary(HEAP_SNAPSHOT, {
+    await snapshot.streamSummary({
       top: 5,
       onProgress: (phase) => {
         if (!phases.includes(phase)) phases.push(phase);
@@ -54,9 +54,10 @@ describe("streamHeapSnapshotSummary", () => {
   }, 60000);
 });
 
-describe("buildRetainedSize", () => {
-  test("computes retained sizes for a small synthetic snapshot", () => {
-    const result: ReturnType<typeof parseHeapSnapshot> extends Promise<infer T> ? T : never = {
+describe("HeapSnapshot.retainedSizes", () => {
+  test("computes retained sizes for a parsed snapshot", () => {
+    const snapshot = new HeapSnapshot("");
+    (snapshot as any)._data = {
       meta: {
         node_count: 3,
         edge_count: 2,
@@ -79,7 +80,7 @@ describe("buildRetainedSize", () => {
       strings: ["root", "ObjA", "str"],
     };
 
-    const retained = buildRetainedSize(result);
+    const retained = snapshot.retainedSizes;
     expect(retained.length).toBe(3);
     expect(retained[0]).toBeGreaterThan(0);
     expect(retained[0]).toBe(150);

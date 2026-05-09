@@ -32,11 +32,7 @@ export function formatBytes(bytes: number): string {
   return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[unit]}`;
 }
 
-export {
-  parseHeapProfile,
-  summarizeHeapProfile,
-  flattenToCallFrames,
-} from "./heapprofile.ts";
+export { HeapProfile } from "./heapprofile.ts";
 export type {
   CallFrame,
   HeapProfileNode,
@@ -45,12 +41,7 @@ export type {
   FlatCallFrame,
 } from "./heapprofile.ts";
 
-export {
-  parseSnapshotMeta,
-  streamHeapSnapshotSummary,
-  parseHeapSnapshot,
-  buildRetainedSize,
-} from "./heapsnapshot.ts";
+export { HeapSnapshot } from "./heapsnapshot.ts";
 export type {
   HeapSnapshotMeta,
   HeapSnapshotNode,
@@ -59,10 +50,7 @@ export type {
   HeapSnapshotSummary,
 } from "./heapsnapshot.ts";
 
-export {
-  parseHeapTimeline,
-  streamHeapTimelineSummary,
-} from "./heaptimeline.ts";
+export { HeapTimeline } from "./heaptimeline.ts";
 export type {
   HeapTimelineResult,
   TimelineEntry,
