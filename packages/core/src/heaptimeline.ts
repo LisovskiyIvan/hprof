@@ -112,7 +112,7 @@ export class HeapTimeline {
   }
 
   async streamSummary(
-    options?: { top?: number; filter?: string },
+    options?: { top?: number; filter?: string; onProgress?: (phase: string, pct: number) => void },
   ): Promise<HeapTimelineSummary> {
     const snapshot = this.snapshot;
     const snapshotMeta = snapshot.meta;
@@ -129,14 +129,26 @@ export class HeapTimeline {
 
     const byTypeIndex = new Map<number, { allocated: number; freed: number; count: number }>();
     let totalAllocated = 0;
+    const onProgress = options?.onProgress;
+    const fileSize = fs.statSync(this.filePath).size;
 
     let mode: "seekNodes" | "parseNodes" | "done" = "seekNodes";
     let record: number[] = [];
     let currentNumber = "";
 
     const stream = fs.createReadStream(this.filePath, { encoding: "utf8" });
+    let bytesRead = 0;
+    let lastProgressPct = -1;
 
     for await (const chunk of stream) {
+      bytesRead += chunk.length;
+      const pct = Math.floor((bytesRead / fileSize) * 100);
+      if (onProgress && pct !== lastProgressPct) {
+        lastProgressPct = pct;
+        const phase = mode === "done" ? "done" : "nodes";
+        onProgress(phase, pct);
+      }
+
       let i = 0;
       while (i < chunk.length) {
         if (mode === "seekNodes") {
@@ -192,6 +204,10 @@ export class HeapTimeline {
       }
 
       if (mode === "done") break;
+    }
+
+    if (onProgress && lastProgressPct < 100) {
+      onProgress("done", 100);
     }
 
     const byType = new Map<string, { allocated: number; freed: number; count: number }>();

@@ -15,8 +15,11 @@ import type {
   HeapProfileSummary,
   HeapSnapshotMeta,
 } from "@hprof/core";
+import { spawn } from "child_process";
 import fs from "fs";
+import { createServer } from "http";
 import path from "path";
+import { fileURLToPath } from "url";
 
 export interface ServerOptions {
   files: string[];
@@ -82,6 +85,51 @@ function jsonResponse(data: unknown, status = 200): Response {
 
 function errorResponse(message: string, status = 400): Response {
   return jsonResponse({ error: message }, status);
+}
+
+async function sendResponse(response: Response, res: import("http").ServerResponse) {
+  res.statusCode = response.status;
+  response.headers.forEach((value, key) => {
+    res.setHeader(key, value);
+  });
+  const body = await response.arrayBuffer();
+  res.end(Buffer.from(body));
+}
+
+function staticResponse(clientDist: string, pathname: string): Response {
+  const relativePath = pathname === "/" ? "index.html" : pathname.replace(/^\//, "");
+  const requestedPath = path.resolve(clientDist, relativePath);
+  const indexPath = path.join(clientDist, "index.html");
+
+  if (!requestedPath.startsWith(clientDist + path.sep) && requestedPath !== indexPath) {
+    return new Response("Not found", { status: 404 });
+  }
+
+  let filePath = requestedPath;
+  if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+    filePath = indexPath;
+  }
+
+  if (!fs.existsSync(filePath)) {
+    return new Response("UI bundle not found. Build packages/ui/src/client first.", {
+      status: 500,
+    });
+  }
+
+  const ext = path.extname(filePath);
+  const mimeTypes: Record<string, string> = {
+    ".html": "text/html",
+    ".js": "application/javascript",
+    ".css": "text/css",
+    ".json": "application/json",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+  };
+
+  return new Response(fs.readFileSync(filePath), {
+    headers: { "Content-Type": mimeTypes[ext] ?? "application/octet-stream" },
+  });
 }
 
 function serializeMap<K, V>(map: Map<K, V>): [K, V][] {
@@ -373,56 +421,47 @@ export async function startServer(options: ServerOptions): Promise<void> {
     process.exit(1);
   }
 
-  const server = Bun.serve({
-    port: options.port,
-    async fetch(req) {
-      const url = new URL(req.url);
-
-      if (url.pathname.startsWith("/api/")) {
-        return handleApiRequest(url);
-      }
-
-      const clientDist = path.join(import.meta.dir, "client", "dist");
-      let filePath = path.join(clientDist, url.pathname === "/" ? "index.html" : url.pathname);
-
-      if (!fs.existsSync(filePath)) {
-        filePath = path.join(clientDist, "index.html");
-      }
-
-      if (fs.existsSync(filePath)) {
-        const ext = path.extname(filePath);
-        const mimeTypes: Record<string, string> = {
-          ".html": "text/html",
-          ".js": "application/javascript",
-          ".css": "text/css",
-          ".json": "application/json",
-          ".png": "image/png",
-          ".svg": "image/svg+xml",
-          ".ico": "image/x-icon",
-        };
-        return new Response(Bun.file(filePath), {
-          headers: { "Content-Type": mimeTypes[ext] ?? "application/octet-stream" },
-        });
-      }
-
-      return new Response("Not found", { status: 404 });
-    },
+  const clientDist = fileURLToPath(new URL("../client/dist", import.meta.url));
+  const server = createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url ?? "/", `http://${req.headers.host ?? `localhost:${options.port}`}`);
+      const response = url.pathname.startsWith("/api/")
+        ? await handleApiRequest(url)
+        : staticResponse(clientDist, url.pathname);
+      await sendResponse(response, res);
+    } catch (error) {
+      await sendResponse(errorResponse((error as Error).message, 500), res);
+    }
   });
 
-  console.log(`\n  hprof UI server running at http://localhost:${server.port}`);
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(options.port, () => resolve());
+  });
+
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : options.port;
+
+  console.log(`\n  hprof UI server running at http://localhost:${port}`);
   console.log(`\n  Profiles:`);
-  for (const [fp, data] of profiles) {
+  for (const data of profiles.values()) {
     console.log(`    ${data.fileName} (${data.type}, ${formatBytes(data.fileSize)})`);
   }
   console.log();
 
   if (options.open) {
-    const opener =
-      process.platform === "darwin"
-        ? "open"
-        : process.platform === "win32"
-          ? "start"
-          : "xdg-open";
-    Bun.spawn([opener, `http://localhost:${server.port}`]);
+    const targetUrl = `http://localhost:${port}`;
+    if (process.platform === "win32") {
+      spawn("cmd", ["/c", "start", "", targetUrl], {
+        detached: true,
+        stdio: "ignore",
+      }).unref();
+    } else {
+      const opener = process.platform === "darwin" ? "open" : "xdg-open";
+      spawn(opener, [targetUrl], {
+        detached: true,
+        stdio: "ignore",
+      }).unref();
+    }
   }
 }

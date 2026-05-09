@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+const USE_COLOR = Boolean(process.stdout.isTTY) && process.env.NO_COLOR == null;
+
 import {
   detectProfileType,
   formatBytes,
@@ -22,14 +24,51 @@ const C = {
   gray: "\x1b[90m",
 };
 
-function bold(s: string) { return `${C.bold}${s}${C.reset}`; }
-function cyan(s: string) { return `${C.cyan}${s}${C.reset}`; }
-function yellow(s: string) { return `${C.yellow}${s}${C.reset}`; }
-function green(s: string) { return `${C.green}${s}${C.reset}`; }
-function red(s: string) { return `${C.red}${s}${C.reset}`; }
-function dim(s: string) { return `${C.dim}${s}${C.reset}`; }
-function magenta(s: string) { return `${C.magenta}${s}${C.reset}`; }
-function gray(s: string) { return `${C.gray}${s}${C.reset}`; }
+function color(code: string, s: string) {
+  return USE_COLOR ? `${code}${s}${C.reset}` : s;
+}
+
+function bold(s: string) { return color(C.bold, s); }
+function cyan(s: string) { return color(C.cyan, s); }
+function yellow(s: string) { return color(C.yellow, s); }
+function green(s: string) { return color(C.green, s); }
+function red(s: string) { return color(C.red, s); }
+function dim(s: string) { return color(C.dim, s); }
+function magenta(s: string) { return color(C.magenta, s); }
+function gray(s: string) { return color(C.gray, s); }
+
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+const CONTROL_RE = /[\x00-\x1f\x7f]+/g;
+
+function stripAnsi(s: string) {
+  return s.replace(ANSI_RE, "");
+}
+
+function normalizeCell(s: string) {
+  return s
+    .replace(ANSI_RE, "")
+    .replace(CONTROL_RE, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function applyCellStyle(source: string, text: string) {
+  if (!USE_COLOR) return text;
+  const match = source.match(/^((?:\x1b\[[0-9;]*m)+)([\s\S]*?)((?:\x1b\[[0-9;]*m)+)$/);
+  if (!match) return text;
+  return `${match[1]}${text}${match[3]}`;
+}
+
+function truncateVisible(source: string, width: number) {
+  const plain = normalizeCell(source);
+  if (plain.length <= width) return plain;
+  if (width <= 1) return "…";
+  return `${plain.slice(0, width - 1)}…`;
+}
+
+function padVisible(s: string, width: number) {
+  return s + " ".repeat(Math.max(0, width - stripAnsi(s).length));
+}
 
 function progressBar(pct: number, phase: string, width = 30) {
   const filled = Math.round((pct / 100) * width);
@@ -105,25 +144,53 @@ function parseArgs(argv: string[]): CliArgs {
 }
 
 function printTable(headers: string[], rows: string[][]) {
+  const normalizedRows = rows.map((row) => row.map((cell) => normalizeCell(cell)));
   const widths = headers.map((h, i) =>
     Math.max(
       h.length,
-      ...rows.map((r) => (r[i] ?? "").length),
+      ...normalizedRows.map((r) => stripAnsi(r[i] ?? "").length),
     ),
   );
+
+  if (widths.length > 0) {
+    const terminalWidth = Math.max(process.stdout.columns ?? 120, 60);
+    const paddingWidth = 2 * (widths.length - 1);
+    const fixedColumnsWidth = widths.slice(0, -1).reduce((sum, width) => sum + width, 0);
+    const lastColumnMinWidth = headers[widths.length - 1]!.length;
+    const lastColumnMaxWidth = Math.max(
+      lastColumnMinWidth,
+      terminalWidth - 2 - paddingWidth - fixedColumnsWidth,
+    );
+
+    widths[widths.length - 1] = Math.min(widths[widths.length - 1]!, lastColumnMaxWidth);
+  }
 
   const headerLine = headers
     .map((h, i) => h.padEnd(widths[i]!))
     .join("  ");
   console.log(`  ${dim(headerLine)}`);
-  console.log(`  ${dim("─".repeat(headerLine.length))}`);
+  console.log(`  ${dim("─".repeat(widths.reduce((sum, width) => sum + width, 0) + 2 * (widths.length - 1)))}`);
 
-  for (const row of rows) {
+  for (const [rowIndex, row] of rows.entries()) {
     const line = row
-      .map((cell, i) => cell.padEnd(widths[i]!))
+      .map((cell, i) => {
+        if (i === row.length - 1) {
+          const truncated = truncateVisible(cell, widths[i]!);
+          return padVisible(applyCellStyle(cell, truncated), widths[i]!);
+        }
+
+        const normalized = normalizedRows[rowIndex]![i]!;
+        if (normalized === stripAnsi(cell)) {
+          return padVisible(cell, widths[i]!);
+        }
+
+        return padVisible(normalized, widths[i]!);
+      })
       .join("  ");
     console.log(`  ${line}`);
   }
+
+  console.log();
 }
 
 function printHeader(title: string, subtitle?: string) {
@@ -244,6 +311,7 @@ async function analyzeHeapTimeline(filePath: string, args: CliArgs) {
   const summary = await timeline.streamSummary({
     top: args.top,
     filter: args.filter ?? undefined,
+    onProgress: args.json ? undefined : (phase, pct) => progressBar(pct, phase),
   });
 
   if (args.json) {
