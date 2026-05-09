@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from "react";
 import uPlot from "uplot";
+import { fetchJson } from "../lib/api";
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes === 0) return "0 B";
@@ -39,14 +40,7 @@ export default function Timeline({ base }: { base: string }) {
 
   useEffect(() => {
     setError(null);
-    fetch(`${base}/timeline`)
-      .then(async (r) => {
-        const json = await r.json();
-        if (!r.ok) {
-          throw new Error(typeof json?.error === "string" ? json.error : `HTTP ${r.status}`);
-        }
-        return json;
-      })
+    fetchJson<TimelineData>(`${base}/timeline`)
       .then((next) => {
         setData({ timeline: Array.isArray(next?.timeline) ? next.timeline : [] });
       })

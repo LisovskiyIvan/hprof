@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
+import { fetchJson } from "../lib/api";
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes)) return String(bytes);
@@ -30,6 +31,7 @@ interface NodesResponse {
 
 export default function NodesTable({ base }: { base: string }) {
   const [data, setData] = useState<NodesResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState(0);
   const [pageSize] = useState(100);
   const [sort, setSort] = useState("selfSize");
@@ -38,6 +40,7 @@ export default function NodesTable({ base }: { base: string }) {
   const [search, setSearch] = useState("");
 
   const fetchNodes = useCallback(() => {
+    setError(null);
     const params = new URLSearchParams({
       page: String(page),
       pageSize: String(pageSize),
@@ -47,9 +50,9 @@ export default function NodesTable({ base }: { base: string }) {
     if (filterType) params.set("type", filterType);
     if (search) params.set("q", search);
 
-    fetch(`${base}/nodes?${params}`)
-      .then((r) => r.json())
-      .then(setData);
+    fetchJson<NodesResponse>(`${base}/nodes?${params}`)
+      .then(setData)
+      .catch((e) => setError(e.message));
   }, [base, page, pageSize, sort, dir, filterType, search]);
 
   useEffect(() => {
@@ -72,6 +75,10 @@ export default function NodesTable({ base }: { base: string }) {
     if (sort !== col) return <span className="text-gray-600 ml-1">↕</span>;
     return <span className="text-indigo-400 ml-1">{dir === "desc" ? "↓" : "↑"}</span>;
   };
+
+  if (error) {
+    return <p className="text-red-400 text-sm">Failed to load nodes: {error}</p>;
+  }
 
   return (
     <div className="space-y-4">

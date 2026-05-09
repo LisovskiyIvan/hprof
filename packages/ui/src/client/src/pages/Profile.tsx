@@ -6,8 +6,11 @@ import TreeView from "../components/TreeView";
 import Search from "../components/Search";
 import Timeline from "../components/Timeline";
 import RetainedSize from "../components/RetainedSize";
+import { fetchJson } from "../lib/api";
 
 type Tab = "summary" | "nodes" | "tree" | "timeline" | "retained" | "search";
+
+const FULL_PARSE_NODE_LIMIT = 5_000_000;
 
 interface Meta {
   fileName: string;
@@ -37,26 +40,23 @@ export default function Profile() {
   const [error, setError] = useState<string | null>(null);
 
   const base = `/api/profile/${encodeURIComponent(filePath)}`;
+  const supportsFullInspect = meta?.node_count == null || meta.node_count <= FULL_PARSE_NODE_LIMIT;
 
   useEffect(() => {
     if (!filePath) return;
     setError(null);
-    fetch(`${base}/meta`)
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
+    fetchJson<Meta>(`${base}/meta`)
       .then(setMeta)
       .catch((e) => setError(e.message));
   }, [filePath]);
 
   const tabs: { key: Tab; label: string; show: boolean }[] = [
     { key: "summary", label: "Summary", show: true },
-    { key: "nodes", label: "Nodes", show: meta?.type === "heapsnapshot" },
+    { key: "nodes", label: "Nodes", show: meta?.type === "heapsnapshot" && supportsFullInspect },
     { key: "tree", label: "Call Tree", show: meta?.type === "heapprofile" },
-    { key: "timeline", label: "Timeline", show: meta?.type === "heaptimeline" },
-    { key: "retained", label: "Retained", show: meta?.type === "heapsnapshot" },
-    { key: "search", label: "Search", show: true },
+    { key: "timeline", label: "Timeline", show: meta?.type === "heaptimeline" && supportsFullInspect },
+    { key: "retained", label: "Retained", show: meta?.type === "heapsnapshot" && supportsFullInspect },
+    { key: "search", label: "Search", show: meta?.type === "heapprofile" || supportsFullInspect },
   ];
 
   if (error) {
@@ -108,6 +108,11 @@ export default function Profile() {
       </nav>
 
       <main className="p-6">
+        {!supportsFullInspect && (
+          <div className="mb-6 rounded-lg border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+            This profile is very large. Interactive node, retained, timeline, and string search views are disabled to avoid full parsing in the API server.
+          </div>
+        )}
         {tab === "summary" && <Summary base={base} type={meta.type} />}
         {tab === "nodes" && <NodesTable base={base} />}
         {tab === "tree" && <TreeView base={base} />}

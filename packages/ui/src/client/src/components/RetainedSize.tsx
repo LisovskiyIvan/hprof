@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { fetchJson } from "../lib/api";
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes === 0) return "0 B";
@@ -24,16 +25,18 @@ export default function RetainedSize({ base }: { base: string }) {
   const [data, setData] = useState<RetainedEntry[] | null>(null);
   const [top, setTop] = useState(50);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     setLoading(true);
-    fetch(`${base}/retained?top=${top}`)
-      .then((r) => r.json())
+    setError(null);
+    fetchJson<{ retained: RetainedEntry[] }>(`${base}/retained?top=${top}`)
       .then((d) => { setData(d.retained); setLoading(false); })
-      .catch(() => setLoading(false));
+      .catch((e) => { setLoading(false); setError(e.message); });
   }, [base, top]);
 
   if (loading) return <p className="text-gray-500">Computing retained sizes (this may take a moment for large snapshots)...</p>;
+  if (error) return <p className="text-red-400 text-sm">Failed to load retained sizes: {error}</p>;
   if (!data) return null;
 
   const maxRetained = data[0]?.retainedSize ?? 1;

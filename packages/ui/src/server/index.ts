@@ -27,6 +27,10 @@ export interface ServerOptions {
   open: boolean;
 }
 
+const FULL_PARSE_NODE_LIMIT = 5_000_000;
+
+type ApiError = Error & { status?: number };
+
 interface ProfileData {
   type: ProfileType;
   filePath: string;
@@ -38,9 +42,17 @@ interface ProfileData {
   profileResult?: HeapProfileResult;
   snapshotResult?: HeapSnapshotResult;
   timelineResult?: HeapTimelineResult;
+  profileResultPromise?: Promise<HeapProfileResult>;
+  snapshotResultPromise?: Promise<HeapSnapshotResult>;
+  timelineResultPromise?: Promise<HeapTimelineResult>;
   profileSummary?: HeapProfileSummary;
   snapshotSummary?: HeapSnapshotSummary;
   timelineSummary?: HeapTimelineSummary;
+  retainedSizes?: number[];
+  profileSummaryPromise?: Promise<HeapProfileSummary>;
+  snapshotSummaryPromise?: Promise<HeapSnapshotSummary>;
+  timelineSummaryPromise?: Promise<HeapTimelineSummary>;
+  retainedSizesPromise?: Promise<number[]>;
 }
 
 const profiles = new Map<string, ProfileData>();
@@ -85,6 +97,102 @@ function jsonResponse(data: unknown, status = 200): Response {
 
 function errorResponse(message: string, status = 400): Response {
   return jsonResponse({ error: message }, status);
+}
+
+function apiError(message: string, status: number): ApiError {
+  const error = new Error(message) as ApiError;
+  error.status = status;
+  return error;
+}
+
+function ensureInteractiveParseAllowed(data: ProfileData, feature: string) {
+  const meta = getMeta(data);
+  if (!meta || meta.node_count <= FULL_PARSE_NODE_LIMIT) return;
+  throw apiError(
+    `${feature} is disabled for very large profiles (${meta.node_count.toLocaleString()} nodes). Use summary view or CLI output instead.`,
+    413,
+  );
+}
+
+async function ensureProfileSummary(data: ProfileData): Promise<HeapProfileSummary> {
+  if (data.profileSummary) return data.profileSummary;
+  if (!data.profileSummaryPromise) {
+    data.profileSummaryPromise = Promise.resolve().then(() => {
+      data.profileSummary = data.profile!.summarize();
+      return data.profileSummary;
+    }).finally(() => {
+      data.profileSummaryPromise = undefined;
+    });
+  }
+  return data.profileSummaryPromise;
+}
+
+async function ensureSnapshotSummary(data: ProfileData): Promise<HeapSnapshotSummary> {
+  if (data.snapshotSummary) return data.snapshotSummary;
+  if (!data.snapshotSummaryPromise) {
+    data.snapshotSummaryPromise = data.snapshot!.streamSummary().then((summary) => {
+      data.snapshotSummary = summary;
+      return summary;
+    }).finally(() => {
+      data.snapshotSummaryPromise = undefined;
+    });
+  }
+  return data.snapshotSummaryPromise;
+}
+
+async function ensureTimelineSummary(data: ProfileData): Promise<HeapTimelineSummary> {
+  if (data.timelineSummary) return data.timelineSummary;
+  if (!data.timelineSummaryPromise) {
+    data.timelineSummaryPromise = data.timeline!.streamSummary().then((summary) => {
+      data.timelineSummary = summary;
+      return summary;
+    }).finally(() => {
+      data.timelineSummaryPromise = undefined;
+    });
+  }
+  return data.timelineSummaryPromise;
+}
+
+async function ensureSnapshotResult(data: ProfileData): Promise<HeapSnapshotResult> {
+  ensureInteractiveParseAllowed(data, "This view");
+  if (data.snapshotResult) return data.snapshotResult;
+  if (!data.snapshotResultPromise) {
+    data.snapshotResultPromise = Promise.resolve().then(() => {
+      data.snapshotResult = data.snapshot!.data;
+      return data.snapshotResult;
+    }).finally(() => {
+      data.snapshotResultPromise = undefined;
+    });
+  }
+  return data.snapshotResultPromise;
+}
+
+async function ensureTimelineResult(data: ProfileData): Promise<HeapTimelineResult> {
+  ensureInteractiveParseAllowed(data, "This view");
+  if (data.timelineResult) return data.timelineResult;
+  if (!data.timelineResultPromise) {
+    data.timelineResultPromise = Promise.resolve().then(() => {
+      data.timelineResult = data.timeline!.data;
+      return data.timelineResult;
+    }).finally(() => {
+      data.timelineResultPromise = undefined;
+    });
+  }
+  return data.timelineResultPromise;
+}
+
+async function ensureRetainedSizes(data: ProfileData): Promise<number[]> {
+  ensureInteractiveParseAllowed(data, "This view");
+  if (data.retainedSizes) return data.retainedSizes;
+  if (!data.retainedSizesPromise) {
+    data.retainedSizesPromise = ensureSnapshotResult(data).then(() => {
+      data.retainedSizes = data.snapshot!.retainedSizes;
+      return data.retainedSizes;
+    }).finally(() => {
+      data.retainedSizesPromise = undefined;
+    });
+  }
+  return data.retainedSizesPromise;
 }
 
 async function sendResponse(response: Response, res: import("http").ServerResponse) {
@@ -206,40 +314,31 @@ async function handleApiRequest(url: URL): Promise<Response> {
 
     case "summary": {
       if (data.type === "heapprofile") {
-        if (!data.profileResult) {
-          data.profileResult = data.profile!.data;
-        }
-        if (!data.profileSummary) {
-          data.profileSummary = data.profile!.summarize();
-        }
+        const profileSummary = await ensureProfileSummary(data);
         return jsonResponse({
-          totalSize: data.profileSummary.totalSize,
-          byFrame: serializeMap(data.profileSummary.byFrame),
-          byUrl: serializeMap(data.profileSummary.byUrl),
-          byFunction: serializeMap(data.profileSummary.byFunction),
+          totalSize: profileSummary.totalSize,
+          byFrame: serializeMap(profileSummary.byFrame),
+          byUrl: serializeMap(profileSummary.byUrl),
+          byFunction: serializeMap(profileSummary.byFunction),
         });
       }
 
       if (data.type === "heapsnapshot") {
-        if (!data.snapshotSummary) {
-          data.snapshotSummary = await data.snapshot!.streamSummary();
-        }
+        const snapshotSummary = await ensureSnapshotSummary(data);
         return jsonResponse({
-          totalSize: data.snapshotSummary.totalSize,
-          totalCount: data.snapshotSummary.totalCount,
-          byNodeName: serializeMap(data.snapshotSummary.byNodeName),
-          byNodeType: serializeMap(data.snapshotSummary.byNodeType),
+          totalSize: snapshotSummary.totalSize,
+          totalCount: snapshotSummary.totalCount,
+          byNodeName: serializeMap(snapshotSummary.byNodeName),
+          byNodeType: serializeMap(snapshotSummary.byNodeType),
         });
       }
 
       if (data.type === "heaptimeline") {
-        if (!data.timelineSummary) {
-          data.timelineSummary = await data.timeline!.streamSummary();
-        }
+        const timelineSummary = await ensureTimelineSummary(data);
         return jsonResponse({
-          totalAllocated: data.timelineSummary.totalAllocated,
-          totalFreed: data.timelineSummary.totalFreed,
-          byType: serializeMap(data.timelineSummary.byType),
+          totalAllocated: timelineSummary.totalAllocated,
+          totalFreed: timelineSummary.totalFreed,
+          byType: serializeMap(timelineSummary.byType),
         });
       }
 
@@ -250,9 +349,7 @@ async function handleApiRequest(url: URL): Promise<Response> {
       if (data.type !== "heapsnapshot") {
         return errorResponse("Nodes only available for heapsnapshot");
       }
-      if (!data.snapshotResult) {
-        data.snapshotResult = data.snapshot!.data;
-      }
+      const snapshotResult = await ensureSnapshotResult(data);
       const page = Number(url.searchParams.get("page") ?? "0");
       const pageSize = Number(url.searchParams.get("pageSize") ?? "100");
       const nodeType = url.searchParams.get("type");
@@ -260,7 +357,7 @@ async function handleApiRequest(url: URL): Promise<Response> {
       const sort = url.searchParams.get("sort") ?? "selfSize";
       const sortDir = url.searchParams.get("dir") ?? "desc";
 
-      let filtered = data.snapshotResult.nodes;
+      let filtered = snapshotResult.nodes;
       if (nodeType) {
         filtered = filtered.filter((n) => n.type === nodeType);
       }
@@ -292,20 +389,18 @@ async function handleApiRequest(url: URL): Promise<Response> {
       if (data.type !== "heapsnapshot") {
         return errorResponse("Edges only available for heapsnapshot");
       }
-      if (!data.snapshotResult) {
-        data.snapshotResult = data.snapshot!.data;
-      }
+      const snapshotResult = await ensureSnapshotResult(data);
       const nodeId = Number(url.searchParams.get("nodeId"));
       if (!nodeId) return errorResponse("nodeId required");
 
-      const node = data.snapshotResult.nodes[nodeId];
+      const node = snapshotResult.nodes[nodeId];
       if (!node) return errorResponse("Node not found");
 
       let offset = 0;
       for (let i = 0; i < nodeId; i++) {
-        offset += data.snapshotResult.nodes[i]!.edgeCount;
+        offset += snapshotResult.nodes[i]!.edgeCount;
       }
-      const edges = data.snapshotResult.edges.slice(offset, offset + node.edgeCount);
+      const edges = snapshotResult.edges.slice(offset, offset + node.edgeCount);
 
       return jsonResponse({
         node,
@@ -327,11 +422,9 @@ async function handleApiRequest(url: URL): Promise<Response> {
       if (data.type !== "heaptimeline") {
         return errorResponse("Timeline only available for heaptimeline");
       }
-      if (!data.timelineResult) {
-        data.timelineResult = data.timeline!.data;
-      }
+      const timelineResult = await ensureTimelineResult(data);
       return jsonResponse({
-        timeline: data.timelineResult.timeline,
+        timeline: timelineResult.timeline,
       });
     }
 
@@ -340,15 +433,19 @@ async function handleApiRequest(url: URL): Promise<Response> {
       if (!q) return errorResponse("q parameter required");
 
       if (data.type === "heapsnapshot" || data.type === "heaptimeline") {
-        if (!data.snapshotResult && data.type === "heapsnapshot") {
-          data.snapshotResult = data.snapshot!.data;
+        if (data.type === "heapsnapshot") {
+          const snapshotResult = await ensureSnapshotResult(data);
+          const re = new RegExp(q, "i");
+          const matches = snapshotResult.strings
+            .map((s, i) => ({ index: i, value: s }))
+            .filter((s) => re.test(s.value))
+            .slice(0, 100);
+          return jsonResponse({ matches });
         }
-        if (!data.timelineResult && data.type === "heaptimeline") {
-          data.timelineResult = data.timeline!.data;
-        }
-        const strings = data.snapshotResult?.strings ?? data.timelineResult?.strings ?? [];
+
+        const timelineResult = await ensureTimelineResult(data);
         const re = new RegExp(q, "i");
-        const matches = strings
+        const matches = timelineResult.strings
           .map((s, i) => ({ index: i, value: s }))
           .filter((s) => re.test(s.value))
           .slice(0, 100);
@@ -356,14 +453,9 @@ async function handleApiRequest(url: URL): Promise<Response> {
       }
 
       if (data.type === "heapprofile") {
-        if (!data.profileResult) {
-          data.profileResult = data.profile!.data;
-        }
-        if (!data.profileSummary) {
-          data.profileSummary = data.profile!.summarize();
-        }
+        const profileSummary = await ensureProfileSummary(data);
         const re = new RegExp(q, "i");
-        const frames = [...data.profileSummary.byFrame.entries()]
+        const frames = [...profileSummary.byFrame.entries()]
           .filter(([frame]) => re.test(frame))
           .slice(0, 100);
         return jsonResponse({ matches: frames.map(([frame, size]) => ({ frame, size })) });
@@ -376,11 +468,9 @@ async function handleApiRequest(url: URL): Promise<Response> {
       if (data.type !== "heapsnapshot") {
         return errorResponse("Retained size only available for heapsnapshot");
       }
-      if (!data.snapshotResult) {
-        data.snapshotResult = data.snapshot!.data;
-      }
+      const snapshotResult = await ensureSnapshotResult(data);
 
-      const retainedSizes = data.snapshot!.retainedSizes;
+      const retainedSizes = await ensureRetainedSizes(data);
       const topN = Number(url.searchParams.get("top") ?? "30");
       const indexed = retainedSizes
         .map((size, idx) => ({ idx, size }))
@@ -388,7 +478,7 @@ async function handleApiRequest(url: URL): Promise<Response> {
         .slice(0, topN);
 
       const result = indexed.map(({ idx, size }) => {
-        const node = data.snapshotResult!.nodes[idx]!;
+        const node = snapshotResult.nodes[idx]!;
         return {
           nodeIndex: idx,
           name: node.name,
@@ -430,7 +520,8 @@ export async function startServer(options: ServerOptions): Promise<void> {
         : staticResponse(clientDist, url.pathname);
       await sendResponse(response, res);
     } catch (error) {
-      await sendResponse(errorResponse((error as Error).message, 500), res);
+      const apiErr = error as ApiError;
+      await sendResponse(errorResponse(apiErr.message, apiErr.status ?? 500), res);
     }
   });
 

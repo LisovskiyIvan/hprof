@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { fetchJson } from "../lib/api";
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes)) return String(bytes);
@@ -27,13 +28,16 @@ interface SummaryData {
 
 export default function Summary({ base, type }: { base: string; type: string }) {
   const [data, setData] = useState<SummaryData | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch(`${base}/summary`)
-      .then((r) => r.json())
-      .then(setData);
+    setError(null);
+    fetchJson<SummaryData>(`${base}/summary`)
+      .then(setData)
+      .catch((e) => setError(e.message));
   }, [base]);
 
+  if (error) return <p className="text-red-400 text-sm">Failed to load summary: {error}</p>;
   if (!data) return <p className="text-gray-500">Loading summary...</p>;
 
   if (type === "heapprofile") {

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { fetchJson } from "../lib/api";
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes)) return String(bytes);
@@ -26,17 +27,21 @@ export default function Search({ base, type }: { base: string; type: string }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<StringMatch[] | FrameMatch[] | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const doSearch = () => {
     if (!query.trim()) return;
     setLoading(true);
-    fetch(`${base}/search?q=${encodeURIComponent(query)}`)
-      .then((r) => r.json())
+    setError(null);
+    fetchJson<{ matches: StringMatch[] | FrameMatch[] }>(`${base}/search?q=${encodeURIComponent(query)}`, { cache: false })
       .then((data) => {
         setResults(data.matches);
         setLoading(false);
       })
-      .catch(() => setLoading(false));
+      .catch((e) => {
+        setLoading(false);
+        setError(e.message);
+      });
   };
 
   return (
@@ -58,6 +63,8 @@ export default function Search({ base, type }: { base: string; type: string }) {
           Search
         </button>
       </div>
+
+      {error && <p className="text-red-400 text-sm">Failed to search: {error}</p>}
 
       {results && (
         <div className="bg-gray-900 rounded-lg overflow-hidden">
