@@ -100,16 +100,16 @@ function printUsage() {
  ${bold('Usage:')} hprof <command> [options] <file>
 
  ${bold('Commands:')}
-   ${cyan('analyze')}   Analyze profile file and print summary to stdout (default)
-   ${cyan('ui')}        Start web UI server for interactive analysis
-   ${cyan('help')}      Show this help message
+    ${cyan('analyze')}   Analyze profile file and print summary to stdout (default)
+    ${cyan('ui')}        Start web UI server for interactive analysis
+    ${cyan('help')}      Show this help message
 
  ${bold('Options:')}
    ${yellow('--top <n>')}       Number of top entries to show (default: 30)
    ${yellow('--filter <re>')}   Filter results by regex
-   ${yellow('--json')}          Output as JSON
-   ${yellow('--port <port>')}   Port for UI server (default: 3000)
-   ${yellow('--open')}          Open browser automatically (ui command only)
+    ${yellow('--json')}          Output as JSON
+    ${yellow('--port <port>')}   Port for UI server (default: 3000)
+    ${yellow('--open')}          Open browser automatically (ui command only)
 
  ${bold('Supported formats:')}
    ${green('.heapsnapshot')}   V8 heap snapshot
@@ -151,7 +151,7 @@ function parseArgs(argv: string[]): CliArgs {
       args.open = true
     } else if (arg === '--json') {
       args.json = true
-    } else if (arg === 'analyze' || arg === 'ui' || arg === 'help') {
+    } else if (arg === 'analyze' || arg === 'ui' || arg === 'help' || arg === 'bench') {
       args.command = arg
     } else if (!arg.startsWith('-')) {
       args.files.push(arg)

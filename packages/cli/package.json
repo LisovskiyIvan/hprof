@@ -4,6 +4,9 @@
   "bin": {
     "hprof": "src/cli.ts"
   },
+  "files": [
+    "src"
+  ],
   "type": "module",
   "dependencies": {
     "@hprof/core": "workspace:*",

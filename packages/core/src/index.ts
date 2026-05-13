@@ -1,19 +1,15 @@
-export type ProfileType = "heapsnapshot" | "heapprofile" | "heaptimeline";
+export type ProfileType = 'heapsnapshot' | 'heapprofile' | 'heaptimeline'
 
 export interface ProfileMeta {
-  fileName: string;
-  fileSize: number;
-  type: ProfileType;
+  fileName: string
+  fileSize: number
+  type: ProfileType
 }
 
-export { HeapProfile } from "./heapprofile.ts";
-export type {
-  HeapProfileResult,
-  HeapProfileSummary,
-  FlatCallFrame,
-} from "./heapprofile.ts";
+export { HeapProfile } from './heapprofile.ts'
+export type { HeapProfileResult, HeapProfileSummary, FlatCallFrame } from './heapprofile.ts'
 
-export { HeapSnapshot } from "./heapsnapshot.ts";
+export { HeapSnapshot } from './heapsnapshot.ts'
 export type {
   HeapSnapshotMeta,
   HeapSnapshotNode,
@@ -24,13 +20,9 @@ export type {
   HeapSnapshotNodePageOptions,
   HeapSnapshotSearchMatch,
   HeapSnapshotRetainedEntry,
-} from "./heapsnapshot.ts";
+} from './heapsnapshot.ts'
 
-export { HeapTimeline } from "./heaptimeline.ts";
-export type {
-  HeapTimelineResult,
-  TimelineEntry,
-  HeapTimelineSummary,
-} from "./heaptimeline.ts";
+export { HeapTimeline } from './heaptimeline.ts'
+export type { HeapTimelineResult, TimelineEntry, HeapTimelineSummary } from './heaptimeline.ts'
 
-export { detectType as detectProfileType, formatBytesNative as formatBytes } from "./ffi.ts";
+export { detectType as detectProfileType, formatBytesNative as formatBytes } from './ffi.ts'

@@ -56,7 +56,8 @@ packages/
 - [x] `buildRetainedSize(snapshot)` — расчёт retained size (BFS/DFS от GC roots)
 
 **Референс:** `analyze-memory-profiles.mjs:108-340`
- ### 1.4 Heaptimeline parser (`src/heaptimeline.ts`)
+
+### 1.4 Heaptimeline parser (`src/heaptimeline.ts`)
 
 Похож на heapsnapshot, но с массивом `timeline` записей.
 

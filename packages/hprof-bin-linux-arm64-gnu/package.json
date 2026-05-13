@@ -2,11 +2,21 @@
   "name": "@hprof/hprof-bin-linux-arm64-gnu",
   "version": "0.0.0",
   "description": "hprof native binary for linux-arm64-gnu",
-  "os": ["linux"],
-  "cpu": ["arm64"],
-  "main": "libhprof_c.so",
-  "files": ["libhprof_c.so"],
-  "publishConfig": { "access": "public" },
   "license": "MIT",
-  "libc": ["glibc"]
+  "files": [
+    "libhprof_c.so"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "main": "libhprof_c.so",
+  "publishConfig": {
+    "access": "public"
+  }
 }

@@ -11,3 +11,7 @@ serde_derive = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 regex = "1"
+memmap2 = "0.9"
+memchr = "2"
+rayon = "1"
+ahash = "0.8"

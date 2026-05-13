@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::BufReader;
 
 use crate::types::*;
-use crate::heapsnapshot::stream_json_numbers;
+use crate::heapsnapshot::{parse_numbers_fast, find_marker};
 
 pub struct HeapTimeline {
     file_path: String,
@@ -33,16 +32,20 @@ impl HeapTimeline {
         let type_offset = node_fields.iter().position(|f| f == "type").ok_or(Error::UnsupportedLayout)?;
         let self_size_offset = node_fields.iter().position(|f| f == "self_size").ok_or(Error::UnsupportedLayout)?;
 
-        let mut reader = BufReader::new(fs::File::open(&self.file_path)?);
-        let nodes = stream_json_numbers(&mut reader, b"\"nodes\":[")?;
+        let mmap = unsafe { memmap2::Mmap::map(&fs::File::open(&self.file_path)?)? };
+        let data = &mmap[..];
 
-        let mut by_type_idx: HashMap<usize, TimelineTypeSummary> = HashMap::new();
+        let nodes_marker = b"\"nodes\":[";
+        let nodes_start = find_marker(data, nodes_marker).ok_or(Error::HeaderParseFailed)?;
+        let nodes = parse_numbers_fast(&data[nodes_start + nodes_marker.len()..]);
+
+        let mut by_type_idx: HashMap<u32, TimelineTypeSummary> = HashMap::new();
         let mut total_allocated = 0usize;
 
         for chunk in nodes.chunks(node_field_count) {
             if chunk.len() < node_field_count { break; }
             let type_idx = chunk[type_offset];
-            let self_size = chunk[self_size_offset];
+            let self_size = chunk[self_size_offset] as usize;
             total_allocated += self_size;
 
             if self_size > 0 {
@@ -55,7 +58,7 @@ impl HeapTimeline {
         let top = top.unwrap_or(30);
         let mut by_type: HashMap<String, TimelineTypeSummary> = HashMap::new();
         for (&type_idx, info) in &by_type_idx {
-            let type_name = node_types.get(type_idx).cloned().unwrap_or_else(|| type_idx.to_string());
+            let type_name = node_types.get(type_idx as usize).cloned().unwrap_or_else(|| type_idx.to_string());
             by_type.insert(type_name, info.clone());
         }
 

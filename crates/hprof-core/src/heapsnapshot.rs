@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufReader, Read};
+use std::io::Read;
+
+use ahash::AHashMap;
+use memchr::memchr;
+use memmap2::Mmap;
+use rayon::prelude::*;
 
 use crate::types::*;
 
@@ -11,12 +16,10 @@ pub struct HeapSnapshot {
     edge_starts: Option<Vec<u32>>,
 }
 
-#[allow(dead_code)]
-
 pub struct RawData {
     pub meta: SnapshotMeta,
-    pub nodes: Vec<usize>,
-    pub edges: Vec<usize>,
+    pub nodes: Vec<u32>,
+    pub edges: Vec<u32>,
     pub strings: Vec<String>,
     pub node_offsets: NodeFieldOffsets,
     pub edge_offsets: EdgeFieldOffsets,
@@ -38,16 +41,21 @@ impl HeapSnapshot {
         Ok(self.meta.as_ref().unwrap())
     }
 
+    fn mmap_file(&self) -> crate::Result<Mmap> {
+        let file = fs::File::open(&self.file_path)?;
+        unsafe { Ok(Mmap::map(&file)?) }
+    }
+
     fn parse_meta(&mut self) -> crate::Result<()> {
         let file = fs::File::open(&self.file_path)?;
-        let mut reader = BufReader::new(file);
+        let mut reader = std::io::BufReader::new(file);
         let mut chunk_size = 2 * 1024 * 1024;
         let max_chunk = 64 * 1024 * 1024;
 
         while chunk_size <= max_chunk {
             let mut buffer = vec![0u8; chunk_size];
             let bytes_read = reader.read(&mut buffer)?;
-            let prefix = String::from_utf8_lossy(&buffer[..bytes_read]);
+            let prefix = unsafe { std::str::from_utf8_unchecked(&buffer[..bytes_read]) };
 
             if let Some(snapshot_start) = prefix.find("\"snapshot\":") {
                 if let Some(nodes_start) = prefix.find("\"nodes\":[") {
@@ -55,7 +63,7 @@ impl HeapSnapshot {
                         let object_start = prefix[snapshot_start..].find('{');
                         if let Some(obj_offset) = object_start {
                             let obj_start = snapshot_start + obj_offset;
-                            if let Some(end) = find_matching_brace(&prefix, obj_start) {
+                            if let Some(end) = find_matching_brace(prefix, obj_start) {
                                 let json_str = &prefix[obj_start..=end];
                                 let meta = parse_meta_from_value(json_str)?;
                                 self.meta = Some(meta);
@@ -68,7 +76,7 @@ impl HeapSnapshot {
 
             if !prefix.contains("\"nodes\":[") {
                 chunk_size *= 2;
-                reader = BufReader::new(fs::File::open(&self.file_path)?);
+                reader = std::io::BufReader::new(fs::File::open(&self.file_path)?);
                 continue;
             }
 
@@ -84,14 +92,20 @@ impl HeapSnapshot {
         let _ = self.meta()?;
         let meta = self.meta.as_ref().unwrap().clone();
 
-        let mut reader1 = BufReader::new(fs::File::open(&self.file_path)?);
-        let nodes = stream_json_numbers(&mut reader1, b"\"nodes\":[")?;
+        let mmap = self.mmap_file()?;
+        let data = &mmap[..];
 
-        let mut reader2 = BufReader::new(fs::File::open(&self.file_path)?);
-        let edges = stream_json_numbers(&mut reader2, b"\"edges\":[")?;
+        let nodes_marker = b"\"nodes\":[";
+        let edges_marker = b"\"edges\":[";
+        let strings_marker = b"\"strings\":[";
 
-        let mut reader3 = BufReader::new(fs::File::open(&self.file_path)?);
-        let strings = stream_json_strings(&mut reader3, b"\"strings\":[")?;
+        let nodes_start = find_marker(data, nodes_marker).ok_or(Error::HeaderParseFailed)?;
+        let edges_start = find_marker(data, edges_marker).ok_or(Error::HeaderParseFailed)?;
+        let strings_start = find_marker(data, strings_marker).ok_or(Error::HeaderParseFailed)?;
+
+        let nodes = parse_numbers_fast(&data[nodes_start + nodes_marker.len()..]);
+        let edges = parse_numbers_fast(&data[edges_start + edges_marker.len()..]);
+        let strings = parse_strings_fast(&data[strings_start + strings_marker.len()..]);
 
         let node_offsets = NodeFieldOffsets::from_fields(&meta.meta.node_fields)?;
         let edge_offsets = EdgeFieldOffsets::from_fields(&meta.meta.edge_fields)?;
@@ -117,11 +131,11 @@ impl HeapSnapshot {
 
     fn create_node(raw: &RawData, node_index: usize) -> HeapSnapshotNode {
         let base = node_index * raw.node_field_count;
-        let type_idx = raw.nodes[base + raw.node_offsets.type_];
-        let name_idx = raw.nodes[base + raw.node_offsets.name];
-        let self_size = raw.nodes[base + raw.node_offsets.self_size];
-        let id = raw.nodes[base + raw.node_offsets.id];
-        let edge_count = raw.nodes[base + raw.node_offsets.edge_count];
+        let type_idx = raw.nodes[base + raw.node_offsets.type_] as usize;
+        let name_idx = raw.nodes[base + raw.node_offsets.name] as usize;
+        let self_size = raw.nodes[base + raw.node_offsets.self_size] as usize;
+        let id = raw.nodes[base + raw.node_offsets.id] as usize;
+        let edge_count = raw.nodes[base + raw.node_offsets.edge_count] as usize;
 
         let type_ = raw.node_types.get(type_idx).cloned().unwrap_or_else(|| type_idx.to_string());
         let name = raw.strings.get(name_idx).cloned().unwrap_or_else(|| format!("<string#{}>", name_idx));
@@ -139,44 +153,75 @@ impl HeapSnapshot {
         let name_offset = node_fields.iter().position(|f| f == "name").ok_or(Error::UnsupportedLayout)?;
         let self_size_offset = node_fields.iter().position(|f| f == "self_size").ok_or(Error::UnsupportedLayout)?;
 
-        let file = fs::File::open(&self.file_path)?;
-        let mut reader = BufReader::new(file);
+        let mmap = self.mmap_file()?;
+        let data = &mmap[..];
+        let nodes_marker = b"\"nodes\":[";
+        let nodes_start = find_marker(data, nodes_marker).ok_or(Error::HeaderParseFailed)?;
+        let nodes = parse_numbers_fast(&data[nodes_start + nodes_marker.len()..]);
 
-        let nodes = stream_json_numbers(&mut reader, b"\"nodes\":[")?;
+        let total_node_count = nodes.len() / node_field_count;
 
-        let mut by_name_idx: HashMap<usize, (usize, usize, usize)> = HashMap::new();
-        let mut by_type_idx: HashMap<usize, (usize, usize)> = HashMap::new();
-        let mut total_count = 0usize;
+        let chunks_per_thread = (total_node_count / rayon::current_num_threads().max(1)).max(1);
+        let partials: Vec<(usize, usize, AHashMap<u32, (usize, usize, u32)>, AHashMap<u32, (usize, usize)>)> = nodes
+            .par_chunks(chunks_per_thread * node_field_count)
+            .map(|chunk| {
+                let mut local_size = 0usize;
+                let mut local_count = 0usize;
+                let mut local_by_name: AHashMap<u32, (usize, usize, u32)> = AHashMap::new();
+                let mut local_by_type: AHashMap<u32, (usize, usize)> = AHashMap::new();
+
+                for c in chunk.chunks(node_field_count) {
+                    if c.len() < node_field_count { break; }
+                    let type_idx = c[type_offset];
+                    let name_idx = c[name_offset];
+                    let self_size = c[self_size_offset] as usize;
+                    local_count += 1;
+                    local_size += self_size;
+
+                    if self_size > 0 {
+                        let e = local_by_name.entry(name_idx).or_insert((0, 0, type_idx));
+                        e.0 += self_size;
+                        e.1 += 1;
+                        let te = local_by_type.entry(type_idx).or_insert((0, 0));
+                        te.0 += self_size;
+                        te.1 += 1;
+                    }
+                }
+                (local_size, local_count, local_by_name, local_by_type)
+            })
+            .collect();
+
         let mut total_size = 0usize;
+        let mut total_count = 0usize;
+        let mut by_name_idx: AHashMap<u32, (usize, usize, u32)> = AHashMap::new();
+        let mut by_type_idx: AHashMap<u32, (usize, usize)> = AHashMap::new();
 
-        for chunk in nodes.chunks(node_field_count) {
-            if chunk.len() < node_field_count { break; }
-            let type_idx = chunk[type_offset];
-            let name_idx = chunk[name_offset];
-            let self_size = chunk[self_size_offset];
-            total_count += 1;
-            total_size += self_size;
-
-            if self_size > 0 {
-                let entry = by_name_idx.entry(name_idx).or_insert((0, 0, type_idx));
-                entry.0 += self_size;
-                entry.1 += 1;
-
-                let type_entry = by_type_idx.entry(type_idx).or_insert((0, 0));
-                type_entry.0 += self_size;
-                type_entry.1 += 1;
+        for (size, count, local_names, local_types) in partials {
+            total_size += size;
+            total_count += count;
+            for (name_idx, (sz, cnt, type_idx)) in local_names {
+                let e = by_name_idx.entry(name_idx).or_insert((0, 0, 0));
+                e.0 += sz;
+                e.1 += cnt;
+                e.2 = type_idx;
+            }
+            for (type_idx, (sz, cnt)) in local_types {
+                let e = by_type_idx.entry(type_idx).or_insert((0, 0));
+                e.0 += sz;
+                e.1 += cnt;
             }
         }
 
-        let mut reader2 = BufReader::new(fs::File::open(&self.file_path)?);
-        let strings = stream_json_strings(&mut reader2, b"\"strings\":[")?;
+        let strings_marker = b"\"strings\":[";
+        let strings_start = find_marker(data, strings_marker).ok_or(Error::HeaderParseFailed)?;
+        let strings = parse_strings_fast(&data[strings_start + strings_marker.len()..]);
 
         let filter_re = filter.and_then(|f| regex::Regex::new(f).ok());
         let mut by_node_name: HashMap<String, TypeSummary> = HashMap::new();
         for (&name_idx, &(size, count, type_idx)) in &by_name_idx {
-            let name = strings.get(name_idx).cloned().unwrap_or_else(|| format!("<string#{}>", name_idx));
+            let name = strings.get(name_idx as usize).cloned().unwrap_or_else(|| format!("<string#{}>", name_idx));
             if let Some(ref re) = filter_re {
-                let type_name = node_types.get(type_idx).map(|s| s.as_str()).unwrap_or("");
+                let type_name = node_types.get(type_idx as usize).map(|s| s.as_str()).unwrap_or("");
                 if !re.is_match(&format!("{} {}", name, type_name)) {
                     continue;
                 }
@@ -187,12 +232,12 @@ impl HeapSnapshot {
         }
 
         let mut sorted_names: Vec<_> = by_node_name.into_iter().collect();
-        sorted_names.sort_by(|a, b| b.1.size.cmp(&a.1.size));
+        sorted_names.sort_unstable_by(|a, b| b.1.size.cmp(&a.1.size));
         sorted_names.truncate(top);
 
         let mut by_node_type: HashMap<String, TypeSummary> = HashMap::new();
         for (&type_idx, &(size, count)) in &by_type_idx {
-            let type_name = node_types.get(type_idx).cloned().unwrap_or_else(|| type_idx.to_string());
+            let type_name = node_types.get(type_idx as usize).cloned().unwrap_or_else(|| type_idx.to_string());
             by_node_type.insert(type_name, TypeSummary { size, count });
         }
 
@@ -213,16 +258,41 @@ impl HeapSnapshot {
         let mut selected: Vec<(usize, HeapSnapshotNode)> = Vec::with_capacity(wanted);
         let mut total = 0usize;
 
-        for node_index in 0..raw.meta.node_count {
-            let node = Self::create_node(raw, node_index);
-            if let Some(ft) = options.type_filter {
-                if node.type_ != ft { continue; }
+        let query_lower;
+        let q_match = if let Some(q) = options.query {
+            if q.is_empty() {
+                None
+            } else {
+                query_lower = q.to_lowercase();
+                Some(&query_lower[..])
             }
-            if let Some(q) = options.query {
-                if !q.is_empty() && !node.name.to_lowercase().contains(&q.to_lowercase()) {
+        } else {
+            None
+        };
+
+        for node_index in 0..raw.meta.node_count {
+            let base = node_index * raw.node_field_count;
+            let type_idx = raw.nodes[base + raw.node_offsets.type_] as usize;
+            let type_ = raw.node_types.get(type_idx).cloned().unwrap_or_else(|| type_idx.to_string());
+
+            if let Some(ft) = options.type_filter {
+                if type_ != ft { continue; }
+            }
+
+            let name_idx = raw.nodes[base + raw.node_offsets.name] as usize;
+            let name = raw.strings.get(name_idx).cloned().unwrap_or_else(|| format!("<string#{}>", name_idx));
+
+            if let Some(ql) = q_match {
+                if !name.to_lowercase().contains(ql) {
                     continue;
                 }
             }
+
+            let self_size = raw.nodes[base + raw.node_offsets.self_size] as usize;
+            let id = raw.nodes[base + raw.node_offsets.id] as usize;
+            let edge_count = raw.nodes[base + raw.node_offsets.edge_count] as usize;
+
+            let node = HeapSnapshotNode { type_, name, self_size, retention_size: None, id, edge_count };
             total += 1;
 
             let candidate = (node_index, node);
@@ -236,7 +306,7 @@ impl HeapSnapshot {
             }
         }
 
-        selected.sort_by(|a, b| compare_nodes(a, b, options.sort, options.dir));
+        selected.sort_unstable_by(|a, b| compare_nodes(a, b, options.sort, options.dir));
 
         Ok(NodePage {
             total,
@@ -259,7 +329,7 @@ impl HeapSnapshot {
             for i in 0..raw.meta.node_count {
                 starts.push(offset);
                 let base = i * raw.node_field_count;
-                offset += raw.nodes[base + raw.node_offsets.edge_count] as u32;
+                offset += raw.nodes[base + raw.node_offsets.edge_count];
             }
             starts.push(offset);
             self.edge_starts = Some(starts);
@@ -273,9 +343,9 @@ impl HeapSnapshot {
         let mut edges = Vec::with_capacity(edge_end - edge_start);
         for edge_index in edge_start..edge_end {
             let base = edge_index * raw.edge_field_count;
-            let type_idx = raw.edges[base + raw.edge_offsets.type_];
-            let name_or_index_val = raw.edges[base + raw.edge_offsets.name_or_index];
-            let to_node = raw.edges[base + raw.edge_offsets.to_node] / raw.node_field_count;
+            let type_idx = raw.edges[base + raw.edge_offsets.type_] as usize;
+            let name_or_index_val = raw.edges[base + raw.edge_offsets.name_or_index] as usize;
+            let to_node = raw.edges[base + raw.edge_offsets.to_node] as usize / raw.node_field_count;
 
             let edge_type = raw.edge_types.get(type_idx).cloned().unwrap_or_else(|| type_idx.to_string());
             let name = if edge_type == "element" {
@@ -296,9 +366,10 @@ impl HeapSnapshot {
     pub fn search_strings(&mut self, query: &str) -> crate::Result<Vec<SearchMatch>> {
         self.ensure_raw()?;
         let raw = self.raw.as_ref().unwrap();
+        let query_lower = query.to_lowercase();
         let mut matches_ = Vec::new();
         for (index, value) in raw.strings.iter().enumerate() {
-            if value.to_lowercase().contains(&query.to_lowercase()) {
+            if value.to_lowercase().contains(&query_lower) {
                 matches_.push(SearchMatch { index, value: value.clone() });
                 if matches_.len() >= 100 { break; }
             }
@@ -323,7 +394,7 @@ impl HeapSnapshot {
                     selected[worst_pos] = (node_index, node);
                 }
             }
-            selected.sort_by(|a, b| b.1.self_size.cmp(&a.1.self_size));
+            selected.sort_unstable_by(|a, b| b.1.self_size.cmp(&a.1.self_size));
             return Ok(RetainedResult {
                 approximate: true,
                 retained: selected.into_iter().map(|(idx, node)| RetainedEntry {
@@ -339,7 +410,7 @@ impl HeapSnapshot {
 
         let retained = self.build_retained_sizes(raw)?;
         let mut indexed: Vec<(usize, f64)> = retained.into_iter().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         indexed.truncate(top_n);
 
         Ok(RetainedResult {
@@ -365,7 +436,7 @@ impl HeapSnapshot {
         for i in 0..node_count {
             edge_starts[i] = offset;
             let base = i * raw.node_field_count;
-            offset += raw.nodes[base + raw.node_offsets.edge_count] as u32;
+            offset += raw.nodes[base + raw.node_offsets.edge_count];
         }
         edge_starts[node_count] = offset;
 
@@ -385,7 +456,7 @@ impl HeapSnapshot {
             let end = edge_starts[node_idx + 1] as usize;
             for edge_index in start..end {
                 let base = edge_index * raw.edge_field_count;
-                let to_node = raw.edges[base + raw.edge_offsets.to_node] / raw.node_field_count;
+                let to_node = raw.edges[base + raw.edge_offsets.to_node] as usize / raw.node_field_count;
                 if to_node < node_count && !visited[to_node] {
                     stack.push(to_node as i64);
                 }
@@ -401,7 +472,7 @@ impl HeapSnapshot {
             let end = edge_starts[n + 1] as usize;
             for edge_index in start..end {
                 let base = edge_index * raw.edge_field_count;
-                let to_node = raw.edges[base + raw.edge_offsets.to_node] / raw.node_field_count;
+                let to_node = raw.edges[base + raw.edge_offsets.to_node] as usize / raw.node_field_count;
                 if to_node < node_count {
                     preds[to_node].push(n);
                 }
@@ -523,6 +594,7 @@ fn parse_meta_from_value(json: &str) -> crate::Result<SnapshotMeta> {
     })
 }
 
+#[inline]
 fn find_matching_brace(s: &str, start: usize) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut depth = 0i32;
@@ -556,101 +628,106 @@ fn find_matching_brace(s: &str, start: usize) -> Option<usize> {
     None
 }
 
-fn _parse_json_numbers(val: &serde_json::Value) -> Vec<usize> {
-    match val {
-        serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect(),
-        _ => Vec::new(),
+#[inline]
+pub fn find_marker(data: &[u8], marker: &[u8]) -> Option<usize> {
+    if marker.len() > data.len() { return None; }
+    let first = marker[0];
+    let mut pos = 0;
+    while pos <= data.len() - marker.len() {
+        let found = memchr(first, &data[pos..])?;
+        let abs = pos + found;
+        if abs + marker.len() > data.len() { return None; }
+        if &data[abs..abs + marker.len()] == marker {
+            return Some(abs);
+        }
+        pos = abs + 1;
     }
+    None
 }
 
-fn _parse_json_strings(val: &serde_json::Value) -> Vec<String> {
-    match val {
-        serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
-        _ => Vec::new(),
-    }
-}
+#[inline]
+pub fn parse_numbers_fast(data: &[u8]) -> Vec<u32> {
+    let mut numbers = Vec::with_capacity(data.len() / 4);
+    let mut i = 0;
+    let len = data.len();
 
-pub fn stream_json_numbers(reader: &mut BufReader<fs::File>, marker: &[u8]) -> crate::Result<Vec<usize>> {
-    skip_to(reader, marker)?;
-    let mut numbers = Vec::new();
-    let mut num_buf = String::new();
-    let mut byte = [0u8; 1];
-    loop {
-        if reader.read(&mut byte)? == 0 { break; }
-        let ch = byte[0];
+    while i < len {
+        let ch = data[i];
         if ch == b']' { break; }
-        if ch == b',' || ch == b' ' || ch == b'\n' || ch == b'\r' || ch == b'\t' {
-            if !num_buf.is_empty() {
-                if let Ok(n) = num_buf.parse::<usize>() {
-                    numbers.push(n);
-                }
-                num_buf.clear();
+        if ch.is_ascii_digit() {
+            let mut val: u32 = 0;
+            while i < len && data[i].is_ascii_digit() {
+                val = val * 10 + (data[i] - b'0') as u32;
+                i += 1;
             }
-        } else if ch == b'-' || ch.is_ascii_digit() {
-            num_buf.push(ch as char);
+            numbers.push(val);
+            continue;
         }
+        i += 1;
     }
-    if !num_buf.is_empty() {
-        if let Ok(n) = num_buf.parse::<usize>() {
-            numbers.push(n);
-        }
-    }
-    Ok(numbers)
+    numbers
 }
 
-pub fn stream_json_strings(reader: &mut BufReader<fs::File>, marker: &[u8]) -> crate::Result<Vec<String>> {
-    skip_to(reader, marker)?;
-    let mut strings = Vec::new();
-    let mut buf = Vec::new();
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut byte = [0u8; 1];
-    loop {
-        if reader.read(&mut byte)? == 0 { break; }
-        let ch = byte[0];
-        if !in_string {
+#[inline]
+fn parse_strings_fast(data: &[u8]) -> Vec<String> {
+    let mut strings = Vec::with_capacity(65536);
+    let mut i = 0;
+    let len = data.len();
+
+    while i < len {
+        if data[i] == b']' { break; }
+        if data[i] != b'"' { i += 1; continue; }
+        i += 1;
+
+        let mut buf: Vec<u8> = Vec::with_capacity(64);
+        while i < len {
+            let ch = data[i];
+            if ch == b'\\' {
+                i += 1;
+                if i >= len { break; }
+                let decoded = match data[i] {
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'\\' => b'\\',
+                    b'"' => b'"',
+                    b'/' => b'/',
+                    b'b' => 8,
+                    b'f' => 12,
+                    b'u' => {
+                        if i + 4 < len {
+                            let hex = &data[i + 1..i + 5];
+                            let cp = u32::from_str_radix(
+                                std::str::from_utf8(hex).unwrap_or("0000"), 16
+                            ).unwrap_or(0);
+                            i += 4;
+                            let mut tmp = [0u8; 4];
+                            let s = std::char::from_u32(cp)
+                                .unwrap_or('\u{FFFD}')
+                                .encode_utf8(&mut tmp);
+                            let len = s.len();
+                            buf.extend_from_slice(&tmp[..len]);
+                            i += 1;
+                            continue;
+                        }
+                        data[i]
+                    }
+                    _ => data[i],
+                };
+                buf.push(decoded);
+                i += 1;
+                continue;
+            }
             if ch == b'"' {
-                in_string = true;
-                buf.clear();
-            } else if ch == b']' {
+                i += 1;
                 break;
             }
-        } else if escaped {
-            let decoded = match ch {
-                b'n' => b'\n',
-                b'r' => b'\r',
-                b't' => b'\t',
-                b'\\' => b'\\',
-                b'"' => b'"',
-                b'/' => b'/',
-                b'b' => 8,
-                b'f' => 12,
-                _ => ch,
-            };
-            buf.push(decoded);
-            escaped = false;
-        } else if ch == b'\\' {
-            escaped = true;
-        } else if ch == b'"' {
-            in_string = false;
-            strings.push(String::from_utf8_lossy(&buf).into_owned());
-        } else {
             buf.push(ch);
+            i += 1;
         }
-    }
-    Ok(strings)
-}
 
-pub fn skip_to(reader: &mut BufReader<fs::File>, marker: &[u8]) -> crate::Result<()> {
-    let mut window = vec![0u8; marker.len()];
-    reader.read_exact(&mut window)?;
-    let mut byte = [0u8; 1];
-    let marker_len = marker.len();
-    loop {
-        if window == marker { return Ok(()); }
-        if reader.read(&mut byte)? == 0 { break; }
-        window.copy_within(1..marker_len, 0);
-        window[marker_len - 1] = byte[0];
+        strings.push(unsafe { String::from_utf8_unchecked(buf) });
     }
-    Err(Error::HeaderParseFailed)
+
+    strings
 }

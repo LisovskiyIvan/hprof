@@ -1,0 +1,8 @@
+{
+  "name": "hprof-bench",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@hprof/core": "workspace:*"
+  }
+}

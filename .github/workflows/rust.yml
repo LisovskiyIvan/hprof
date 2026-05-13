@@ -28,7 +28,7 @@ jobs:
         with:
           cache: true
           cache-on-failure: true
-          cache-key: "v1-rust"
+          cache-key: 'v1-rust'
           components: rustfmt, clippy
 
       - name: Run tests

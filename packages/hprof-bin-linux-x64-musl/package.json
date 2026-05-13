@@ -2,11 +2,21 @@
   "name": "@hprof/hprof-bin-linux-x64-musl",
   "version": "0.0.0",
   "description": "hprof native binary for linux-x64-musl",
-  "os": ["linux"],
-  "cpu": ["x64"],
-  "main": "libhprof_c.so",
-  "files": ["libhprof_c.so"],
-  "publishConfig": { "access": "public" },
   "license": "MIT",
-  "libc": ["musl"]
+  "files": [
+    "libhprof_c.so"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "musl"
+  ],
+  "main": "libhprof_c.so",
+  "publishConfig": {
+    "access": "public"
+  }
 }

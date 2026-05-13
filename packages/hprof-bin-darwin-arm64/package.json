@@ -2,10 +2,18 @@
   "name": "@hprof/hprof-bin-darwin-arm64",
   "version": "0.0.0",
   "description": "hprof native binary for darwin-arm64",
-  "os": ["darwin"],
-  "cpu": ["arm64"],
+  "license": "MIT",
+  "files": [
+    "libhprof_c.dylib"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
   "main": "libhprof_c.dylib",
-  "files": ["libhprof_c.dylib"],
-  "publishConfig": { "access": "public" },
-  "license": "MIT"
+  "publishConfig": {
+    "access": "public"
+  }
 }

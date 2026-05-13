@@ -13,6 +13,9 @@ coverage
 # Rust build artifacts
 target/
 
+# Bench results (local)
+bench/results/
+
 # Cargo lock for library crates (optional, but keep it for workspace)
 # Cargo.lock
 

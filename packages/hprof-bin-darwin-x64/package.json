@@ -2,10 +2,18 @@
   "name": "@hprof/hprof-bin-darwin-x64",
   "version": "0.0.0",
   "description": "hprof native binary for darwin-x64",
-  "os": ["darwin"],
-  "cpu": ["x64"],
+  "license": "MIT",
+  "files": [
+    "libhprof_c.dylib"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
   "main": "libhprof_c.dylib",
-  "files": ["libhprof_c.dylib"],
-  "publishConfig": { "access": "public" },
-  "license": "MIT"
+  "publishConfig": {
+    "access": "public"
+  }
 }

@@ -1,8 +1,5 @@
 [workspace]
-members = [
-  "crates/hprof-core",
-  "crates/hprof-c"
-]
+members = ["crates/hprof-core", "crates/hprof-c"]
 resolver = "2"
 
 [workspace.dependencies]

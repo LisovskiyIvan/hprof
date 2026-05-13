@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     tags:
-      - "v*"
+      - 'v*'
   pull_request:
 
 jobs:
@@ -176,7 +176,7 @@ jobs:
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
-          name: "${{ steps.version.outputs.version }}"
+          name: '${{ steps.version.outputs.version }}'
           tag_name: "${{ steps.version.outputs.is_release == 'true' && format('v{0}', steps.version.outputs.version) || steps.version.outputs.version }}"
           token: ${{ github.token }}
           files: ./binaries/*
@@ -199,8 +199,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "25"
-          registry-url: "https://registry.npmjs.org"
+          node-version: '25'
+          registry-url: 'https://registry.npmjs.org'
 
       - name: Determine version
         id: version
