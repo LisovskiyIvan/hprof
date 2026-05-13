@@ -1,0 +1,15 @@
+[package]
+name = "hprof-c"
+version = "0.1.0"
+edition = "2021"
+description = "C FFI bindings for hprof-core"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hprof-core = { path = "../hprof-core" }
+serde = { workspace = true }
+serde_derive = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,11 @@
+{
+  "name": "@hprof/hprof-bin-win32-x64",
+  "version": "0.0.0",
+  "description": "hprof native binary for win32-x64",
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "main": "hprof_c.dll",
+  "files": ["hprof_c.dll"],
+  "publishConfig": { "access": "public" },
+  "license": "MIT"
+}

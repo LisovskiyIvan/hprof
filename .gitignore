@@ -10,6 +10,12 @@ snapshots/*
 coverage
 *.lcov
 
+# Rust build artifacts
+target/
+
+# Cargo lock for library crates (optional, but keep it for workspace)
+# Cargo.lock
+
 # logs
 logs
 _.log

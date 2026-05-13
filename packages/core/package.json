@@ -6,5 +6,28 @@
   "types": "src/index.ts",
   "exports": {
     ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hprof/hprof-bin-linux-x64-gnu": "workspace:*",
+    "@hprof/hprof-bin-linux-arm64-gnu": "workspace:*",
+    "@hprof/hprof-bin-darwin-x64": "workspace:*",
+    "@hprof/hprof-bin-darwin-arm64": "workspace:*",
+    "@hprof/hprof-bin-win32-x64": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"],
+  "peerDependencies": {
+    "bun": ">=1.0.0"
   }
 }

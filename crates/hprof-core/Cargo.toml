@@ -1,0 +1,13 @@
+[package]
+name = "hprof-core"
+version = "0.1.0"
+edition = "2021"
+description = "V8 heap profile/snapshot/timeline parser"
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+serde_derive = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+regex = "1"
