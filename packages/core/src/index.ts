@@ -7,7 +7,18 @@ export interface ProfileMeta {
 }
 
 export { HeapProfile } from './heapprofile.ts'
-export type { HeapProfileResult, HeapProfileSummary, FlatCallFrame } from './heapprofile.ts'
+export type {
+  HeapProfileResult,
+  HeapProfileSummary,
+  FlatCallFrame,
+  FilterOptions,
+  CumulativeEntry,
+  CumulativeSummary,
+  FlamegraphFrame,
+  TreemapNode,
+  DiffEntry,
+  ProfileDiff,
+} from './heapprofile.ts'
 
 export { HeapSnapshot } from './heapsnapshot.ts'
 export type {
@@ -20,6 +31,7 @@ export type {
   HeapSnapshotNodePageOptions,
   HeapSnapshotSearchMatch,
   HeapSnapshotRetainedEntry,
+  SnapshotDiff,
 } from './heapsnapshot.ts'
 
 export { HeapTimeline } from './heaptimeline.ts'

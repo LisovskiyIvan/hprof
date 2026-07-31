@@ -70,6 +70,15 @@ const ffiDefinition = {
   hprof_snapshot_edges: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.ptr },
   hprof_snapshot_search: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.ptr },
   hprof_snapshot_retained: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.ptr },
+  hprof_snapshot_flamegraph: {
+    args: [FFIType.ptr, FFIType.u32, FFIType.cstring],
+    returns: FFIType.ptr,
+  },
+  hprof_snapshot_treemap: {
+    args: [FFIType.ptr, FFIType.u32, FFIType.cstring],
+    returns: FFIType.ptr,
+  },
+  hprof_snapshot_diff: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
   hprof_snapshot_destroy: { args: [FFIType.ptr], returns: FFIType.void },
 
   hprof_profile_open: { args: [FFIType.cstring], returns: FFIType.ptr },
@@ -78,7 +87,24 @@ const ffiDefinition = {
     args: [FFIType.ptr, FFIType.u32, FFIType.cstring],
     returns: FFIType.ptr,
   },
+  hprof_profile_summarize_cumulative: {
+    args: [FFIType.ptr, FFIType.u32, FFIType.cstring, FFIType.cstring, FFIType.cstring],
+    returns: FFIType.ptr,
+  },
   hprof_profile_flatten: { args: [FFIType.ptr], returns: FFIType.ptr },
+  hprof_profile_flamegraph: {
+    args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.cstring],
+    returns: FFIType.ptr,
+  },
+  hprof_profile_dot: {
+    args: [FFIType.ptr, FFIType.u32, FFIType.cstring, FFIType.cstring, FFIType.cstring],
+    returns: FFIType.ptr,
+  },
+  hprof_profile_treemap: {
+    args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.cstring],
+    returns: FFIType.ptr,
+  },
+  hprof_profile_diff: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
   hprof_profile_destroy: { args: [FFIType.ptr], returns: FFIType.void },
 
   hprof_timeline_open: { args: [FFIType.cstring], returns: FFIType.ptr },
@@ -206,6 +232,26 @@ export function snapshotRetained(handle: NativeHandle, topN = 30): any {
   return JSON.parse(callString(loadLib().symbols.hprof_snapshot_retained(handle, topN)))
 }
 
+export function snapshotFlamegraph(handle: NativeHandle, top?: number, filter?: string): any {
+  return JSON.parse(
+    callString(
+      loadLib().symbols.hprof_snapshot_flamegraph(handle, top ?? 0, ptr(encode(filter ?? ''))),
+    ),
+  )
+}
+
+export function snapshotTreemap(handle: NativeHandle, top?: number, filter?: string): any {
+  return JSON.parse(
+    callString(
+      loadLib().symbols.hprof_snapshot_treemap(handle, top ?? 0, ptr(encode(filter ?? ''))),
+    ),
+  )
+}
+
+export function snapshotDiff(handle: NativeHandle, baselineHandle: NativeHandle): any {
+  return JSON.parse(callString(loadLib().symbols.hprof_snapshot_diff(handle, baselineHandle)))
+}
+
 export function snapshotDestroy(handle: NativeHandle): void {
   loadLib().symbols.hprof_snapshot_destroy(handle)
 }
@@ -230,6 +276,75 @@ export function profileSummarize(handle: NativeHandle, top?: number, filter?: st
 
 export function profileFlatten(handle: NativeHandle): any {
   return JSON.parse(callString(loadLib().symbols.hprof_profile_flatten(handle)))
+}
+
+export function profileSummarizeCumulative(
+  handle: NativeHandle,
+  options?: { top?: number; focus?: string; ignore?: string; hide?: string },
+): any {
+  return JSON.parse(
+    callString(
+      loadLib().symbols.hprof_profile_summarize_cumulative(
+        handle,
+        options?.top ?? 0,
+        ptr(encode(options?.focus ?? '')),
+        ptr(encode(options?.ignore ?? '')),
+        ptr(encode(options?.hide ?? '')),
+      ),
+    ),
+  )
+}
+
+export function profileFlamegraph(
+  handle: NativeHandle,
+  options?: { focus?: string; ignore?: string; hide?: string },
+): any {
+  return JSON.parse(
+    callString(
+      loadLib().symbols.hprof_profile_flamegraph(
+        handle,
+        ptr(encode(options?.focus ?? '')),
+        ptr(encode(options?.ignore ?? '')),
+        ptr(encode(options?.hide ?? '')),
+      ),
+    ),
+  )
+}
+
+export function profileDot(
+  handle: NativeHandle,
+  options?: { top?: number; focus?: string; ignore?: string; hide?: string },
+): string {
+  // Return raw DOT text (not JSON).
+  return callString(
+    loadLib().symbols.hprof_profile_dot(
+      handle,
+      options?.top ?? 0,
+      ptr(encode(options?.focus ?? '')),
+      ptr(encode(options?.ignore ?? '')),
+      ptr(encode(options?.hide ?? '')),
+    ),
+  )
+}
+
+export function profileTreemap(
+  handle: NativeHandle,
+  options?: { focus?: string; ignore?: string; hide?: string },
+): any {
+  return JSON.parse(
+    callString(
+      loadLib().symbols.hprof_profile_treemap(
+        handle,
+        ptr(encode(options?.focus ?? '')),
+        ptr(encode(options?.ignore ?? '')),
+        ptr(encode(options?.hide ?? '')),
+      ),
+    ),
+  )
+}
+
+export function profileDiff(handle: NativeHandle, baselineHandle: NativeHandle): any {
+  return JSON.parse(callString(loadLib().symbols.hprof_profile_diff(handle, baselineHandle)))
 }
 
 export function profileDestroy(handle: NativeHandle): void {

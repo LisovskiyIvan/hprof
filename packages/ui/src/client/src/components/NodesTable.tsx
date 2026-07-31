@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { fetchJson } from '../lib/api'
 
 function formatBytes(bytes: number): string {
@@ -29,37 +29,95 @@ interface NodesResponse {
   nodes: NodeEntry[]
 }
 
+const ROW_HEIGHT = 33
+const OVERSCAN = 10
+
+/// Virtualized nodes table. Instead of paginating through "Next/Prev",
+/// we fetch larger chunks (e.g. 500 rows) and render only the visible
+/// window using transform offsets. Scrolling loads more pages.
 export default function NodesTable({ base }: { base: string }) {
-  const [data, setData] = useState<NodesResponse | null>(null)
+  const [allNodes, setAllNodes] = useState<NodeEntry[]>([])
+  const [total, setTotal] = useState(0)
   const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
   const [page, setPage] = useState(0)
-  const [pageSize] = useState(100)
+  const pageSize = 500
   const [sort, setSort] = useState('selfSize')
   const [dir, setDir] = useState<'asc' | 'desc'>('desc')
   const [filterType, setFilterType] = useState('')
   const [search, setSearch] = useState('')
+  const [viewportHeight, setViewportHeight] = useState(600)
+  const [scrollTop, setScrollTop] = useState(0)
+  const containerRef = useRef<HTMLDivElement>(null)
 
-  const fetchNodes = useCallback(() => {
-    setError(null)
-    const params = new URLSearchParams({
-      page: String(page),
-      pageSize: String(pageSize),
-      sort,
-      dir,
-    })
-    if (filterType) params.set('type', filterType)
-    if (search) params.set('q', search)
+  // Fetch a single page; append to allNodes if continuing same query.
+  const fetchPage = useCallback(
+    (p: number, replace: boolean) => {
+      setLoading(true)
+      setError(null)
+      const params = new URLSearchParams({
+        page: String(p),
+        pageSize: String(pageSize),
+        sort,
+        dir,
+      })
+      if (filterType) params.set('type', filterType)
+      if (search) params.set('q', search)
 
-    fetchJson<NodesResponse>(`${base}/nodes?${params}`)
-      .then(setData)
-      .catch((e) => setError(e.message))
-  }, [base, page, pageSize, sort, dir, filterType, search])
+      fetchJson<NodesResponse>(`${base}/nodes?${params}`, { cache: false })
+        .then((data) => {
+          setTotal(data.total)
+          setAllNodes((prev) => (replace ? data.nodes : [...prev, ...data.nodes]))
+          setLoading(false)
+        })
+        .catch((e) => {
+          setError(e.message)
+          setLoading(false)
+        })
+    },
+    [base, sort, dir, filterType, search],
+  )
 
+  // Reset+fetch when filters/sort change.
   useEffect(() => {
-    fetchNodes()
-  }, [fetchNodes])
+    setPage(0)
+    setAllNodes([])
+    setScrollTop(0)
+    fetchPage(0, true)
+  }, [fetchPage])
 
-  const totalPages = data ? Math.ceil(data.total / pageSize) : 0
+  // Observe viewport height.
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+    const update = () => setViewportHeight(container.clientHeight)
+    update()
+    const ro = new ResizeObserver(update)
+    ro.observe(container)
+    return () => ro.disconnect()
+  }, [])
+
+  const totalRows = total
+  const startIndex = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN)
+  const endIndex = Math.min(
+    totalRows,
+    Math.ceil((scrollTop + viewportHeight) / ROW_HEIGHT) + OVERSCAN,
+  )
+
+  // Load more pages if user scrolled past what we have.
+  useEffect(() => {
+    const loadedCount = allNodes.length
+    const neededIndex = endIndex
+    if (neededIndex > loadedCount && !loading && loadedCount < total) {
+      const nextPage = Math.floor(loadedCount / pageSize)
+      fetchPage(nextPage, false)
+      setPage(nextPage)
+    }
+  }, [endIndex, allNodes.length, loading, total, fetchPage])
+
+  const onScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    setScrollTop(e.currentTarget.scrollTop)
+  }
 
   const toggleSort = (col: string) => {
     if (sort === col) {
@@ -68,7 +126,6 @@ export default function NodesTable({ base }: { base: string }) {
       setSort(col)
       setDir('desc')
     }
-    setPage(0)
   }
 
   const SortIcon = ({ col }: { col: string }) => {
@@ -80,6 +137,14 @@ export default function NodesTable({ base }: { base: string }) {
     return <p className="text-red-400 text-sm">Failed to load nodes: {error}</p>
   }
 
+  const visibleNodes = allNodes.slice(
+    Math.max(0, startIndex - page * pageSize),
+    endIndex - page * pageSize,
+  )
+
+  // Compute absolute indices for visible rows.
+  const absoluteIndex = (i: number) => page * pageSize + i
+
   return (
     <div className="space-y-4">
       <div className="flex gap-3 items-center">
@@ -89,7 +154,6 @@ export default function NodesTable({ base }: { base: string }) {
           value={search}
           onChange={(e) => {
             setSearch(e.target.value)
-            setPage(0)
           }}
           className="bg-gray-900 border border-gray-700 rounded px-3 py-1.5 text-sm w-64 focus:border-indigo-500 outline-none"
         />
@@ -99,17 +163,25 @@ export default function NodesTable({ base }: { base: string }) {
           value={filterType}
           onChange={(e) => {
             setFilterType(e.target.value)
-            setPage(0)
           }}
           className="bg-gray-900 border border-gray-700 rounded px-3 py-1.5 text-sm w-48 focus:border-indigo-500 outline-none"
         />
-        {data && <span className="text-xs text-gray-500">{data.total.toLocaleString()} nodes</span>}
+        <span className="text-xs text-gray-500">
+          {total.toLocaleString()} nodes · virtualized scroll
+        </span>
       </div>
 
       <div className="bg-gray-900 rounded-lg overflow-hidden">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-gray-800 text-gray-400">
+        <table className="w-full text-sm table-fixed">
+          <colgroup>
+            <col className="w-20" />
+            <col className="w-32" />
+            <col />
+            <col className="w-28" />
+            <col className="w-20" />
+          </colgroup>
+          <thead className="sticky top-0 z-10">
+            <tr className="border-b border-gray-800 text-gray-400 bg-gray-900">
               <th
                 className="text-left px-4 py-2 cursor-pointer select-none"
                 onClick={() => toggleSort('id')}
@@ -142,56 +214,67 @@ export default function NodesTable({ base }: { base: string }) {
               </th>
             </tr>
           </thead>
-          <tbody>
-            {data?.nodes.map((node, i) => (
-              <tr key={node.id} className="border-b border-gray-800/50 hover:bg-gray-800/30">
-                <td className="px-4 py-1.5 text-gray-500 font-mono text-xs">
-                  {page * pageSize + i}
-                </td>
-                <td className="px-4 py-1.5">
-                  <span className="px-1.5 py-0.5 rounded text-xs bg-gray-800 text-gray-300">
-                    {node.type}
-                  </span>
-                </td>
-                <td
-                  className="px-4 py-1.5 font-mono text-xs text-indigo-400 truncate max-w-md"
-                  title={node.name}
-                >
-                  {node.name}
-                </td>
-                <td className="px-4 py-1.5 text-right font-mono text-xs">
-                  {formatBytes(node.selfSize)}
-                </td>
-                <td className="px-4 py-1.5 text-right font-mono text-xs text-gray-400">
-                  {node.edgeCount}
-                </td>
-              </tr>
-            ))}
-          </tbody>
         </table>
-      </div>
-
-      {totalPages > 1 && (
-        <div className="flex items-center gap-2 text-sm">
-          <button
-            disabled={page === 0}
-            onClick={() => setPage((p) => p - 1)}
-            className="px-3 py-1 bg-gray-800 rounded disabled:opacity-30 hover:bg-gray-700"
-          >
-            Prev
-          </button>
-          <span className="text-gray-400">
-            Page {page + 1} of {totalPages}
-          </span>
-          <button
-            disabled={page >= totalPages - 1}
-            onClick={() => setPage((p) => p + 1)}
-            className="px-3 py-1 bg-gray-800 rounded disabled:opacity-30 hover:bg-gray-700"
-          >
-            Next
-          </button>
+        <div
+          ref={containerRef}
+          onScroll={onScroll}
+          style={{ height: viewportHeight, overflowY: 'auto', position: 'relative' }}
+        >
+          <div style={{ height: totalRows * ROW_HEIGHT, position: 'relative' }}>
+            <table className="w-full text-sm table-fixed">
+              <colgroup>
+                <col className="w-20" />
+                <col className="w-32" />
+                <col />
+                <col className="w-28" />
+                <col className="w-20" />
+              </colgroup>
+              <tbody>
+                {visibleNodes.map((node, i) => {
+                  const absIdx = absoluteIndex(i)
+                  const offsetTop = (startIndex + i) * ROW_HEIGHT
+                  return (
+                    <tr
+                      key={`${node.id}-${absIdx}`}
+                      className="border-b border-gray-800/50 hover:bg-gray-800/30 absolute"
+                      style={{
+                        height: ROW_HEIGHT,
+                        top: offsetTop,
+                        width: '100%',
+                        display: 'table-row',
+                      }}
+                    >
+                      <td className="px-4 py-1.5 text-gray-500 font-mono text-xs">{absIdx}</td>
+                      <td className="px-4 py-1.5">
+                        <span className="px-1.5 py-0.5 rounded text-xs bg-gray-800 text-gray-300">
+                          {node.type}
+                        </span>
+                      </td>
+                      <td
+                        className="px-4 py-1.5 font-mono text-xs text-indigo-400 truncate max-w-md"
+                        title={node.name}
+                      >
+                        {node.name}
+                      </td>
+                      <td className="px-4 py-1.5 text-right font-mono text-xs">
+                        {formatBytes(node.selfSize)}
+                      </td>
+                      <td className="px-4 py-1.5 text-right font-mono text-xs text-gray-400">
+                        {node.edgeCount}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+          {loading && (
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+              <span className="bg-gray-800 text-xs px-3 py-1.5 rounded">Loading more...</span>
+            </div>
+          )}
         </div>
-      )}
+      </div>
     </div>
   )
 }

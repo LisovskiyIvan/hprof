@@ -1,4 +1,4 @@
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{c_char, c_void, CStr, CString};
 
 use hprof_core::*;
 
@@ -6,7 +6,11 @@ mod ffi_types;
 use ffi_types::*;
 
 unsafe fn cstr_to_str<'a>(s: *const c_char) -> Option<&'a str> {
-    if s.is_null() { None } else { unsafe { CStr::from_ptr(s).to_str().ok() } }
+    if s.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(s).to_str().ok() }
+    }
 }
 
 struct HprofSnapshot {
@@ -20,12 +24,11 @@ struct HprofProfile {
 struct HprofTimeline {
     timeline: HeapTimeline,
 }
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hprof_snapshot_open(path: *const c_char) -> *mut HprofResult {
     let path_str = match unsafe { cstr_to_str(path) } {
         Some(s) => s,
-        None => return HprofResult::err("path is null"),
+        _none => return HprofResult::err("path is null"),
     };
     let snapshot = HeapSnapshot::new(path_str.to_string());
     let instance = Box::new(HprofSnapshot { snapshot });
@@ -89,7 +92,11 @@ pub unsafe extern "C" fn hprof_snapshot_node_page(
         4 => SortField::EdgeCount,
         _ => SortField::SelfSize,
     };
-    let sort_dir = if dir == 0 { SortDir::Desc } else { SortDir::Asc };
+    let sort_dir = if dir == 0 {
+        SortDir::Desc
+    } else {
+        SortDir::Asc
+    };
     let options = NodePageOptions {
         page: page as usize,
         page_size: page_size as usize,
@@ -100,7 +107,8 @@ pub unsafe extern "C" fn hprof_snapshot_node_page(
     };
     match inst.snapshot.get_node_page(options) {
         Ok(page_result) => {
-            let json = serde_json::to_string(&HprofNodePageJson::from(page_result)).unwrap_or_default();
+            let json =
+                serde_json::to_string(&HprofNodePageJson::from(page_result)).unwrap_or_default();
             HprofResult::ok_string(&json)
         }
         Err(e) => HprofResult::err(&e.to_string()),
@@ -118,7 +126,10 @@ pub unsafe extern "C" fn hprof_snapshot_edges(
     };
     match inst.snapshot.get_node_edges(node_index as usize) {
         Ok((node, edges)) => {
-            let result = HprofEdgesResult { node: HprofNodeJson::from_node(&node), edges: edges.into_iter().map(HprofEdgeJson::from_edge).collect() };
+            let result = HprofEdgesResult {
+                node: HprofNodeJson::from_node(&node),
+                edges: edges.into_iter().map(HprofEdgeJson::from_edge).collect(),
+            };
             let json = serde_json::to_string(&result).unwrap_or_default();
             HprofResult::ok_string(&json)
         }
@@ -141,7 +152,16 @@ pub unsafe extern "C" fn hprof_snapshot_search(
     };
     match inst.snapshot.search_strings(query_str) {
         Ok(matches_) => {
-            let json = serde_json::to_string(&matches_.into_iter().map(|m| HprofSearchMatchJson { index: m.index, value: m.value }).collect::<Vec<_>>()).unwrap_or_default();
+            let json = serde_json::to_string(
+                &matches_
+                    .into_iter()
+                    .map(|m| HprofSearchMatchJson {
+                        index: m.index,
+                        value: m.value,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_default();
             HprofResult::ok_string(&json)
         }
         Err(e) => HprofResult::err(&e.to_string()),
@@ -159,7 +179,8 @@ pub unsafe extern "C" fn hprof_snapshot_retained(
     };
     match inst.snapshot.get_retained_entries(top_n as usize) {
         Ok(result) => {
-            let json = serde_json::to_string(&HprofRetainedResultJson::from(result)).unwrap_or_default();
+            let json =
+                serde_json::to_string(&HprofRetainedResultJson::from(result)).unwrap_or_default();
             HprofResult::ok_string(&json)
         }
         Err(e) => HprofResult::err(&e.to_string()),
@@ -168,8 +189,12 @@ pub unsafe extern "C" fn hprof_snapshot_retained(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hprof_snapshot_destroy(handle: *mut c_void) {
-    if handle.is_null() { return; }
-    unsafe { drop(Box::from_raw(handle as *mut HprofSnapshot)); }
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(handle as *mut HprofSnapshot));
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -194,7 +219,8 @@ pub unsafe extern "C" fn hprof_profile_data(handle: *mut c_void) -> *mut HprofRe
             let json = serde_json::to_string(&HprofProfileDataJson {
                 start_time: data.start_time,
                 end_time: data.end_time,
-            }).unwrap_or_default();
+            })
+            .unwrap_or_default();
             HprofResult::ok_string(&json)
         }
         Err(e) => HprofResult::err(&e.to_string()),
@@ -212,14 +238,18 @@ pub unsafe extern "C" fn hprof_profile_summarize(
         Err(e) => return e,
     };
     let filter_str = unsafe { cstr_to_str(filter) };
-    match inst.profile.summarize(if top == 0 { None } else { Some(top as usize) }, filter_str) {
+    match inst
+        .profile
+        .summarize(if top == 0 { None } else { Some(top as usize) }, filter_str)
+    {
         Ok(summary) => {
             let json = serde_json::to_string(&serde_json::json!({
                 "totalSize": summary.total_size,
                 "byFrame": summary.by_frame,
                 "byUrl": summary.by_url,
                 "byFunction": summary.by_function,
-            })).unwrap_or_default();
+            }))
+            .unwrap_or_default();
             HprofResult::ok_string(&json)
         }
         Err(e) => HprofResult::err(&e.to_string()),
@@ -234,14 +264,194 @@ pub unsafe extern "C" fn hprof_profile_flatten(handle: *mut c_void) -> *mut Hpro
     };
     match inst.profile.flatten() {
         Ok(frames) => {
-            let json = serde_json::to_string(&frames.into_iter().map(|f| serde_json::json!({
-                "functionName": f.function_name,
-                "url": f.url,
-                "lineNumber": f.line_number,
-                "columnNumber": f.column_number,
-                "selfSize": f.self_size,
-                "stack": f.stack,
-            })).collect::<Vec<_>>()).unwrap_or_default();
+            let json = serde_json::to_string(
+                &frames
+                    .into_iter()
+                    .map(|f| {
+                        serde_json::json!({
+                            "functionName": f.function_name,
+                            "url": f.url,
+                            "lineNumber": f.line_number,
+                            "columnNumber": f.column_number,
+                            "selfSize": f.self_size,
+                            "stack": f.stack,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_default();
+            HprofResult::ok_string(&json)
+        }
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_profile_summarize_cumulative(
+    handle: *mut c_void,
+    top: u32,
+    focus: *const c_char,
+    ignore: *const c_char,
+    hide: *const c_char,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_profile(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let filters = unsafe { decode_filters(focus, ignore, hide) };
+    let top_arg = if top == 0 { None } else { Some(top as usize) };
+    match inst.profile.summarize_cumulative(top_arg, &filters) {
+        Ok(summary) => {
+            let json =
+                serde_json::to_string(&CumulativeSummaryJson::from(summary)).unwrap_or_default();
+            HprofResult::ok_string(&json)
+        }
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_profile_flamegraph(
+    handle: *mut c_void,
+    focus: *const c_char,
+    ignore: *const c_char,
+    hide: *const c_char,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_profile(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let filters = unsafe { decode_filters(focus, ignore, hide) };
+    match inst.profile.to_flamegraph(&filters) {
+        Ok(frame) => {
+            let json = serde_json::to_string(&frame).unwrap_or_default();
+            HprofResult::ok_string(&json)
+        }
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_profile_dot(
+    handle: *mut c_void,
+    top: u32,
+    focus: *const c_char,
+    ignore: *const c_char,
+    hide: *const c_char,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_profile(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let filters = unsafe { decode_filters(focus, ignore, hide) };
+    let top_arg = if top == 0 { None } else { Some(top as usize) };
+    match inst.profile.to_dot(top_arg, &filters) {
+        Ok(dot) => HprofResult::ok_string(&dot),
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_profile_treemap(
+    handle: *mut c_void,
+    focus: *const c_char,
+    ignore: *const c_char,
+    hide: *const c_char,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_profile(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let filters = unsafe { decode_filters(focus, ignore, hide) };
+    match inst.profile.to_treemap(&filters) {
+        Ok(node) => {
+            let json = serde_json::to_string(&node).unwrap_or_default();
+            HprofResult::ok_string(&json)
+        }
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_profile_diff(
+    handle: *mut c_void,
+    baseline_handle: *mut c_void,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_profile(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let baseline = match unsafe { as_profile(baseline_handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    match inst.profile.diff(&mut baseline.profile) {
+        Ok(diff) => {
+            let json = serde_json::to_string(&diff).unwrap_or_default();
+            HprofResult::ok_string(&json)
+        }
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_snapshot_flamegraph(
+    handle: *mut c_void,
+    top: u32,
+    filter: *const c_char,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_snapshot(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let filter_str = unsafe { cstr_to_str(filter) };
+    let top_arg = if top == 0 { None } else { Some(top as usize) };
+    match inst.snapshot.to_flamegraph(top_arg, filter_str) {
+        Ok(frame) => {
+            let json = serde_json::to_string(&frame).unwrap_or_default();
+            HprofResult::ok_string(&json)
+        }
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_snapshot_treemap(
+    handle: *mut c_void,
+    top: u32,
+    filter: *const c_char,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_snapshot(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let filter_str = unsafe { cstr_to_str(filter) };
+    let top_arg = if top == 0 { None } else { Some(top as usize) };
+    match inst.snapshot.to_treemap(top_arg, filter_str) {
+        Ok(node) => {
+            let json = serde_json::to_string(&node).unwrap_or_default();
+            HprofResult::ok_string(&json)
+        }
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_snapshot_diff(
+    handle: *mut c_void,
+    baseline_handle: *mut c_void,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_snapshot(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let baseline = match unsafe { as_snapshot(baseline_handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    match inst.snapshot.diff(&mut baseline.snapshot) {
+        Ok(diff) => {
+            let json = serde_json::to_string(&diff).unwrap_or_default();
             HprofResult::ok_string(&json)
         }
         Err(e) => HprofResult::err(&e.to_string()),
@@ -250,8 +460,12 @@ pub unsafe extern "C" fn hprof_profile_flatten(handle: *mut c_void) -> *mut Hpro
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hprof_profile_destroy(handle: *mut c_void) {
-    if handle.is_null() { return; }
-    unsafe { drop(Box::from_raw(handle as *mut HprofProfile)); }
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(handle as *mut HprofProfile));
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -283,7 +497,8 @@ pub unsafe extern "C" fn hprof_timeline_meta(handle: *mut c_void) -> *mut HprofR
                     "edge_fields": meta.meta.edge_fields,
                     "edge_types": meta.meta.edge_types,
                 },
-            })).unwrap_or_default();
+            }))
+            .unwrap_or_default();
             HprofResult::ok_string(&json)
         }
         Err(e) => HprofResult::err(&e.to_string()),
@@ -301,13 +516,17 @@ pub unsafe extern "C" fn hprof_timeline_summary(
         Err(e) => return e,
     };
     let filter_str = unsafe { cstr_to_str(filter) };
-    match inst.timeline.stream_summary(if top == 0 { None } else { Some(top as usize) }, filter_str) {
+    match inst
+        .timeline
+        .stream_summary(if top == 0 { None } else { Some(top as usize) }, filter_str)
+    {
         Ok(summary) => {
             let json = serde_json::to_string(&serde_json::json!({
                 "totalAllocated": summary.total_allocated,
                 "totalFreed": summary.total_freed,
                 "byType": summary.by_type,
-            })).unwrap_or_default();
+            }))
+            .unwrap_or_default();
             HprofResult::ok_string(&json)
         }
         Err(e) => HprofResult::err(&e.to_string()),
@@ -316,8 +535,12 @@ pub unsafe extern "C" fn hprof_timeline_summary(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hprof_timeline_destroy(handle: *mut c_void) {
-    if handle.is_null() { return; }
-    unsafe { drop(Box::from_raw(handle as *mut HprofTimeline)); }
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(handle as *mut HprofTimeline));
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -339,19 +562,29 @@ pub unsafe extern "C" fn hprof_format_bytes(bytes: u64) -> *mut HprofResult {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hprof_free_result(result: *mut HprofResult) {
-    if result.is_null() { return; }
+    if result.is_null() {
+        return;
+    }
     unsafe {
         let r = Box::from_raw(result);
-        if !r.error.is_null() { drop(CString::from_raw(r.error)); }
+        if !r.error.is_null() {
+            drop(CString::from_raw(r.error));
+        }
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hprof_free_string(s: *mut c_char) {
-    if !s.is_null() { unsafe { drop(CString::from_raw(s)); } }
+    if !s.is_null() {
+        unsafe {
+            drop(CString::from_raw(s));
+        }
+    }
 }
 
-unsafe fn as_snapshot<'a>(handle: *mut c_void) -> std::result::Result<&'a mut HprofSnapshot, *mut HprofResult> {
+unsafe fn as_snapshot<'a>(
+    handle: *mut c_void,
+) -> std::result::Result<&'a mut HprofSnapshot, *mut HprofResult> {
     if handle.is_null() {
         Err(HprofResult::err("handle is null"))
     } else {
@@ -359,7 +592,9 @@ unsafe fn as_snapshot<'a>(handle: *mut c_void) -> std::result::Result<&'a mut Hp
     }
 }
 
-unsafe fn as_profile<'a>(handle: *mut c_void) -> std::result::Result<&'a mut HprofProfile, *mut HprofResult> {
+unsafe fn as_profile<'a>(
+    handle: *mut c_void,
+) -> std::result::Result<&'a mut HprofProfile, *mut HprofResult> {
     if handle.is_null() {
         Err(HprofResult::err("handle is null"))
     } else {
@@ -367,7 +602,9 @@ unsafe fn as_profile<'a>(handle: *mut c_void) -> std::result::Result<&'a mut Hpr
     }
 }
 
-unsafe fn as_timeline<'a>(handle: *mut c_void) -> std::result::Result<&'a mut HprofTimeline, *mut HprofResult> {
+unsafe fn as_timeline<'a>(
+    handle: *mut c_void,
+) -> std::result::Result<&'a mut HprofTimeline, *mut HprofResult> {
     if handle.is_null() {
         Err(HprofResult::err("handle is null"))
     } else {

@@ -84,6 +84,32 @@ function errorResponse(message: string, status = 400): Response {
   return jsonResponse({ error: message }, status)
 }
 
+/// Attempt to render DOT to SVG using the system `dot` binary.
+/// Falls back to a simple error SVG if dot is unavailable.
+function renderDotToSvgFallback(dot: string): string {
+  try {
+    const proc = Bun.spawnSync({
+      cmd: ['dot', '-Tsvg'],
+      stdin: dot,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    if (proc.exitCode === 0) {
+      const svg = new TextDecoder().decode(proc.stdout)
+      if (svg.includes('<svg')) return svg
+    }
+  } catch {
+    // fall through to fallback
+  }
+  // Fallback message.
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="100" viewBox="0 0 600 100">
+  <rect width="600" height="100" fill="#1f2937"/>
+  <text x="300" y="40" text-anchor="middle" fill="#e5e7eb" font-family="sans-serif" font-size="14">Graphviz 'dot' not available</text>
+  <text x="300" y="65" text-anchor="middle" fill="#9ca3af" font-family="sans-serif" font-size="12">Install graphviz or use the DOT endpoint to render the graph yourself</text>
+</svg>`
+}
+
 async function ensureProfileSummary(data: ProfileData): Promise<HeapProfileSummary> {
   if (data.profileSummary) return data.profileSummary
   if (!data.profileSummaryPromise) {
@@ -316,9 +342,16 @@ async function handleApiRequest(url: URL): Promise<Response> {
         return errorResponse('Tree only available for heapprofile')
       }
       if (!data.profileResult) {
-        data.profileResult = data.profile!.data
+        data.profileResult = data.profile!.getFullData()
       }
       return jsonResponse(data.profileResult.head)
+    }
+
+    case 'flat': {
+      if (data.type !== 'heapprofile') {
+        return errorResponse('Flat frames only available for heapprofile')
+      }
+      return jsonResponse(data.profile!.flatten())
     }
 
     case 'timeline': {
@@ -360,6 +393,105 @@ async function handleApiRequest(url: URL): Promise<Response> {
       }
       const topN = Number(url.searchParams.get('top') ?? '30')
       return jsonResponse(await data.snapshot!.getRetainedEntries(topN))
+    }
+
+    case 'flamegraph': {
+      const top = Number(url.searchParams.get('top') ?? '0')
+      const filter = url.searchParams.get('filter') ?? undefined
+      const focus = url.searchParams.get('focus') ?? undefined
+      const ignore = url.searchParams.get('ignore') ?? undefined
+      const hide = url.searchParams.get('hide') ?? undefined
+
+      if (data.type === 'heapprofile') {
+        return jsonResponse(
+          data.profile!.flamegraph({
+            focus,
+            ignore,
+            hide,
+          }),
+        )
+      }
+      if (data.type === 'heapsnapshot') {
+        return jsonResponse(await data.snapshot!.flamegraph({ top: top || undefined, filter }))
+      }
+      return errorResponse('Flamegraph not available for this profile type')
+    }
+
+    case 'graph': {
+      if (data.type !== 'heapprofile') {
+        return errorResponse('Call graph only available for heapprofile')
+      }
+      const top = Number(url.searchParams.get('top') ?? '0')
+      const focus = url.searchParams.get('focus') ?? undefined
+      const ignore = url.searchParams.get('ignore') ?? undefined
+      const hide = url.searchParams.get('hide') ?? undefined
+      const dot = data.profile!.dot({ top: top || undefined, focus, ignore, hide })
+      const format = url.searchParams.get('format') ?? 'dot'
+      if (format === 'svg') {
+        return new Response(renderDotToSvgFallback(dot), {
+          headers: { 'Content-Type': 'image/svg+xml' },
+        })
+      }
+      return new Response(dot, { headers: { 'Content-Type': 'text/vnd.graphviz' } })
+    }
+
+    case 'treemap': {
+      const top = Number(url.searchParams.get('top') ?? '0')
+      const filter = url.searchParams.get('filter') ?? undefined
+      const focus = url.searchParams.get('focus') ?? undefined
+      const ignore = url.searchParams.get('ignore') ?? undefined
+      const hide = url.searchParams.get('hide') ?? undefined
+
+      if (data.type === 'heapprofile') {
+        return jsonResponse(data.profile!.treemap({ focus, ignore, hide }))
+      }
+      if (data.type === 'heapsnapshot') {
+        return jsonResponse(await data.snapshot!.treemap({ top: top || undefined, filter }))
+      }
+      return errorResponse('Treemap not available for this profile type')
+    }
+
+    case 'cumulative': {
+      if (data.type !== 'heapprofile') {
+        return errorResponse('Cumulative only available for heapprofile')
+      }
+      const top = Number(url.searchParams.get('top') ?? '0')
+      const focus = url.searchParams.get('focus') ?? undefined
+      const ignore = url.searchParams.get('ignore') ?? undefined
+      const hide = url.searchParams.get('hide') ?? undefined
+      const summary = data.profile!.summarizeCumulative({
+        top: top || undefined,
+        focus,
+        ignore,
+        hide,
+      })
+      return jsonResponse({
+        totalSize: summary.totalSize,
+        byFrame: [...summary.byFrame.entries()].map(([name, e]) => ({ name, ...e })),
+        byUrl: [...summary.byUrl.entries()].map(([name, e]) => ({ name, ...e })),
+        byFunction: [...summary.byFunction.entries()].map(([name, e]) => ({ name, ...e })),
+      })
+    }
+
+    case 'diff': {
+      const baselinePath = url.searchParams.get('baseline')
+      if (!baselinePath) return errorResponse('baseline query parameter required')
+      const baselineData = profiles.get(baselinePath)
+      if (!baselineData) {
+        return errorResponse(`Baseline profile not loaded: ${baselinePath}`, 404)
+      }
+      if (baselineData.type !== data.type) {
+        return errorResponse(
+          `Cannot diff ${baselineData.type} with ${data.type} — types must match`,
+        )
+      }
+      if (data.type === 'heapprofile') {
+        return jsonResponse(data.profile!.diff(baselineData.profile!))
+      }
+      if (data.type === 'heapsnapshot') {
+        return jsonResponse(await data.snapshot!.diff(baselineData.snapshot!))
+      }
+      return errorResponse('Diff not implemented for this profile type')
     }
 
     default:

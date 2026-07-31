@@ -6,9 +6,25 @@ import TreeView from '../components/TreeView'
 import Search from '../components/Search'
 import Timeline from '../components/Timeline'
 import RetainedSize from '../components/RetainedSize'
+import Flamegraph from '../components/Flamegraph'
+import CallGraph from '../components/CallGraph'
+import Treemap from '../components/Treemap'
+import DiffView from '../components/DiffView'
+import SourceListing from '../components/SourceListing'
 import { fetchJson } from '../lib/api'
 
-type Tab = 'summary' | 'nodes' | 'tree' | 'timeline' | 'retained' | 'search'
+type Tab =
+  | 'summary'
+  | 'flamegraph'
+  | 'callgraph'
+  | 'treemap'
+  | 'locations'
+  | 'nodes'
+  | 'tree'
+  | 'timeline'
+  | 'retained'
+  | 'diff'
+  | 'search'
 
 interface Meta {
   fileName: string
@@ -68,10 +84,27 @@ export default function Profile() {
 
   const tabs: { key: Tab; label: string; show: boolean }[] = [
     { key: 'summary', label: 'Summary', show: true },
+    {
+      key: 'flamegraph',
+      label: 'Flamegraph',
+      show: meta?.type === 'heapprofile' || meta?.type === 'heapsnapshot',
+    },
+    { key: 'callgraph', label: 'Call Graph', show: meta?.type === 'heapprofile' },
+    {
+      key: 'treemap',
+      label: 'Treemap',
+      show: meta?.type === 'heapprofile' || meta?.type === 'heapsnapshot',
+    },
+    { key: 'locations', label: 'Locations', show: meta?.type === 'heapprofile' },
     { key: 'nodes', label: 'Nodes', show: meta?.type === 'heapsnapshot' },
     { key: 'tree', label: 'Call Tree', show: meta?.type === 'heapprofile' },
     { key: 'timeline', label: 'Timeline', show: meta?.type === 'heaptimeline' },
     { key: 'retained', label: 'Retained', show: meta?.type === 'heapsnapshot' },
+    {
+      key: 'diff',
+      label: 'Diff',
+      show: meta?.type === 'heapprofile' || meta?.type === 'heapsnapshot',
+    },
     { key: 'search', label: 'Search', show: true },
   ]
 
@@ -111,14 +144,14 @@ export default function Profile() {
         </div>
       </header>
 
-      <nav className="border-b border-gray-800 px-6 flex gap-1">
+      <nav className="border-b border-gray-800 px-6 flex gap-1 overflow-x-auto">
         {tabs
           .filter((t) => t.show)
           .map((t) => (
             <button
               key={t.key}
               onClick={() => setTab(t.key)}
-              className={`px-4 py-2.5 text-sm border-b-2 transition-colors ${
+              className={`px-4 py-2.5 text-sm border-b-2 transition-colors whitespace-nowrap ${
                 tab === t.key
                   ? 'border-indigo-500 text-white'
                   : 'border-transparent text-gray-400 hover:text-gray-200'
@@ -131,10 +164,15 @@ export default function Profile() {
 
       <main className="p-6">
         {tab === 'summary' && <Summary base={base} type={meta.type} />}
+        {tab === 'flamegraph' && <Flamegraph base={base} />}
+        {tab === 'callgraph' && <CallGraph base={base} />}
+        {tab === 'treemap' && <Treemap base={base} />}
+        {tab === 'locations' && <SourceListing base={base} />}
         {tab === 'nodes' && <NodesTable base={base} />}
         {tab === 'tree' && <TreeView base={base} />}
         {tab === 'timeline' && <Timeline base={base} />}
         {tab === 'retained' && <RetainedSize base={base} />}
+        {tab === 'diff' && <DiffView base={base} currentPath={filePath} currentType={meta.type} />}
         {tab === 'search' && <Search base={base} type={meta.type} />}
       </main>
     </div>

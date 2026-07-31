@@ -72,6 +72,35 @@ export interface HeapSnapshotRetainedEntry {
   approximate: boolean
 }
 
+export interface FlamegraphFrame {
+  name: string
+  selfSize: number
+  totalSize: number
+  children: FlamegraphFrame[]
+}
+
+export interface TreemapNode {
+  name: string
+  size: number
+  children: TreemapNode[]
+}
+
+export interface DiffEntry {
+  name: string
+  baselineSize: number
+  profileSize: number
+  delta: number
+  deltaPct: number | null
+}
+
+export interface SnapshotDiff {
+  baselineTotal: number
+  profileTotal: number
+  deltaTotal: number
+  byNodeName: DiffEntry[]
+  byNodeType: DiffEntry[]
+}
+
 export class HeapSnapshot {
   readonly filePath: string
   private _handle: NativeHandle | null = null
@@ -172,6 +201,25 @@ export class HeapSnapshot {
         retainedSize: e.retained_size,
         approximate: e.approximate,
       })),
+    }
+  }
+
+  async flamegraph(options?: { top?: number; filter?: string }): Promise<FlamegraphFrame> {
+    return ffi.snapshotFlamegraph(this.handle, options?.top, options?.filter)
+  }
+
+  async treemap(options?: { top?: number; filter?: string }): Promise<TreemapNode> {
+    return ffi.snapshotTreemap(this.handle, options?.top, options?.filter)
+  }
+
+  async diff(baseline: HeapSnapshot): Promise<SnapshotDiff> {
+    const raw = ffi.snapshotDiff(this.handle, baseline.handle)
+    return {
+      baselineTotal: raw.baselineTotal,
+      profileTotal: raw.profileTotal,
+      deltaTotal: raw.deltaTotal,
+      byNodeName: raw.byNodeName,
+      byNodeType: raw.byNodeType,
     }
   }
 

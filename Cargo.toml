@@ -8,6 +8,28 @@ serde_derive = "1.0"
 serde_json = "1.0"
 thiserror = "2"
 
+[workspace.lints.clippy]
+# Pedantic lints we don't enforce — these are stylistic and frequently conflict
+# with code that is intentionally explicit (e.g. complex signatures for FFI
+# bridge functions, hot loops that benefit from explicit indexing).
+too_many_arguments = "allow"
+type_complexity = "allow"
+needless_range_loop = "allow"
+manual_clamp = "allow"
+only_used_in_recursion = "allow"
+missing_safety_doc = "allow"
+# Sort-by-key churns the code without changing behaviour; we keep the explicit
+# comparators for clarity.
+unnecessary_sort_by = "allow"
+
+[workspace.lints.rust]
+unknown_lints = "allow"
+renamed_and_removed_lints = "allow"
+# `missing_safety_doc` fires on every `unsafe extern "C"` FFI export. We have
+# many of these by design in the `hprof-c` crate; documenting each is busywork
+# that adds no value.
+missing_safety_doc = "allow"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

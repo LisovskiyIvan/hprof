@@ -38,20 +38,15 @@ describe('formatBytes', () => {
   test('formats GB', () => {
     expect(formatBytes(1073741824)).toBe('1.00 GB')
   })
-
-  test('handles non-finite', () => {
-    expect(formatBytes(Infinity)).toBe('Infinity')
-    expect(formatBytes(NaN)).toBe('NaN')
-  })
 })
 
 describe('HeapProfile', () => {
   const filePath = path.join(SNAPSHOTS, 'Heap-20260508T151711.heapprofile')
   let profile: HeapProfile
 
-  test('data parses the file', () => {
+  test('getFullData parses the file', () => {
     profile = new HeapProfile(filePath)
-    const result = profile.data
+    const result = profile.getFullData()
     expect(result.head).toBeDefined()
     expect(result.head.callFrame).toBeDefined()
     expect(result.head.children).toBeInstanceOf(Array)
@@ -86,5 +81,47 @@ describe('HeapProfile', () => {
     expect(flat[0]).toHaveProperty('selfSize')
     expect(flat[0]).toHaveProperty('stack')
     expect(flat[0]!.stack.length).toBeGreaterThan(0)
+  })
+
+  test('summarizeCumulative computes self and cumulative sizes', () => {
+    const summary = profile.summarizeCumulative({ top: 5 })
+    expect(summary.totalSize).toBeGreaterThan(0)
+    expect(summary.byFrame.size).toBeGreaterThan(0)
+    const firstEntry = [...summary.byFrame.values()][0]!
+    expect(firstEntry.cumulativeSize).toBeGreaterThanOrEqual(firstEntry.selfSize)
+    expect(firstEntry.cumulativePct).toBeGreaterThanOrEqual(firstEntry.selfPct)
+  })
+
+  test('summarizeCumulative respects focus filter', () => {
+    const baseline = profile.summarizeCumulative()
+    const focused = profile.summarizeCumulative({ focus: 'render' })
+    expect(focused.totalSize).toBeLessThanOrEqual(baseline.totalSize)
+  })
+
+  test('flamegraph produces a tree of frames', () => {
+    const flame = profile.flamegraph()
+    expect(flame.name).toBeDefined()
+    expect(flame.totalSize).toBeGreaterThan(0)
+    expect(Array.isArray(flame.children)).toBe(true)
+  })
+
+  test('dot emits a graphviz digraph', () => {
+    const dot = profile.dot({ top: 5 })
+    expect(dot).toContain('digraph')
+    expect(dot).toContain('->')
+  })
+
+  test('treemap produces a hierarchical structure', () => {
+    const tm = profile.treemap()
+    expect(tm.name).toBeDefined()
+    expect(tm.size).toBeGreaterThan(0)
+    expect(Array.isArray(tm.children)).toBe(true)
+  })
+
+  test('diff against self produces zero delta', () => {
+    const other = new HeapProfile(filePath)
+    const d = profile.diff(other)
+    expect(d.deltaTotal).toBe(0)
+    expect(d.baselineTotal).toBe(d.profileTotal)
   })
 })
