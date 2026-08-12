@@ -17,6 +17,8 @@ pub enum Error {
     UnsupportedType(String),
     #[error("Profiles must be of the same type to diff")]
     DiffTypeMismatch,
+    #[error("{0}")]
+    Other(String),
 }
 
 /// Granular filtering options, modelled after Go pprof's `-focus`/`-ignore`/`-hide`.
@@ -316,6 +318,87 @@ pub struct TimelineTypeSummary {
     pub allocated: usize,
     pub freed: usize,
     pub count: usize,
+}
+
+// ============================================================================
+// HeapTimeline extended analysis
+// ============================================================================
+
+/// A single name bucket: total self-size, allocation count, and the split by
+/// node type (e.g. `object` vs `string` for the same constructor name).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineNameType {
+    pub name: String,
+    pub size: usize,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineNameEntry {
+    pub name: String,
+    pub size: usize,
+    pub count: usize,
+    pub types: Vec<TimelineNameType>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineNamesResult {
+    pub total_size: usize,
+    pub total_count: usize,
+    pub entries: Vec<TimelineNameEntry>,
+}
+
+/// One frame in an allocation stack trace.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineStackFrame {
+    pub name: String,
+    pub script: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// An allocation site: a full stack path (root -> leaf) with the bytes and
+/// number of allocations recorded directly on its leaf frame.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineStackEntry {
+    pub size: usize,
+    pub count: usize,
+    pub stack: Vec<TimelineStackFrame>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineStacksResult {
+    pub total_size: usize,
+    pub total_count: usize,
+    pub entries: Vec<TimelineStackEntry>,
+}
+
+/// Stack distribution for a single node name.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineNameStacksResult {
+    pub name: String,
+    pub total_size: usize,
+    pub total_count: usize,
+    pub entries: Vec<TimelineStackEntry>,
+}
+
+/// Object-growth profile derived from the `samples` array. Each sample is a
+/// `(timestamp_us, last_assigned_id)` pair; the slope tells how many objects
+/// were allocated per second between consecutive samples.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineGrowth {
+    pub span_us: u64,
+    pub objects_start: u64,
+    pub objects_end: u64,
+    pub samples: Vec<[u64; 2]>,
 }
 
 pub fn detect_profile_type(path: &str) -> crate::Result<&'static str> {

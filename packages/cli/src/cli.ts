@@ -109,7 +109,7 @@ function printUsage() {
 
  ${bold('Options:')}
    ${yellow('--top <n>')}       Number of top entries to show (default: 30)
-   ${yellow('--filter <re>')}   Filter results by regex
+   ${yellow('--filter <re>')}   Filter results by regex (timeline: names + stacks)
    ${yellow('--focus <re>')}    pprof-style focus: only frames matching contribute
    ${yellow('--ignore <re>')}   pprof-style ignore: drop flat attribution for matches
    ${yellow('--hide <re>')}     pprof-style hide: drop matching frames from visualisations
@@ -117,6 +117,13 @@ function printUsage() {
    ${yellow('--json')}          Output as JSON
    ${yellow('--port <port>')}   Port for UI server (default: 3000)
    ${yellow('--open')}          Open browser automatically (ui command only)
+
+ ${bold('Heap timeline analysis:')}
+   analyze on a .heaptimeline prints, in addition to the by-type summary:
+     - top allocation names with per-type split
+     - top allocation sites as stack traces (leaf <- caller)
+     - object-growth profile over the recording
+   ${gray('--filter Vector3')} narrows names and stacks to matching entries.
 
  ${bold('Dot output:')}
    Pipe to graphviz to render a graph. Examples:
@@ -207,6 +214,13 @@ function formatDelta(delta: number): string {
   const abs = Math.abs(delta)
   const formatted = formatBytes(abs)
   return delta > 0 ? red(`+${formatted}`) : green(`-${formatted}`)
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms.toFixed(0)}ms`
+  const s = ms / 1000
+  if (s < 60) return `${s.toFixed(1)}s`
+  return `${Math.floor(s / 60)}m${(s % 60).toFixed(0)}s`
 }
 
 function printTable(headers: string[], rows: string[][]) {
@@ -477,14 +491,29 @@ async function analyzeHeapSnapshot(filePath: string, args: CliArgs) {
   )
 }
 
+function formatStack(stack: { name: string }[]): string {
+  return stack
+    .map((f) => f.name)
+    .filter((n) => n !== '(root)' && n !== '')
+    .join(' <- ')
+}
+
 async function analyzeHeapTimeline(filePath: string, args: CliArgs) {
   const timeline = new HeapTimeline(filePath)
   const meta = timeline.meta
-  const summary = await timeline.streamSummary({
-    top: args.top,
-    filter: args.filter ?? undefined,
-    onProgress: args.json ? undefined : (phase, pct) => progressBar(pct, phase),
-  })
+
+  if (!args.json) {
+    process.stderr.write(`  ${dim('parsing…')}\r`)
+  }
+  const [summary, names, stacks, growth] = await Promise.all([
+    timeline.streamSummary({ top: args.top, filter: args.filter ?? undefined }),
+    timeline.topNames({ top: args.top, filter: args.filter ?? undefined }),
+    timeline.topStacks({ top: args.top, filter: args.filter ?? undefined }),
+    timeline.growth(),
+  ])
+  if (!args.json) {
+    process.stderr.write('\r\x1b[K')
+  }
 
   if (args.json) {
     console.log(
@@ -502,6 +531,28 @@ async function analyzeHeapTimeline(filePath: string, args: CliArgs) {
             freed: info.freed,
             count: info.count,
           })),
+          names: names.entries.map((e) => ({
+            name: e.name,
+            size: e.size,
+            count: e.count,
+            types: e.types.map((t) => ({ type: t.name, size: t.size, count: t.count })),
+          })),
+          stacks: stacks.entries.map((e) => ({
+            size: e.size,
+            count: e.count,
+            stack: e.stack.map((f) => ({
+              name: f.name,
+              script: f.script,
+              line: f.line,
+              column: f.column,
+            })),
+          })),
+          growth: {
+            spanUs: growth.spanUs,
+            objectsStart: growth.objectsStart,
+            objectsEnd: growth.objectsEnd,
+            samples: growth.samples,
+          },
         },
         null,
         2,
@@ -516,9 +567,41 @@ async function analyzeHeapTimeline(filePath: string, args: CliArgs) {
       `heaptimeline`,
       `nodes: ${bold(meta.node_count.toLocaleString())}`,
       `total allocated: ${yellow(formatBytes(summary.totalAllocated))}`,
+      `recording: ${bold(formatDuration(growth.spanUs / 1000))}`,
     ].join(' | '),
   )
 
+  // ---- growth / time profile ----
+  if (growth.samples.length > 1) {
+    const maxRate = Math.max(
+      ...growth.samples.slice(1).map((s, i) => {
+        const [t0, o0] = growth.samples[i]
+        const dt = (s[0] - t0) / 1e6
+        return dt > 0 ? (s[1] - o0) / dt : 0
+      }),
+      1,
+    )
+    const bar = (rate: number) => dim('|') + cyan('#'.repeat(Math.round((rate / maxRate) * 24)))
+    const timeLine: string[] = []
+    for (let i = 1; i < growth.samples.length; i++) {
+      const [t0, o0] = growth.samples[i - 1]
+      const [t1, o1] = growth.samples[i]
+      const dt = (t1 - t0) / 1e6
+      const rate = dt > 0 ? (o1 - o0) / dt : 0
+      timeLine.push(bar(rate))
+    }
+    printHeader(
+      'Objects allocated over time',
+      `+${(growth.objectsEnd - growth.objectsStart).toLocaleString()} objects in ${formatDuration(growth.spanUs / 1000)}`,
+    )
+    console.log('  ' + timeLine.join(''))
+    console.log(
+      `  ${dim('0s')}${' '.repeat(30)}${dim('end')} (density = objects/s, peaks are game-creation phases)`,
+    )
+  }
+
+  // ---- by type ----
+  printHeader('By type')
   const typeRows = [...summary.byType.entries()].slice(0, args.top)
   printTable(
     ['ALLOCATED', '%', 'COUNT', 'TYPE'],
@@ -529,6 +612,34 @@ async function analyzeHeapTimeline(filePath: string, args: CliArgs) {
       magenta(type),
     ]),
   )
+
+  // ---- top names ----
+  printHeader('Top allocations by name', `of ${formatBytes(names.totalSize)} total`)
+  const nameRows = names.entries.map((e) => {
+    const typeStr = e.types.map((t) => `${t.name} ${pct(t.size, e.size)}`).join(' · ')
+    return [
+      green(formatBytes(e.size)),
+      dim(pct(e.size, names.totalSize)),
+      dim(String(e.count)),
+      e.name,
+      dim(typeStr !== e.name ? typeStr : ''),
+    ]
+  })
+  printTable(['ALLOCATED', '%', 'COUNT', 'NAME', 'BY TYPE'], nameRows)
+
+  // ---- top stacks ----
+  if (stacks.entries.length > 0) {
+    printHeader(
+      'Top allocation sites (stack traces)',
+      `${stacks.entries.length} sites · ${formatBytes(stacks.totalSize)} tracked`,
+    )
+    const stackRows = stacks.entries.map((e) => [
+      green(formatBytes(e.size)),
+      dim(String(e.count)),
+      formatStack(e.stack),
+    ])
+    printTable(['SIZE', 'COUNT', 'STACK (leaf <- caller)'], stackRows)
+  }
 }
 
 async function main() {

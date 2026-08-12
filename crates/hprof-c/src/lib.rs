@@ -534,6 +534,100 @@ pub unsafe extern "C" fn hprof_timeline_summary(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_timeline_top_names(
+    handle: *mut c_void,
+    top: u32,
+    filter: *const c_char,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_timeline(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let filter_str = unsafe { cstr_to_str(filter) };
+    match inst
+        .timeline
+        .top_names(if top == 0 { None } else { Some(top as usize) }, filter_str)
+    {
+        Ok(res) => HprofResult::ok_string(&serde_json::to_string(&res).unwrap_or_default()),
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_timeline_top_stacks(
+    handle: *mut c_void,
+    top: u32,
+    filter: *const c_char,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_timeline(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let filter_str = unsafe { cstr_to_str(filter) };
+    match inst
+        .timeline
+        .top_stacks(if top == 0 { None } else { Some(top as usize) }, filter_str)
+    {
+        Ok(res) => HprofResult::ok_string(&serde_json::to_string(&res).unwrap_or_default()),
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_timeline_name_stacks(
+    handle: *mut c_void,
+    name_re: *const c_char,
+    top: u32,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_timeline(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let name_str = match unsafe { cstr_to_str(name_re) } {
+        Some(s) => s,
+        None => return HprofResult::err("name filter is null"),
+    };
+    match inst
+        .timeline
+        .name_stacks(name_str, if top == 0 { None } else { Some(top as usize) })
+    {
+        Ok(res) => HprofResult::ok_string(&serde_json::to_string(&res).unwrap_or_default()),
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_timeline_growth(handle: *mut c_void) -> *mut HprofResult {
+    let inst = match unsafe { as_timeline(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    match inst.timeline.growth() {
+        Ok(res) => HprofResult::ok_string(&serde_json::to_string(&res).unwrap_or_default()),
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_timeline_search(
+    handle: *mut c_void,
+    query: *const c_char,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_timeline(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let q = match unsafe { cstr_to_str(query) } {
+        Some(s) => s,
+        None => return HprofResult::err("query is null"),
+    };
+    match inst.timeline.search_strings(q) {
+        Ok(res) => HprofResult::ok_string(&serde_json::to_string(&res).unwrap_or_default()),
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hprof_timeline_destroy(handle: *mut c_void) {
     if handle.is_null() {
         return;

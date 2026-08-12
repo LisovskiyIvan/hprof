@@ -41,3 +41,84 @@ describe('HeapTimeline.streamSummary', () => {
     expect(Array.isArray(phases)).toBe(true)
   }, 60000)
 })
+
+describe('HeapTimeline.topNames', () => {
+  test('returns top names with per-type split, sorted by size', async () => {
+    const timeline = new HeapTimeline(HEAP_TIMELINE)
+    const res = await timeline.topNames({ top: 10 })
+    expect(res.totalSize).toBeGreaterThan(0)
+    expect(res.totalCount).toBeGreaterThan(0)
+    expect(res.entries.length).toBeGreaterThan(0)
+    expect(res.entries.length).toBeLessThanOrEqual(10)
+    // sorted desc by size
+    for (let i = 1; i < res.entries.length; i++) {
+      expect(res.entries[i - 1]!.size).toBeGreaterThanOrEqual(res.entries[i]!.size)
+    }
+    for (const e of res.entries) {
+      expect(e.name.length).toBeGreaterThan(0)
+      expect(e.count).toBeGreaterThan(0)
+      // per-type sizes sum to the entry size
+      const typeSum = e.types.reduce((s, t) => s + t.size, 0)
+      expect(typeSum).toBe(e.size)
+    }
+  }, 60000)
+
+  test('filter narrows results to matching names', async () => {
+    const timeline = new HeapTimeline(HEAP_TIMELINE)
+    const res = await timeline.topNames({ top: 50, filter: 'Vector3' })
+    expect(res.entries.length).toBeGreaterThan(0)
+    for (const e of res.entries) {
+      expect(e.name).toMatch(/Vector3/)
+    }
+  }, 60000)
+})
+
+describe('HeapTimeline.topStacks', () => {
+  test('returns allocation sites with resolvable stack frames', async () => {
+    const timeline = new HeapTimeline(HEAP_TIMELINE)
+    const res = await timeline.topStacks({ top: 10 })
+    expect(res.totalCount).toBeGreaterThan(0)
+    expect(res.entries.length).toBeGreaterThan(0)
+    for (const e of res.entries) {
+      expect(e.stack.length).toBeGreaterThan(0)
+      // root frame first
+      expect(e.stack[0]!.name).toBe('(root)')
+    }
+  }, 60000)
+})
+
+describe('HeapTimeline.growth', () => {
+  test('reports object growth from samples', async () => {
+    const timeline = new HeapTimeline(HEAP_TIMELINE)
+    const g = await timeline.growth()
+    expect(g.spanUs).toBeGreaterThan(0)
+    expect(g.samples.length).toBeGreaterThanOrEqual(2)
+    expect(g.objectsEnd).toBeGreaterThan(g.objectsStart)
+    // samples are (time, objects) pairs, strictly increasing
+    for (let i = 1; i < g.samples.length; i++) {
+      expect(g.samples[i]![0]).toBeGreaterThan(g.samples[i - 1]![0])
+      expect(g.samples[i]![1]).toBeGreaterThan(g.samples[i - 1]![1])
+    }
+  }, 60000)
+})
+
+describe('HeapTimeline.nameStacks', () => {
+  test('attributes allocations of a name to stacks', async () => {
+    const timeline = new HeapTimeline(HEAP_TIMELINE)
+    const res = await timeline.nameStacks('Vector3', 5)
+    expect(res.totalCount).toBeGreaterThan(0)
+    expect(res.totalSize).toBeGreaterThan(0)
+    expect(res.entries.length).toBeGreaterThan(0)
+  }, 60000)
+})
+
+describe('HeapTimeline.searchStrings', () => {
+  test('finds names containing the query, ranked by size', async () => {
+    const timeline = new HeapTimeline(HEAP_TIMELINE)
+    const matches = await timeline.searchStrings('vector')
+    expect(matches.length).toBeGreaterThan(0)
+    for (const m of matches) {
+      expect(m.name.toLowerCase()).toContain('vector')
+    }
+  }, 60000)
+})

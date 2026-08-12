@@ -49,6 +49,24 @@ Useful flags:
 - `summary`, `nodes`, and `search` are optimized for very large `.heapsnapshot` files under Bun
 - `retained` falls back to an approximate top-self-size view for very large snapshots so the UI stays responsive
 
+## Heap Timeline Analysis
+
+`analyze` on a `.heaptimeline` prints, in addition to the by-type summary:
+
+- **object-growth profile** — how many objects were allocated per second across the recording
+- **top allocation names** — constructor names ranked by total self-size, with the per-type split (`system / JSArrayBufferData`, `Vector3`, …)
+- **top allocation sites** — stack traces (leaf ← caller) from the allocation trace tree, so you can see *who* allocates
+- `--filter <re>` narrows both names and stacks (e.g. `--filter 'Vector3|Particle'`)
+
+The file is mmap'd and parsed once per process, so repeated queries (and the web UI) are cheap:
+
+```bash
+bun packages/cli/src/cli.ts analyze snapshots/Heap-20260508T151658.heaptimeline --top 20
+bun packages/cli/src/cli.ts analyze snapshots/Heap-20260508T151658.heaptimeline --filter 'Vector3' --json
+```
+
+In the web UI, the Timeline tab shows the growth chart, clickable name table (click a name to see where it is allocated), and the top stack traces.
+
 ## Development
 
 Project layout:

@@ -354,13 +354,33 @@ async function handleApiRequest(url: URL): Promise<Response> {
       return jsonResponse(data.profile!.flatten())
     }
 
-    case 'timeline': {
-      if (data.type !== 'heaptimeline') {
-        return errorResponse('Timeline only available for heaptimeline')
+    case 'growth': {
+      if (data.type !== 'heaptimeline' || !data.timeline) {
+        return errorResponse('Growth only available for heaptimeline')
       }
-      return jsonResponse({
-        timeline: await data.timeline!.getTimelineEntries(),
-      })
+      return jsonResponse(await data.timeline.growth())
+    }
+
+    case 'names': {
+      if (data.type !== 'heaptimeline' || !data.timeline) {
+        return errorResponse('Names only available for heaptimeline')
+      }
+      const top = Number(url.searchParams.get('top') ?? '30')
+      const filter = url.searchParams.get('filter') ?? undefined
+      return jsonResponse(await data.timeline.topNames({ top, filter }))
+    }
+
+    case 'stacks': {
+      if (data.type !== 'heaptimeline' || !data.timeline) {
+        return errorResponse('Stacks only available for heaptimeline')
+      }
+      const top = Number(url.searchParams.get('top') ?? '20')
+      const filter = url.searchParams.get('filter') ?? undefined
+      const name = url.searchParams.get('name') ?? undefined
+      if (name) {
+        return jsonResponse(await data.timeline.nameStacks(name, top))
+      }
+      return jsonResponse(await data.timeline.topStacks({ top, filter }))
     }
 
     case 'search': {

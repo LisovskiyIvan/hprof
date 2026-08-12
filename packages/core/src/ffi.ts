@@ -113,6 +113,20 @@ const ffiDefinition = {
     args: [FFIType.ptr, FFIType.u32, FFIType.cstring],
     returns: FFIType.ptr,
   },
+  hprof_timeline_top_names: {
+    args: [FFIType.ptr, FFIType.u32, FFIType.cstring],
+    returns: FFIType.ptr,
+  },
+  hprof_timeline_top_stacks: {
+    args: [FFIType.ptr, FFIType.u32, FFIType.cstring],
+    returns: FFIType.ptr,
+  },
+  hprof_timeline_name_stacks: {
+    args: [FFIType.ptr, FFIType.cstring, FFIType.u32],
+    returns: FFIType.ptr,
+  },
+  hprof_timeline_growth: { args: [FFIType.ptr], returns: FFIType.ptr },
+  hprof_timeline_search: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.ptr },
   hprof_timeline_destroy: { args: [FFIType.ptr], returns: FFIType.void },
 
   hprof_detect_type: { args: [FFIType.cstring], returns: FFIType.ptr },
@@ -367,6 +381,38 @@ export function timelineSummary(handle: NativeHandle, top?: number, filter?: str
       loadLib().symbols.hprof_timeline_summary(handle, top ?? 0, ptr(encode(filter ?? ''))),
     ),
   )
+}
+
+export function timelineTopNames(handle: NativeHandle, top?: number, filter?: string): any {
+  return JSON.parse(
+    callString(
+      loadLib().symbols.hprof_timeline_top_names(handle, top ?? 0, ptr(encode(filter ?? ''))),
+    ),
+  )
+}
+
+export function timelineTopStacks(handle: NativeHandle, top?: number, filter?: string): any {
+  return JSON.parse(
+    callString(
+      loadLib().symbols.hprof_timeline_top_stacks(handle, top ?? 0, ptr(encode(filter ?? ''))),
+    ),
+  )
+}
+
+export function timelineNameStacks(handle: NativeHandle, nameFilter: string, top?: number): any {
+  return JSON.parse(
+    callString(
+      loadLib().symbols.hprof_timeline_name_stacks(handle, ptr(encode(nameFilter)), top ?? 0),
+    ),
+  )
+}
+
+export function timelineGrowth(handle: NativeHandle): any {
+  return JSON.parse(callString(loadLib().symbols.hprof_timeline_growth(handle)))
+}
+
+export function timelineSearch(handle: NativeHandle, query: string): any {
+  return JSON.parse(callString(loadLib().symbols.hprof_timeline_search(handle, ptr(encode(query)))))
 }
 
 export function timelineDestroy(handle: NativeHandle): void {
