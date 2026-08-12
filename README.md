@@ -48,6 +48,7 @@ Useful flags:
 
 - `summary`, `nodes`, and `search` are optimized for very large `.heapsnapshot` files under Bun
 - `retained` falls back to an approximate top-self-size view for very large snapshots so the UI stays responsive
+- node pages use a bounded-heap top-K selection (no string decode in the hot loop), and the edges array and string table are parsed lazily — a 1.66 GB / 26M-node snapshot opens with ~1 GB less memory than before and a 100-row page takes ~1 s
 
 ## Heap Timeline Analysis
 
@@ -55,7 +56,7 @@ Useful flags:
 
 - **object-growth profile** — how many objects were allocated per second across the recording
 - **top allocation names** — constructor names ranked by total self-size, with the per-type split (`system / JSArrayBufferData`, `Vector3`, …)
-- **top allocation sites** — stack traces (leaf ← caller) from the allocation trace tree, so you can see *who* allocates
+- **top allocation sites** — stack traces (leaf ← caller) from the allocation trace tree, so you can see _who_ allocates
 - `--filter <re>` narrows both names and stacks (e.g. `--filter 'Vector3|Particle'`)
 
 The file is mmap'd and parsed once per process, so repeated queries (and the web UI) are cheap:

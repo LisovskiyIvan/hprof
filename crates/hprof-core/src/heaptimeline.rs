@@ -25,7 +25,7 @@ use std::fs;
 use memmap2::Mmap;
 use regex::Regex;
 
-use crate::heapsnapshot::find_marker;
+use crate::heapsnapshot::{find_array_end, find_marker};
 use crate::types::*;
 
 // ---------------------------------------------------------------------------
@@ -89,38 +89,6 @@ fn read_num(data: &[u8], pos: &mut usize) -> u64 {
     v
 }
 
-/// Find the index of the closing `]` for the array opened at `open`.
-fn find_array_end(data: &[u8], open: usize) -> usize {
-    let mut i = open + 1;
-    let len = data.len();
-    let mut depth = 1i32;
-    while i < len {
-        match data[i] {
-            b'[' => depth += 1,
-            b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return i;
-                }
-            }
-            b'"' => {
-                i += 1;
-                while i < len {
-                    if data[i] == b'\\' {
-                        i += 2;
-                    } else if data[i] == b'"' {
-                        break;
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    len - 1
-}
 
 /// Decode one JSON string from `raw[start..end]` (escape sequences included).
 fn decode_json_string(raw: &[u8]) -> String {

@@ -23,15 +23,159 @@ pub struct HeapSnapshot {
 
 pub struct RawData {
     pub meta: SnapshotMeta,
+    pub mmap: Mmap,
     pub nodes: Vec<u32>,
-    pub edges: Vec<u32>,
-    pub strings: Vec<String>,
+    /// byte range of the `edges` array content (start..=end), parsed on demand
+    edges_range: Option<(usize, usize)>,
+    pub edges: Option<Vec<u32>>,
+    pub strings: StringTable,
     pub node_offsets: NodeFieldOffsets,
     pub edge_offsets: EdgeFieldOffsets,
     pub node_types: Vec<String>,
     pub edge_types: Vec<String>,
     pub node_field_count: usize,
     pub edge_field_count: usize,
+}
+
+/// Lazy string table: byte spans into the mmap, decoded on demand with a
+/// memo so repeated resolutions (e.g. per-row node names) are cheap.
+pub struct StringTable {
+    /// offset into the mmap where the string content starts
+    start: usize,
+    /// per-string (start, end) relative to `start`, content still escaped
+    spans: Vec<(u32, u32)>,
+    memo: std::cell::RefCell<Vec<Option<String>>>,
+}
+
+impl StringTable {
+    /// Scan the `"strings":[` array starting at `strings_start` (position of
+    /// the `[`), recording the byte span of each string.
+    fn scan(mmap: &Mmap, strings_start: usize) -> StringTable {
+        let data = &mmap[..];
+        let start = strings_start + 1; // past '['
+        let end = data.len();
+        let mut spans: Vec<(u32, u32)> = Vec::with_capacity(1 << 16);
+        let mut i = start;
+        while i < end {
+            if data[i] != b'"' {
+                if data[i] == b']' {
+                    break;
+                }
+                i += 1;
+                continue;
+            }
+            let s0 = i + 1;
+            i += 1;
+            while i < end {
+                if data[i] == b'\\' {
+                    i += 2;
+                } else if data[i] == b'"' {
+                    spans.push(((s0 - start) as u32, (i - start) as u32));
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        let span_count = spans.len();
+        StringTable {
+            start,
+            spans,
+            memo: std::cell::RefCell::new(vec![None; span_count]),
+        }
+    }
+
+    /// Decode string `idx` (escapes and surrogate pairs handled).
+    pub fn resolve(&self, mmap: &Mmap, idx: usize) -> Option<String> {
+        let memo = self.memo.borrow();
+        if let Some(cached) = memo.get(idx).and_then(|s| s.as_ref()) {
+            return Some(cached.clone());
+        }
+        drop(memo);
+        let span = self.spans.get(idx).copied()?;
+        let raw = &mmap[self.start + span.0 as usize..self.start + span.1 as usize];
+        let decoded = decode_json_string(raw);
+        self.memo.borrow_mut()[idx] = Some(decoded.clone());
+        Some(decoded)
+    }
+
+    /// All strings containing `query` (case-insensitive), up to `limit`.
+    pub fn search(&self, mmap: &Mmap, query: &str, limit: usize) -> Vec<(usize, String)> {
+        let q = query.to_lowercase();
+        let mut out = Vec::new();
+        for idx in 0..self.spans.len() {
+            if let Some(v) = self.resolve(mmap, idx) {
+                if v.to_lowercase().contains(&q) {
+                    out.push((idx, v));
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Decode one JSON string from `raw[start..end]` (escape sequences included).
+pub(crate) fn decode_json_string(raw: &[u8]) -> String {
+    let mut s: Vec<u8> = Vec::with_capacity(raw.len());
+    let mut i = 0usize;
+    let len = raw.len();
+    while i < len {
+        let c = raw[i];
+        if c == b'\\' && i + 1 < len {
+            match raw[i + 1] {
+                b'"' => s.push(b'"'),
+                b'\\' => s.push(b'\\'),
+                b'/' => s.push(b'/'),
+                b'b' => s.push(8),
+                b'f' => s.push(12),
+                b'n' => s.push(b'\n'),
+                b'r' => s.push(b'\r'),
+                b't' => s.push(b'\t'),
+                b'u' => {
+                    let hexv = |idx: usize| -> u16 {
+                        let mut v: u16 = 0;
+                        for &b in &raw[idx..idx + 4] {
+                            v = v * 16
+                                + match b {
+                                    b'0'..=b'9' => (b - b'0') as u16,
+                                    b'a'..=b'f' => (b - b'a' + 10) as u16,
+                                    b'A'..=b'F' => (b - b'A' + 10) as u16,
+                                    _ => 0,
+                                };
+                        }
+                        v
+                    };
+                    let hi = i + 2;
+                    let mut cp: u32 = hexv(hi) as u32;
+                    i += 6;
+                    if (0xD800..0xDC00).contains(&cp)
+                        && i + 5 < len
+                        && raw[i + 1] == b'\\'
+                        && raw[i + 2] == b'u'
+                    {
+                        let lo = hexv(i + 3) as u32;
+                        i += 6;
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    }
+                    if let Some(ch) = char::from_u32(cp) {
+                        let mut buf = [0u8; 4];
+                        s.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    }
+                    continue;
+                }
+                other => s.push(other),
+            }
+            i += 2;
+            continue;
+        }
+        s.push(c);
+        i += 1;
+    }
+    String::from_utf8_lossy(&s).into_owned()
 }
 
 impl HeapSnapshot {
@@ -109,16 +253,15 @@ impl HeapSnapshot {
         let data = &mmap[..];
 
         let nodes_marker = b"\"nodes\":[";
-        let edges_marker = b"\"edges\":[";
         let strings_marker = b"\"strings\":[";
 
         let nodes_start = find_marker(data, nodes_marker).ok_or(Error::HeaderParseFailed)?;
-        let edges_start = find_marker(data, edges_marker).ok_or(Error::HeaderParseFailed)?;
         let strings_start = find_marker(data, strings_marker).ok_or(Error::HeaderParseFailed)?;
 
+        // nodes are needed by every query; edges and strings are parsed
+        // lazily (get_node_edges / name resolution) to keep memory down on
+        // multi-GB snapshots
         let nodes = parse_numbers_fast(&data[nodes_start + nodes_marker.len()..]);
-        let edges = parse_numbers_fast(&data[edges_start + edges_marker.len()..]);
-        let strings = parse_strings_fast(&data[strings_start + strings_marker.len()..]);
 
         let node_offsets = NodeFieldOffsets::from_fields(&meta.meta.node_fields)?;
         let edge_offsets = EdgeFieldOffsets::from_fields(&meta.meta.edge_fields)?;
@@ -127,11 +270,23 @@ impl HeapSnapshot {
         let node_field_count = meta.meta.node_fields.len();
         let edge_field_count = meta.meta.edge_fields.len();
 
+        // record where the edges array lives so it can be parsed on demand
+        let edges_marker = b"\"edges\":[";
+        let edges_range = find_marker(data, edges_marker).map(|start| {
+            let open = start + edges_marker.len() - 1;
+            (open + 1, find_array_end(data, open))
+        });
+
+        // string table: scan byte spans lazily, decode on demand
+        let strings_table = StringTable::scan(&mmap, strings_start + strings_marker.len() - 1);
+
         self.raw = Some(RawData {
             meta,
+            mmap,
             nodes,
-            edges,
-            strings,
+            edges_range,
+            edges: None,
+            strings: strings_table,
             node_offsets,
             edge_offsets,
             node_types,
@@ -139,6 +294,25 @@ impl HeapSnapshot {
             node_field_count,
             edge_field_count,
         });
+        Ok(())
+    }
+
+    fn ensure_edges(&mut self) -> crate::Result<()> {
+        let needs = match self.raw.as_ref() {
+            Some(raw) => raw.edges.is_none(),
+            None => return Ok(()),
+        };
+        if !needs {
+            return Ok(());
+        }
+        let edges = {
+            let raw = self.raw.as_ref().unwrap();
+            let Some((start, end)) = raw.edges_range else {
+                return Err(Error::HeaderParseFailed);
+            };
+            parse_numbers_fast(&raw.mmap[start..=end])
+        };
+        self.raw.as_mut().unwrap().edges = Some(edges);
         Ok(())
     }
 
@@ -157,8 +331,7 @@ impl HeapSnapshot {
             .unwrap_or_else(|| type_idx.to_string());
         let name = raw
             .strings
-            .get(name_idx)
-            .cloned()
+            .resolve(&raw.mmap, name_idx)
             .unwrap_or_else(|| format!("<string#{}>", name_idx));
 
         HeapSnapshotNode {
@@ -280,16 +453,15 @@ impl HeapSnapshot {
 
         let strings_marker = b"\"strings\":[";
         let strings_start = find_marker(data, strings_marker).ok_or(Error::HeaderParseFailed)?;
-        let strings = parse_strings_fast(&data[strings_start + strings_marker.len()..]);
+        let table = StringTable::scan(&mmap, strings_start + strings_marker.len() - 1);
 
         // Build the full (untruncated, unfiltered) name and type maps. We keep
         // ALL names regardless of size, so subsequent slice_summary() can apply
         // any (top, filter) combination cheaply without re-parsing the mmap.
         let mut by_node_name: HashMap<String, TypeSummary> = HashMap::new();
         for (&name_idx, &(size, count, _type_idx)) in &by_name_idx {
-            let name = strings
-                .get(name_idx as usize)
-                .cloned()
+            let name = table
+                .resolve(&mmap, name_idx as usize)
                 .unwrap_or_else(|| format!("<string#{}>", name_idx));
             let entry = by_node_name
                 .entry(name)
@@ -321,7 +493,6 @@ impl HeapSnapshot {
         let page = options.page;
         let page_size = options.page_size;
         let wanted = (page + 1) * page_size;
-        let mut selected: Vec<(usize, HeapSnapshotNode)> = Vec::with_capacity(wanted);
         let mut total = 0usize;
 
         let query_lower;
@@ -335,6 +506,81 @@ impl HeapSnapshot {
         } else {
             None
         };
+
+        // Numeric sorts (the common case: size / id / edge-count pages) select
+        // with a bounded heap over plain numbers, so the loop stays
+        // allocation-free. Name/type sorts and query filtering need the
+        // strings resolved, so they take the slower path.
+        let numeric_sort = match options.sort {
+            SortField::SelfSize | SortField::Id | SortField::EdgeCount => true,
+            SortField::Name | SortField::Type => false,
+        };
+        let need_name = !numeric_sort || q_match.is_some();
+
+        let mut selected: Vec<(usize, HeapSnapshotNode)> = Vec::with_capacity(wanted);
+
+        if numeric_sort {
+            // keep the top-`wanted` by the numeric key
+            let key_of = |node_index: usize| -> u64 {
+                let base = node_index * raw.node_field_count;
+                match options.sort {
+                    SortField::SelfSize => raw.nodes[base + raw.node_offsets.self_size] as u64,
+                    SortField::Id => raw.nodes[base + raw.node_offsets.id] as u64,
+                    SortField::EdgeCount => raw.nodes[base + raw.node_offsets.edge_count] as u64,
+                    _ => unreachable!(),
+                }
+            };
+            // desc: keep largest (min-heap over the key) · asc: keep smallest
+            let keep_largest = matches!(options.dir, SortDir::Desc);
+            let mut heap: std::collections::BinaryHeap<HeapItem> =
+                std::collections::BinaryHeap::with_capacity(wanted + 1);
+
+            for node_index in 0..raw.meta.node_count {
+                let base = node_index * raw.node_field_count;
+                if let Some(ft) = options.type_filter {
+                    let type_idx = raw.nodes[base + raw.node_offsets.type_] as usize;
+                    let type_ = raw
+                        .node_types
+                        .get(type_idx)
+                        .cloned()
+                        .unwrap_or_else(|| type_idx.to_string());
+                    if type_ != ft {
+                        continue;
+                    }
+                }
+                let key = key_of(node_index);
+                let item = if keep_largest {
+                    HeapItem {
+                        value: key,
+                        idx: node_index,
+                    }
+                } else {
+                    HeapItem {
+                        value: u64::MAX - key,
+                        idx: node_index,
+                    }
+                };
+                heap.push(item);
+                if heap.len() > wanted {
+                    heap.pop();
+                }
+                total += 1;
+            }
+            // materialize the kept nodes, resolve strings for the page rows
+            let mut kept: Vec<usize> = heap.into_iter().map(|h| h.idx).collect();
+            kept.sort_by(|&a, &b| compare_node_indices(raw, a, b, options.sort, options.dir));
+            let rows: Vec<usize> = kept.into_iter().skip(page * page_size).take(page_size).collect();
+            let nodes = rows
+                .iter()
+                .map(|&idx| Self::create_node_raw(raw, idx, true))
+                .collect();
+            return Ok(NodePage {
+                total,
+                page,
+                page_size,
+                nodes,
+            });
+        }
 
         for node_index in 0..raw.meta.node_count {
             let base = node_index * raw.node_field_count;
@@ -352,11 +598,13 @@ impl HeapSnapshot {
             }
 
             let name_idx = raw.nodes[base + raw.node_offsets.name] as usize;
-            let name = raw
-                .strings
-                .get(name_idx)
-                .cloned()
-                .unwrap_or_else(|| format!("<string#{}>", name_idx));
+            let name = if need_name {
+                raw.strings
+                    .resolve(&raw.mmap, name_idx)
+                    .unwrap_or_else(|| format!("<string#{}>", name_idx))
+            } else {
+                String::new()
+            };
 
             if let Some(ql) = q_match {
                 if !name.to_lowercase().contains(ql) {
@@ -384,10 +632,17 @@ impl HeapSnapshot {
                 continue;
             }
 
-            if compare_nodes(&candidate, &selected[0], options.sort, options.dir)
+            // replace the current worst kept candidate if this one is better
+            let worst_idx = selected
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| compare_nodes(a, b, options.sort, options.dir))
+                .map(|(i, _)| i)
+                .unwrap();
+            if compare_nodes(&candidate, &selected[worst_idx], options.sort, options.dir)
                 == std::cmp::Ordering::Less
             {
-                selected[0] = candidate;
+                selected[worst_idx] = candidate;
             }
         }
 
@@ -406,11 +661,45 @@ impl HeapSnapshot {
         })
     }
 
+    /// Build a node from a record index, resolving the name (used by the fast
+    /// numeric-sort page path after selection).
+    fn create_node_raw(raw: &RawData, node_index: usize, with_name: bool) -> HeapSnapshotNode {
+        let base = node_index * raw.node_field_count;
+        let type_idx = raw.nodes[base + raw.node_offsets.type_] as usize;
+        let name_idx = raw.nodes[base + raw.node_offsets.name] as usize;
+        let self_size = raw.nodes[base + raw.node_offsets.self_size] as usize;
+        let id = raw.nodes[base + raw.node_offsets.id] as usize;
+        let edge_count = raw.nodes[base + raw.node_offsets.edge_count] as usize;
+
+        let type_ = raw
+            .node_types
+            .get(type_idx)
+            .cloned()
+            .unwrap_or_else(|| type_idx.to_string());
+        let name = if with_name {
+            raw.strings
+                .resolve(&raw.mmap, name_idx)
+                .unwrap_or_else(|| format!("<string#{}>", name_idx))
+        } else {
+            String::new()
+        };
+
+        HeapSnapshotNode {
+            type_,
+            name,
+            self_size,
+            retention_size: None,
+            id,
+            edge_count,
+        }
+    }
+
     pub fn get_node_edges(
         &mut self,
         node_index: usize,
     ) -> crate::Result<(HeapSnapshotNode, Vec<HeapSnapshotEdge>)> {
         self.ensure_raw()?;
+        self.ensure_edges()?;
         let raw = self.raw.as_ref().unwrap();
         if node_index >= raw.meta.node_count {
             return Err(Error::NodeNotFound(node_index));
@@ -435,11 +724,12 @@ impl HeapSnapshot {
 
         let mut edges = Vec::with_capacity(edge_end - edge_start);
         for edge_index in edge_start..edge_end {
+            let edges_vec = raw.edges.as_ref().unwrap();
             let base = edge_index * raw.edge_field_count;
-            let type_idx = raw.edges[base + raw.edge_offsets.type_] as usize;
-            let name_or_index_val = raw.edges[base + raw.edge_offsets.name_or_index] as usize;
+            let type_idx = edges_vec[base + raw.edge_offsets.type_] as usize;
+            let name_or_index_val = edges_vec[base + raw.edge_offsets.name_or_index] as usize;
             let to_node =
-                raw.edges[base + raw.edge_offsets.to_node] as usize / raw.node_field_count;
+                edges_vec[base + raw.edge_offsets.to_node] as usize / raw.node_field_count;
 
             let edge_type = raw
                 .edge_types
@@ -450,8 +740,7 @@ impl HeapSnapshot {
                 EdgeName::Index(name_or_index_val)
             } else {
                 raw.strings
-                    .get(name_or_index_val)
-                    .cloned()
+                    .resolve(&raw.mmap, name_or_index_val)
                     .map(EdgeName::String)
                     .unwrap_or(EdgeName::Index(name_or_index_val))
             };
@@ -469,27 +758,19 @@ impl HeapSnapshot {
     pub fn search_strings(&mut self, query: &str) -> crate::Result<Vec<SearchMatch>> {
         self.ensure_raw()?;
         let raw = self.raw.as_ref().unwrap();
-        let query_lower = query.to_lowercase();
-        let mut matches_ = Vec::new();
-        for (index, value) in raw.strings.iter().enumerate() {
-            if value.to_lowercase().contains(&query_lower) {
-                matches_.push(SearchMatch {
-                    index,
-                    value: value.clone(),
-                });
-                if matches_.len() >= 100 {
-                    break;
-                }
-            }
-        }
-        Ok(matches_)
+        Ok(raw
+            .strings
+            .search(&raw.mmap, query, 100)
+            .into_iter()
+            .map(|(index, value)| SearchMatch { index, value })
+            .collect())
     }
 
     pub fn get_retained_entries(&mut self, top_n: usize) -> crate::Result<RetainedResult> {
         self.ensure_raw()?;
-        let raw = self.raw.as_ref().unwrap();
 
-        if raw.meta.node_count > 5_000_000 {
+        if self.raw.as_ref().unwrap().meta.node_count > 5_000_000 {
+            let raw = self.raw.as_ref().unwrap();
             let mut selected: Vec<(usize, HeapSnapshotNode)> = Vec::with_capacity(top_n);
             for node_index in 0..raw.meta.node_count {
                 let node = Self::create_node(raw, node_index);
@@ -524,6 +805,8 @@ impl HeapSnapshot {
             });
         }
 
+        self.ensure_edges()?;
+        let raw = self.raw.as_ref().unwrap();
         let retained = self.build_retained_sizes(raw)?;
         let mut indexed: Vec<(usize, f64)> = retained.into_iter().enumerate().collect();
         indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -575,10 +858,11 @@ impl HeapSnapshot {
             stack.push(!(node_idx as i64));
             let start = edge_starts[node_idx] as usize;
             let end = edge_starts[node_idx + 1] as usize;
+            let edges_vec = raw.edges.as_ref().unwrap();
             for edge_index in start..end {
                 let base = edge_index * raw.edge_field_count;
                 let to_node =
-                    raw.edges[base + raw.edge_offsets.to_node] as usize / raw.node_field_count;
+                    edges_vec[base + raw.edge_offsets.to_node] as usize / raw.node_field_count;
                 if to_node < node_count && !visited[to_node] {
                     stack.push(to_node as i64);
                 }
@@ -592,10 +876,11 @@ impl HeapSnapshot {
         for n in 0..node_count {
             let start = edge_starts[n] as usize;
             let end = edge_starts[n + 1] as usize;
+            let edges_vec = raw.edges.as_ref().unwrap();
             for edge_index in start..end {
                 let base = edge_index * raw.edge_field_count;
                 let to_node =
-                    raw.edges[base + raw.edge_offsets.to_node] as usize / raw.node_field_count;
+                    edges_vec[base + raw.edge_offsets.to_node] as usize / raw.node_field_count;
                 if to_node < node_count {
                     preds[to_node].push(n);
                 }
@@ -877,6 +1162,54 @@ fn slice_summary(
     }
 }
 
+/// Heap entry for the bounded top-K selection in `get_node_page`. The value
+/// is the sort key (already inverted for ascending order).
+#[derive(Debug, PartialEq, Eq)]
+struct HeapItem {
+    value: u64,
+    idx: usize,
+}
+
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .value
+            .cmp(&self.value)
+            .then_with(|| other.idx.cmp(&self.idx))
+    }
+}
+
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Compare two node records by a numeric field (plus index tiebreak),
+/// honouring the requested sort direction.
+fn compare_node_indices(
+    raw: &RawData,
+    a: usize,
+    b: usize,
+    sort: SortField,
+    dir: SortDir,
+) -> std::cmp::Ordering {
+    let num = |idx: usize| -> u64 {
+        let base = idx * raw.node_field_count;
+        match sort {
+            SortField::SelfSize => raw.nodes[base + raw.node_offsets.self_size] as u64,
+            SortField::Id => raw.nodes[base + raw.node_offsets.id] as u64,
+            SortField::EdgeCount => raw.nodes[base + raw.node_offsets.edge_count] as u64,
+            _ => 0,
+        }
+    };
+    let cmp = num(a).cmp(&num(b)).then_with(|| a.cmp(&b));
+    match dir {
+        SortDir::Desc => cmp.reverse(),
+        SortDir::Asc => cmp,
+    }
+}
+
 fn compare_nodes(
     a: &(usize, HeapSnapshotNode),
     b: &(usize, HeapSnapshotNode),
@@ -1008,6 +1341,39 @@ fn find_matching_brace(s: &str, start: usize) -> Option<usize> {
     None
 }
 
+/// Find the index of the closing `]` for the array opened at `open`.
+pub fn find_array_end(data: &[u8], open: usize) -> usize {
+    let mut i = open + 1;
+    let len = data.len();
+    let mut depth = 1i32;
+    while i < len {
+        match data[i] {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < len {
+                    if data[i] == b'\\' {
+                        i += 2;
+                    } else if data[i] == b'"' {
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    len - 1
+}
+
 #[inline]
 pub fn find_marker(data: &[u8], marker: &[u8]) -> Option<usize> {
     if marker.len() > data.len() {
@@ -1052,75 +1418,4 @@ pub fn parse_numbers_fast(data: &[u8]) -> Vec<u32> {
         i += 1;
     }
     numbers
-}
-
-#[inline]
-fn parse_strings_fast(data: &[u8]) -> Vec<String> {
-    let mut strings = Vec::with_capacity(65536);
-    let mut i = 0;
-    let len = data.len();
-
-    while i < len {
-        if data[i] == b']' {
-            break;
-        }
-        if data[i] != b'"' {
-            i += 1;
-            continue;
-        }
-        i += 1;
-
-        let mut buf: Vec<u8> = Vec::with_capacity(64);
-        while i < len {
-            let ch = data[i];
-            if ch == b'\\' {
-                i += 1;
-                if i >= len {
-                    break;
-                }
-                let decoded = match data[i] {
-                    b'n' => b'\n',
-                    b'r' => b'\r',
-                    b't' => b'\t',
-                    b'\\' => b'\\',
-                    b'"' => b'"',
-                    b'/' => b'/',
-                    b'b' => 8,
-                    b'f' => 12,
-                    b'u' => {
-                        if i + 4 < len {
-                            let hex = &data[i + 1..i + 5];
-                            let cp =
-                                u32::from_str_radix(std::str::from_utf8(hex).unwrap_or("0000"), 16)
-                                    .unwrap_or(0);
-                            i += 4;
-                            let mut tmp = [0u8; 4];
-                            let s = std::char::from_u32(cp)
-                                .unwrap_or('\u{FFFD}')
-                                .encode_utf8(&mut tmp);
-                            let len = s.len();
-                            buf.extend_from_slice(&tmp[..len]);
-                            i += 1;
-                            continue;
-                        }
-                        data[i]
-                    }
-                    _ => data[i],
-                };
-                buf.push(decoded);
-                i += 1;
-                continue;
-            }
-            if ch == b'"' {
-                i += 1;
-                break;
-            }
-            buf.push(ch);
-            i += 1;
-        }
-
-        strings.push(unsafe { String::from_utf8_unchecked(buf) });
-    }
-
-    strings
 }

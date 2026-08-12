@@ -9,7 +9,7 @@ unsafe fn cstr_to_str<'a>(s: *const c_char) -> Option<&'a str> {
     if s.is_null() {
         None
     } else {
-        unsafe { CStr::from_ptr(s).to_str().ok() }
+        unsafe { CStr::from_ptr(s).to_str().ok() }.filter(|s| !s.is_empty())
     }
 }
 
@@ -146,10 +146,7 @@ pub unsafe extern "C" fn hprof_snapshot_search(
         Ok(i) => i,
         Err(e) => return e,
     };
-    let query_str = match unsafe { cstr_to_str(query) } {
-        Some(s) => s,
-        None => return HprofResult::err("query is null"),
-    };
+    let query_str = unsafe { cstr_to_str(query) }.unwrap_or("");
     match inst.snapshot.search_strings(query_str) {
         Ok(matches_) => {
             let json = serde_json::to_string(
@@ -617,10 +614,7 @@ pub unsafe extern "C" fn hprof_timeline_search(
         Ok(i) => i,
         Err(e) => return e,
     };
-    let q = match unsafe { cstr_to_str(query) } {
-        Some(s) => s,
-        None => return HprofResult::err("query is null"),
-    };
+    let q = unsafe { cstr_to_str(query) }.unwrap_or("");
     match inst.timeline.search_strings(q) {
         Ok(res) => HprofResult::ok_string(&serde_json::to_string(&res).unwrap_or_default()),
         Err(e) => HprofResult::err(&e.to_string()),

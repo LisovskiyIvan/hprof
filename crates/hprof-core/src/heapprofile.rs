@@ -26,12 +26,7 @@ impl HeapProfile {
 
     pub fn data(&mut self) -> crate::Result<&HeapProfileResult> {
         if self.data.is_none() {
-            let raw: serde_json::Value = serde_json::from_reader(fs::File::open(&self.file_path)?)?;
-            let result = HeapProfileResult {
-                head: convert_node(&raw["head"]),
-                start_time: raw["startTime"].as_f64().unwrap_or(0.0),
-                end_time: raw["endTime"].as_f64().unwrap_or(0.0),
-            };
+            let result = parse_profile(&self.file_path)?;
             self.data = Some(Arc::new(result));
         }
         Ok(self.data.as_ref().unwrap())
@@ -787,20 +782,245 @@ fn dot_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn convert_node(val: &serde_json::Value) -> HeapProfileNode {
-    let frame = &val["callFrame"];
-    HeapProfileNode {
-        call_frame: CallFrame {
-            function_name: frame["functionName"].as_str().unwrap_or("").to_string(),
-            script_id: frame["scriptId"].as_str().unwrap_or("").to_string(),
-            url: frame["url"].as_str().unwrap_or("").to_string(),
-            line_number: frame["lineNumber"].as_i64().unwrap_or(0) as i32,
-            column_number: frame["columnNumber"].as_i64().unwrap_or(0) as i32,
-        },
-        self_size: val["selfSize"].as_u64().unwrap_or(0) as usize,
-        children: val["children"]
-            .as_array()
-            .map(|arr| arr.iter().map(convert_node).collect())
-            .unwrap_or_default(),
+// ============================================================================
+// Streaming parser (no full-DOM serde_json) — mmap + recursive descent
+// ============================================================================
+
+use crate::heapsnapshot::{decode_json_string, find_marker};
+
+fn parse_profile(file_path: &str) -> crate::Result<HeapProfileResult> {
+    let mmap = unsafe { memmap2::Mmap::map(&fs::File::open(file_path)?)? };
+    let data = &mmap[..];
+
+    let head_marker = b"\"head\":";
+    let head_start = find_marker(data, head_marker)
+        .map(|s| s + head_marker.len())
+        .ok_or(Error::HeaderParseFailed)?;
+    let mut pos = head_start;
+    let head = parse_profile_node(data, &mut pos);
+
+    let start_time = number_after_key(data, b"\"startTime\"");
+    let end_time = number_after_key(data, b"\"endTime\"");
+
+    Ok(HeapProfileResult {
+        head,
+        start_time,
+        end_time,
+    })
+}
+
+#[inline]
+fn skip_ws(data: &[u8], pos: &mut usize) {
+    while *pos < data.len() && (data[*pos] == b' ' || data[*pos] == b'\n' || data[*pos] == b'\t' || data[*pos] == b'\r') {
+        *pos += 1;
     }
 }
+
+/// Parse a JSON string starting at `data[*pos] == '"'`, returning its content.
+fn parse_string(data: &[u8], pos: &mut usize) -> String {
+    // pos at '"'
+    *pos += 1;
+    let start = *pos;
+    while *pos < data.len() {
+        if data[*pos] == b'\\' {
+            *pos += 2;
+        } else if data[*pos] == b'"' {
+            let end = *pos;
+            *pos += 1;
+            return decode_json_string(&data[start..end]);
+        } else {
+            *pos += 1;
+        }
+    }
+    decode_json_string(&data[start..*pos])
+}
+
+/// Parse the JSON number at `*pos` as u64 (digits only, optional sign).
+fn parse_u64(data: &[u8], pos: &mut usize) -> u64 {
+    skip_ws(data, pos);
+    if *pos < data.len() && data[*pos] == b'-' {
+        *pos += 1;
+    }
+    let mut v: u64 = 0;
+    while *pos < data.len() && data[*pos].is_ascii_digit() {
+        v = v * 10 + (data[*pos] - b'0') as u64;
+        *pos += 1;
+    }
+    v
+}
+
+/// Parse the JSON number at `*pos` as f64 (handles fractions/exponents).
+fn parse_f64(data: &[u8], pos: &mut usize) -> f64 {
+    skip_ws(data, pos);
+    let start = *pos;
+    if *pos < data.len() && (data[*pos] == b'-' || data[*pos] == b'+') {
+        *pos += 1;
+    }
+    while *pos < data.len() && (data[*pos].is_ascii_digit() || matches!(data[*pos], b'.' | b'e' | b'E' | b'-' | b'+')) {
+        *pos += 1;
+    }
+    std::str::from_utf8(&data[start..*pos])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0)
+}
+
+/// Skip a JSON value (scalar, object or array) starting at `*pos`.
+fn skip_value(data: &[u8], pos: &mut usize) {
+    skip_ws(data, pos);
+    if *pos >= data.len() {
+        return;
+    }
+    match data[*pos] {
+        b'"' => {
+            let _ = parse_string(data, pos);
+        }
+        b'{' | b'[' => {
+            let mut depth = 0i32;
+            while *pos < data.len() {
+                match data[*pos] {
+                    b'"' => {
+                        let _ = parse_string(data, pos);
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        *pos += 1;
+                        if depth <= 0 {
+                            return;
+                        }
+                    }
+                    _ => *pos += 1,
+                }
+            }
+        }
+        _ => {
+            let _ = parse_f64(data, pos);
+        }
+    }
+}
+
+/// Parse a call frame object: `{"functionName":...,"scriptId":...,"url":...,"lineNumber":N,"columnNumber":N}`.
+fn parse_call_frame(data: &[u8], pos: &mut usize) -> CallFrame {
+    let mut frame = CallFrame {
+        function_name: String::new(),
+        script_id: String::new(),
+        url: String::new(),
+        line_number: 0,
+        column_number: 0,
+    };
+    skip_ws(data, pos);
+    if *pos < data.len() && data[*pos] == b'{' {
+        *pos += 1;
+    }
+    loop {
+        skip_ws(data, pos);
+        if *pos >= data.len() || data[*pos] == b'}' {
+            *pos += 1;
+            break;
+        }
+        let key = parse_string(data, pos);
+        skip_ws(data, pos);
+        if *pos < data.len() && data[*pos] == b':' {
+            *pos += 1;
+        }
+        skip_ws(data, pos);
+        match key.as_str() {
+            "functionName" => frame.function_name = parse_string(data, pos),
+            "scriptId" => {
+                // V8 writes scriptId as a string; tolerate numbers too
+                frame.script_id = if *pos < data.len() && data[*pos] == b'"' {
+                    parse_string(data, pos)
+                } else {
+                    parse_f64(data, pos).to_string()
+                };
+            }
+            "url" => frame.url = parse_string(data, pos),
+            "lineNumber" => frame.line_number = parse_f64(data, pos) as i32,
+            "columnNumber" => frame.column_number = parse_f64(data, pos) as i32,
+            _ => skip_value(data, pos),
+        }
+        skip_ws(data, pos);
+        if *pos < data.len() && data[*pos] == b',' {
+            *pos += 1;
+        }
+    }
+    frame
+}
+
+/// Parse one profile tree node: `{"callFrame":{...},"selfSize":N,"id":N,"children":[...]}`.
+fn parse_profile_node(data: &[u8], pos: &mut usize) -> HeapProfileNode {
+    let mut node = HeapProfileNode {
+        call_frame: CallFrame {
+            function_name: String::new(),
+            script_id: String::new(),
+            url: String::new(),
+            line_number: 0,
+            column_number: 0,
+        },
+        self_size: 0,
+        children: Vec::new(),
+    };
+    skip_ws(data, pos);
+    if *pos < data.len() && data[*pos] == b'{' {
+        *pos += 1;
+    }
+    loop {
+        skip_ws(data, pos);
+        if *pos >= data.len() || data[*pos] == b'}' {
+            *pos += 1;
+            break;
+        }
+        let key = parse_string(data, pos);
+        skip_ws(data, pos);
+        if *pos < data.len() && data[*pos] == b':' {
+            *pos += 1;
+        }
+        skip_ws(data, pos);
+        match key.as_str() {
+            "callFrame" => node.call_frame = parse_call_frame(data, pos),
+            "selfSize" => node.self_size = parse_u64(data, pos) as usize,
+            "id" => {
+                let _ = parse_u64(data, pos);
+            }
+            "children" => {
+                skip_ws(data, pos);
+                if *pos < data.len() && data[*pos] == b'[' {
+                    *pos += 1;
+                }
+                loop {
+                    skip_ws(data, pos);
+                    if *pos >= data.len() || data[*pos] == b']' {
+                        *pos += 1;
+                        break;
+                    }
+                    node.children.push(parse_profile_node(data, pos));
+                    skip_ws(data, pos);
+                    if *pos < data.len() && data[*pos] == b',' {
+                        *pos += 1;
+                    }
+                }
+            }
+            _ => skip_value(data, pos),
+        }
+        skip_ws(data, pos);
+        if *pos < data.len() && data[*pos] == b',' {
+            *pos += 1;
+        }
+    }
+    node
+}
+
+/// Find `key` in the file and parse the f64 following it (used for start/end time).
+fn number_after_key(data: &[u8], key: &[u8]) -> f64 {
+    let Some(start) = find_marker(data, key) else {
+        return 0.0;
+    };
+    let mut pos = start + key.len();
+    skip_ws(data, &mut pos);
+    if pos < data.len() && data[pos] == b':' {
+        pos += 1;
+    }
+    parse_f64(data, &mut pos)
+}
+
