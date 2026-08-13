@@ -27,6 +27,7 @@ use regex::Regex;
 
 use crate::heapsnapshot::{find_array_end, find_marker};
 use crate::types::*;
+use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Parsed structures
@@ -233,41 +234,32 @@ fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<Timelin
     let nodes_end = find_array_end(data, nodes_open);
     let nodes_data = &data[nodes_open + 1..=nodes_end];
 
-    let mut types: Vec<u8> = Vec::with_capacity(nodes_data.len() / 24);
-    let mut names: Vec<u32> = Vec::with_capacity(nodes_data.len() / 24);
-    let mut sizes: Vec<u32> = Vec::with_capacity(nodes_data.len() / 24);
-    let mut tids: Vec<u32> = Vec::with_capacity(nodes_data.len() / 24);
-    let mut total_allocated: usize = 0;
-    let mut pos = 0usize;
-    loop {
-        // read node_field_count numbers; stop at the array end
-        let mut field = 0usize;
-        let mut node_vals = [0u32; 16];
-        while field < node_field_count {
-            // skip commas/whitespace, stop at ']'
-            while pos < nodes_data.len()
-                && nodes_data[pos] != b']'
-                && !nodes_data[pos].is_ascii_digit()
-            {
-                pos += 1;
-            }
-            if pos >= nodes_data.len() || nodes_data[pos] == b']' {
-                break;
-            }
-            node_vals[field] = read_num(nodes_data, &mut pos) as u32;
-            field += 1;
-        }
-        if field < node_field_count {
-            break;
-        }
-        types.push(node_vals[type_offset] as u8);
-        names.push(node_vals[name_offset]);
-        let size = node_vals[self_size_offset];
-        sizes.push(size);
-        total_allocated += size as usize;
-        tids.push(node_vals[trace_node_offset]);
-    }
-    let node_count = types.len();
+    // Parse all node fields in parallel (flat comma-separated integers), then
+    // extract the four fields per record with rayon. The transient nums vec
+    // (~400MB for 17M nodes) is dropped before the trace tree parse.
+    let nums = crate::heapsnapshot::parse_numbers_par(nodes_data);
+    let node_count = nums.len() / node_field_count;
+    let types: Vec<u8> = nums
+        .par_chunks(node_field_count)
+        .map(|r| r[type_offset] as u8)
+        .collect();
+    let names: Vec<u32> = nums
+        .par_chunks(node_field_count)
+        .map(|r| r[name_offset])
+        .collect();
+    let sizes: Vec<u32> = nums
+        .par_chunks(node_field_count)
+        .map(|r| r[self_size_offset])
+        .collect();
+    let total_allocated: usize = nums
+        .par_chunks(node_field_count)
+        .map(|r| r[self_size_offset] as usize)
+        .sum();
+    let tids: Vec<u32> = nums
+        .par_chunks(node_field_count)
+        .map(|r| r[trace_node_offset])
+        .collect();
+    drop(nums);
 
     // ---- strings table ----
     let strings_marker = b"\"strings\":[";
@@ -302,7 +294,7 @@ fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<Timelin
     let fi_marker = b"\"trace_function_infos\":[";
     let fi_start = find_marker(data, fi_marker).ok_or(Error::HeaderParseFailed)? + fi_marker.len();
     let fi_end = find_array_end(data, fi_start - 1);
-    let fi_nums = crate::heapsnapshot::parse_numbers_fast(&data[fi_start..=fi_end]);
+    let fi_nums = crate::heapsnapshot::parse_numbers_par(&data[fi_start..=fi_end]);
     let mut trace_infos: Vec<TraceInfo> = Vec::with_capacity(fi_nums.len() / 6);
     for c in fi_nums.chunks(6) {
         if c.len() < 6 {

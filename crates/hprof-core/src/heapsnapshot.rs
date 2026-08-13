@@ -293,8 +293,11 @@ impl HeapSnapshot {
 
         // nodes are needed by every query; edges and strings are parsed
         // lazily (get_node_edges / name resolution) to keep memory down on
-        // multi-GB snapshots
-        let nodes = parse_numbers_fast(&data[nodes_start + nodes_marker.len()..]);
+        // multi-GB snapshots. The region is bounded to the nodes array so the
+        // parallel parser can split it at commas.
+        let nodes_open = nodes_start + nodes_marker.len() - 1; // position of '['
+        let nodes_end = find_array_end(data, nodes_open);
+        let nodes = parse_numbers_par(&data[nodes_open + 1..=nodes_end]);
 
         let node_offsets = NodeFieldOffsets::from_fields(&meta.meta.node_fields)?;
         let edge_offsets = EdgeFieldOffsets::from_fields(&meta.meta.edge_fields)?;
@@ -303,12 +306,9 @@ impl HeapSnapshot {
         let node_field_count = meta.meta.node_fields.len();
         let edge_field_count = meta.meta.edge_fields.len();
 
-        // record where the edges array lives so it can be parsed on demand
-        let edges_marker = b"\"edges\":[";
-        let edges_range = find_marker(data, edges_marker).map(|start| {
-            let open = start + edges_marker.len() - 1;
-            (open + 1, find_array_end(data, open))
-        });
+        // the edges array is located lazily in ensure_edges — locating it
+        // here would scan the whole (often ~700MB) edges array even for
+        // queries that never touch edges
 
         // string table: scan byte spans lazily, decode on demand
         let strings_table = StringTable::scan(&mmap, strings_start + strings_marker.len() - 1);
@@ -317,7 +317,7 @@ impl HeapSnapshot {
             meta,
             mmap,
             nodes,
-            edges_range,
+            edges_range: None,
             edges: None,
             strings: strings_table,
             node_offsets,
@@ -340,10 +340,18 @@ impl HeapSnapshot {
         }
         let edges = {
             let raw = self.raw.as_ref().unwrap();
-            let Some((start, end)) = raw.edges_range else {
-                return Err(Error::HeaderParseFailed);
+            let (start, end) = match raw.edges_range {
+                Some(r) => r,
+                None => {
+                    let edges_marker = b"\"edges\":[";
+                    let start =
+                        find_marker(&raw.mmap, edges_marker).ok_or(Error::HeaderParseFailed)?;
+                    let open = start + edges_marker.len() - 1;
+                    let end = find_array_end(&raw.mmap, open);
+                    (open + 1, end)
+                }
             };
-            parse_numbers_fast(&raw.mmap[start..=end])
+            parse_numbers_par(&raw.mmap[start..=end])
         };
         self.raw.as_mut().unwrap().edges = Some(edges);
         Ok(())
@@ -395,34 +403,18 @@ impl HeapSnapshot {
     }
 
     fn compute_full_summary(&mut self) -> crate::Result<HeapSnapshotSummary> {
-        let _ = self.meta()?;
-        let meta = self.meta.as_ref().unwrap();
-        let node_fields = &meta.meta.node_fields;
-        let node_types = meta
-            .meta
-            .node_types
-            .first()
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
-        let node_field_count = node_fields.len();
-        let type_offset = node_fields
-            .iter()
-            .position(|f| f == "type")
-            .ok_or(Error::UnsupportedLayout)?;
-        let name_offset = node_fields
-            .iter()
-            .position(|f| f == "name")
-            .ok_or(Error::UnsupportedLayout)?;
-        let self_size_offset = node_fields
-            .iter()
-            .position(|f| f == "self_size")
-            .ok_or(Error::UnsupportedLayout)?;
-
-        let mmap = self.mmap_file()?;
-        let data = &mmap[..];
-        let nodes_marker = b"\"nodes\":[";
-        let nodes_start = find_marker(data, nodes_marker).ok_or(Error::HeaderParseFailed)?;
-        let nodes = parse_numbers_fast(&data[nodes_start + nodes_marker.len()..]);
+        // Reuse the already-parsed node records from ensure_raw instead of
+        // re-parsing the mmap — in the analyze --retained flow the nodes
+        // array would otherwise be parsed twice (~350MB of scanning).
+        self.ensure_raw()?;
+        let raw = self.raw.as_ref().unwrap();
+        let nodes = &raw.nodes;
+        let node_field_count = raw.node_field_count;
+        let type_offset = raw.node_offsets.type_;
+        let name_offset = raw.node_offsets.name;
+        let self_size_offset = raw.node_offsets.self_size;
+        let node_types = raw.node_types.as_slice();
+        let strings = &raw.strings;
 
         let total_node_count = nodes.len() / node_field_count;
 
@@ -484,9 +476,7 @@ impl HeapSnapshot {
             }
         }
 
-        let strings_marker = b"\"strings\":[";
-        let strings_start = find_marker(data, strings_marker).ok_or(Error::HeaderParseFailed)?;
-        let table = StringTable::scan(&mmap, strings_start + strings_marker.len() - 1);
+        let table = strings;
 
         // Build the full (untruncated, unfiltered) name and type maps. We keep
         // ALL names regardless of size, so subsequent slice_summary() can apply
@@ -494,7 +484,7 @@ impl HeapSnapshot {
         let mut by_node_name: HashMap<String, TypeSummary> = HashMap::new();
         for (&name_idx, &(size, count, _type_idx)) in &by_name_idx {
             let name = table
-                .resolve(&mmap, name_idx as usize)
+                .resolve(&raw.mmap, name_idx as usize)
                 .unwrap_or_else(|| format!("<string#{}>", name_idx));
             let entry = by_node_name
                 .entry(name)
@@ -919,26 +909,41 @@ impl HeapSnapshot {
         // indexed by preorder number; 0 = root. Runs in O(E · α(V)) — the
         // Cooper–Harvey–Kennedy refinement took ~74s on a 7.4M-node snapshot,
         // this finishes in seconds.
-        fn eval(v: u32, semi: &[u32], label: &mut [u32], ancestor: &mut [u32]) -> u32 {
+        // eval/compress with a caller-owned scratch buffer: compress is called
+        // once per predecessor (~24M times on a 7.4M-node snapshot), and a
+        // fresh Vec per call was measurable allocation churn.
+        fn eval(
+            v: u32,
+            semi: &[u32],
+            label: &mut [u32],
+            ancestor: &mut [u32],
+            scratch: &mut Vec<u32>,
+        ) -> u32 {
             if ancestor[v as usize] == 0 {
                 return label[v as usize];
             }
-            compress(v, semi, label, ancestor);
+            compress(v, semi, label, ancestor, scratch);
             label[v as usize]
         }
 
         // Iterative compress (recursion could blow the stack on deep chains).
-        fn compress(v: u32, semi: &[u32], label: &mut [u32], ancestor: &mut [u32]) {
+        fn compress(
+            v: u32,
+            semi: &[u32],
+            label: &mut [u32],
+            ancestor: &mut [u32],
+            scratch: &mut Vec<u32>,
+        ) {
             if ancestor[ancestor[v as usize] as usize] == 0 {
                 return;
             }
-            let mut chain: Vec<u32> = Vec::new();
+            scratch.clear();
             let mut x = v;
             while ancestor[ancestor[x as usize] as usize] != 0 {
-                chain.push(x);
+                scratch.push(x);
                 x = ancestor[x as usize];
             }
-            while let Some(y) = chain.pop() {
+            while let Some(y) = scratch.pop() {
                 let a = ancestor[y as usize];
                 if semi[label[a as usize] as usize] < semi[label[y as usize] as usize] {
                     label[y as usize] = label[a as usize];
@@ -955,12 +960,13 @@ impl HeapSnapshot {
         idom_pre[0] = 0;
         let mut bucket_head = vec![u32::MAX; n];
         let mut bucket_next = vec![u32::MAX; n];
+        let mut scratch: Vec<u32> = Vec::with_capacity(16);
 
         for w in (1..n).rev() {
             let wu = w;
             let preds = &rev_sources[rev_starts[wu] as usize..rev_starts[wu + 1] as usize];
             for &v in preds {
-                let u = eval(v, &semi, &mut label, &mut ancestor);
+                let u = eval(v, &semi, &mut label, &mut ancestor, &mut scratch);
                 if semi[u as usize] < semi[wu] {
                     semi[wu] = semi[u as usize];
                 }
@@ -973,7 +979,7 @@ impl HeapSnapshot {
             let mut v = bucket_head[p];
             while v != u32::MAX {
                 let vu = v as usize;
-                let u = eval(v, &semi, &mut label, &mut ancestor);
+                let u = eval(v, &semi, &mut label, &mut ancestor, &mut scratch);
                 idom_pre[vu] = if semi[u as usize] < semi[vu] {
                     u
                 } else {
@@ -1126,39 +1132,66 @@ impl HeapSnapshot {
         let rd = self.retained_data.as_ref().unwrap();
         let node_count = raw.meta.node_count;
 
+        // node 0 is the synthetic root (name "", type "synthetic"); its
+        // retained is the whole heap plus exclusive double-counts, which
+        // is pure noise in a "by constructor" view. DevTools shows the
+        // "(GC roots)" bucket instead, which is real.
         let mut by_name: AHashMap<u32, (usize, usize)> = AHashMap::new();
         let mut by_type: AHashMap<u32, (usize, usize)> = AHashMap::new();
-        for n in 1..node_count {
-            // node 0 is the synthetic root (name "", type "synthetic"); its
-            // retained is the whole heap plus exclusive double-counts, which
-            // is pure noise in a "by constructor" view. DevTools shows the
-            // "(GC roots)" bucket instead, which is real.
-            let retained = rd.retained[n] as usize;
-            if retained == 0 {
-                continue;
+        // capture only Sync fields — RawData contains a RefCell string memo
+        let nodes = &raw.nodes;
+        let nfc = raw.node_field_count;
+        let name_off = raw.node_offsets.name;
+        let type_off = raw.node_offsets.type_;
+        let retained = &rd.retained;
+        let idoms = &rd.idoms;
+        let chunks_per_thread = (node_count / rayon::current_num_threads().max(1)).max(1);
+        let partials: Vec<(AHashMap<u32, (usize, usize)>, AHashMap<u32, (usize, usize)>)> = (1
+            ..node_count)
+            .into_par_iter()
+            .chunks(chunks_per_thread)
+            .map(|chunk| {
+                let mut local_name: AHashMap<u32, (usize, usize)> = AHashMap::new();
+                let mut local_type: AHashMap<u32, (usize, usize)> = AHashMap::new();
+                for n in chunk {
+                    let retained = retained[n] as usize;
+                    if retained == 0 {
+                        continue;
+                    }
+                    let base = n * nfc;
+                    let name_idx = nodes[base + name_off];
+                    let type_idx = nodes[base + type_off];
+                    let dom = idoms[n] as usize;
+                    let (dom_name, dom_type) = if dom < node_count && dom != n {
+                        let dbase = dom * nfc;
+                        (nodes[dbase + name_off], nodes[dbase + type_off])
+                    } else {
+                        (u32::MAX, u32::MAX)
+                    };
+                    if dom_name != name_idx {
+                        let e = local_name.entry(name_idx).or_insert((0, 0));
+                        e.0 += retained;
+                        e.1 += 1;
+                    }
+                    if dom_type != type_idx {
+                        let e = local_type.entry(type_idx).or_insert((0, 0));
+                        e.0 += retained;
+                        e.1 += 1;
+                    }
+                }
+                (local_name, local_type)
+            })
+            .collect();
+        for (local_name, local_type) in partials {
+            for (idx, (sz, cnt)) in local_name {
+                let e = by_name.entry(idx).or_insert((0, 0));
+                e.0 += sz;
+                e.1 += cnt;
             }
-            let base = n * raw.node_field_count;
-            let name_idx = raw.nodes[base + raw.node_offsets.name];
-            let type_idx = raw.nodes[base + raw.node_offsets.type_];
-            let dom = rd.idoms[n] as usize;
-            let (dom_name, dom_type) = if dom < node_count && dom != n {
-                let dbase = dom * raw.node_field_count;
-                (
-                    raw.nodes[dbase + raw.node_offsets.name],
-                    raw.nodes[dbase + raw.node_offsets.type_],
-                )
-            } else {
-                (u32::MAX, u32::MAX)
-            };
-            if dom_name != name_idx {
-                let e = by_name.entry(name_idx).or_insert((0, 0));
-                e.0 += retained;
-                e.1 += 1;
-            }
-            if dom_type != type_idx {
-                let e = by_type.entry(type_idx).or_insert((0, 0));
-                e.0 += retained;
-                e.1 += 1;
+            for (idx, (sz, cnt)) in local_type {
+                let e = by_type.entry(idx).or_insert((0, 0));
+                e.0 += sz;
+                e.1 += cnt;
             }
         }
 
@@ -1225,31 +1258,56 @@ impl HeapSnapshot {
         let raw = self.raw.as_ref().unwrap();
         let rd = self.retained_data.as_ref().unwrap();
         let q = query.to_lowercase();
-        let name_offset = raw.node_offsets.name;
 
-        // Resolve each distinct name once; the string table memo clones on
-        // every resolve, which would re-copy 3.6MB source maps per node.
-        let mut name_cache: HashMap<u32, String> = HashMap::new();
-        let mut found: Vec<(usize, usize)> = Vec::new();
-        for n in 0..raw.meta.node_count {
-            let base = n * raw.node_field_count;
-            let name_idx = raw.nodes[base + name_offset];
-            let lower = name_cache.entry(name_idx).or_insert_with(|| {
-                raw.strings
-                    .resolve(&raw.mmap, name_idx as usize)
-                    .unwrap_or_default()
-                    .to_lowercase()
-            });
-            if !lower.contains(&q) {
-                continue;
+        // Pre-resolve every distinct node name once (the shared string memo
+        // is a RefCell, so parallel chunks decode through their own cache —
+        // which would re-copy 3.6MB source maps per chunk). Then scan in
+        // parallel, reading only the Sync cache.
+        let nodes = &raw.nodes;
+        let nfc = raw.node_field_count;
+        let name_off = raw.node_offsets.name;
+        let mut distinct: Vec<u32> = {
+            let mut set: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            set.reserve(raw.meta.node_count / 16);
+            for n in 0..raw.meta.node_count {
+                set.insert(nodes[n * nfc + name_off]);
             }
-            let retained = rd.retained[n] as usize;
-            if retained == 0 {
-                continue;
-            }
-            found.push((n, retained));
+            set.into_iter().collect()
+        };
+        let mut name_cache: HashMap<u32, String> = HashMap::with_capacity(distinct.len());
+        for idx in distinct.drain(..) {
+            let lower = raw
+                .strings
+                .resolve(&raw.mmap, idx as usize)
+                .unwrap_or_default()
+                .to_lowercase();
+            name_cache.insert(idx, lower);
         }
 
+        let retained = &rd.retained;
+        let chunks_per_thread = (raw.meta.node_count / rayon::current_num_threads().max(1)).max(1);
+        let parts: Vec<Vec<(usize, usize)>> = (0..raw.meta.node_count)
+            .into_par_iter()
+            .chunks(chunks_per_thread)
+            .map(|chunk| {
+                let mut found: Vec<(usize, usize)> = Vec::new();
+                for n in chunk {
+                    let base = n * nfc;
+                    let name_idx = nodes[base + name_off];
+                    let lower = &name_cache[&name_idx];
+                    if !lower.contains(&q) {
+                        continue;
+                    }
+                    let retained = retained[n] as usize;
+                    if retained == 0 {
+                        continue;
+                    }
+                    found.push((n, retained));
+                }
+                found
+            })
+            .collect();
+        let mut found: Vec<(usize, usize)> = parts.into_iter().flatten().collect();
         found.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         found.truncate(top);
 
@@ -1911,4 +1969,48 @@ pub fn parse_numbers_fast(data: &[u8]) -> Vec<u32> {
         i += 1;
     }
     numbers
+}
+
+/// Parse all integers from a flat comma-separated byte region in parallel.
+/// The region must be bounded (a single array, no nested arrays/strings);
+/// chunk boundaries are placed at comma positions so no number is split.
+/// Small regions fall back to the serial `parse_numbers_fast`.
+pub fn parse_numbers_par(data: &[u8]) -> Vec<u32> {
+    const MIN_PAR: usize = 1 << 20; // 1 MiB
+    if data.len() < MIN_PAR {
+        return parse_numbers_fast(data);
+    }
+    let threads = rayon::current_num_threads().max(1);
+    let chunks = threads * 4;
+
+    // boundaries at comma positions, roughly data.len()/chunks apart
+    let target = data.len() / chunks;
+    let mut bounds: Vec<usize> = Vec::with_capacity(chunks + 1);
+    bounds.push(0);
+    let mut pos = 0usize;
+    for _ in 1..chunks {
+        let mut p = (pos + target).min(data.len());
+        while p < data.len() && data[p] != b',' {
+            p += 1;
+        }
+        pos = (p + 1).min(data.len());
+        bounds.push(pos);
+    }
+    bounds.push(data.len());
+
+    let ranges: Vec<(usize, usize)> = bounds
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .filter(|(s, e)| e > s)
+        .collect();
+    let parts: Vec<Vec<u32>> = ranges
+        .par_iter()
+        .map(|&(s, e)| parse_numbers_fast(&data[s..e]))
+        .collect();
+    let total: usize = parts.iter().map(Vec::len).sum();
+    let mut out = Vec::with_capacity(total);
+    for part in parts {
+        out.extend_from_slice(&part);
+    }
+    out
 }
