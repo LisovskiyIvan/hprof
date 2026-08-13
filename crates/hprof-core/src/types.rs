@@ -539,3 +539,145 @@ pub struct ShortestPath {
     pub nodes: Vec<PathNode>,
     pub edges: Vec<PathEdge>,
 }
+
+// ============================================================================
+// HeapSnapshot queries: name lookup, properties, retainers, owner analysis
+// ============================================================================
+
+/// Options for a node-name query (`find_nodes`). Unlike `search_nodes` this
+/// is a plain scan — no dominator analysis is required, so it works on any
+/// snapshot and returns matches with `retained == 0` too.
+#[derive(Debug, Clone)]
+pub struct NameQuery {
+    /// exact name match when true, substring when false
+    pub exact: bool,
+    pub name: String,
+    /// only nodes with `self_size >= min_self` (0 = any)
+    pub min_self: usize,
+    /// only nodes of this node type ("object", "string", ...); None = all
+    pub type_filter: Option<String>,
+    /// cap on the number of results (0 = unlimited)
+    pub limit: usize,
+}
+
+impl Default for NameQuery {
+    fn default() -> Self {
+        Self {
+            exact: true,
+            name: String::new(),
+            min_self: 0,
+            type_filter: None,
+            limit: 0,
+        }
+    }
+}
+
+/// One node returned by a name query, ranked by self size.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NameMatch {
+    /// record index into the nodes array (usable with `--index`)
+    pub node_index: usize,
+    /// DevTools node id (stable across snapshots, usable with `--id`)
+    pub id: usize,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub self_size: usize,
+    pub edge_count: usize,
+}
+
+/// A single edge of a node with its value resolved for display: primitive
+/// values (numbers, strings) are inlined, objects become a reference. This is
+/// what lets you read e.g. `renderingGroupId` of a GPUParticleSystem without
+/// walking value nodes by hand.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeProperty {
+    /// property name ("_particleSystems"), or "[i]" for element edges
+    pub name: String,
+    /// edge type: property | element | internal | hidden | ...
+    pub edge_type: String,
+    #[serde(flatten)]
+    pub value: PropertyValue,
+}
+
+/// The resolved value of a node edge.
+///
+/// The element index of an `element` edge is carried in the property `name`
+/// ("[i]"), so no dedicated variant is needed here.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase", content = "value")]
+pub enum PropertyValue {
+    /// "number"/"bigint" value node → parsed value
+    Number(f64),
+    /// "string" value node → contents (also the fallback when a numeric
+    /// name does not parse)
+    Str(String),
+    /// object/reference value → target node
+    Ref {
+        /// record index of the target node
+        index: usize,
+        /// DevTools id of the target node
+        id: usize,
+        #[serde(rename = "type")]
+        node_type: String,
+        name: String,
+    },
+}
+
+/// One incoming edge of a node: who points at it, and how.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetainerRef {
+    /// record index of the source (retaining) node
+    pub source: usize,
+    /// edge type: property | element | internal | hidden | ...
+    pub edge_type: String,
+    /// property name, or "[i]" for element edges
+    pub name: String,
+}
+
+/// One hop on the first-parent (owner) chain of a node. Following the first
+/// incoming edge per node is the classic DevTools-style retainer walk and
+/// matches the "(object elements) grouped by owner" classification.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetainerChainNode {
+    /// record index into the nodes array
+    pub node_index: usize,
+    /// DevTools node id
+    pub id: usize,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub self_size: usize,
+    pub edge_count: usize,
+    /// edge type from the parent into this node; empty for the chain root
+    pub edge_type: String,
+    /// edge name from the parent into this node; empty for the chain root
+    pub edge_name: String,
+    /// set on the last hop when the walk hit an already-seen node
+    pub cycle: bool,
+}
+
+/// One owner group: matched nodes sharing the same owner chain.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerGroup {
+    /// "owner -> parent -> grandparent" chain (owner first, root last)
+    pub chain: String,
+    pub count: usize,
+    pub self_size: usize,
+}
+
+/// Result of `owner_groups`: matched nodes classified by their owner chain.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerAnalysis {
+    /// the queried node name
+    pub name: String,
+    pub total_nodes: usize,
+    pub total_self: usize,
+    pub groups: Vec<OwnerGroup>,
+}

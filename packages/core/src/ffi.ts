@@ -79,6 +79,20 @@ const ffiDefinition = {
     returns: FFIType.ptr,
   },
   hprof_snapshot_diff: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
+  hprof_snapshot_find: {
+    args: [FFIType.ptr, FFIType.u8, FFIType.cstring, FFIType.u64, FFIType.cstring, FFIType.u32],
+    returns: FFIType.ptr,
+  },
+  hprof_snapshot_properties: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.ptr },
+  hprof_snapshot_retainers: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.ptr },
+  hprof_snapshot_chain: {
+    args: [FFIType.ptr, FFIType.u32, FFIType.u32],
+    returns: FFIType.ptr,
+  },
+  hprof_snapshot_owners: {
+    args: [FFIType.ptr, FFIType.u8, FFIType.cstring, FFIType.u64, FFIType.u32, FFIType.u32],
+    returns: FFIType.ptr,
+  },
   hprof_snapshot_destroy: { args: [FFIType.ptr], returns: FFIType.void },
 
   hprof_profile_open: { args: [FFIType.cstring], returns: FFIType.ptr },
@@ -240,6 +254,54 @@ export function snapshotEdges(handle: NativeHandle, nodeIndex: number): any {
 
 export function snapshotSearch(handle: NativeHandle, query: string): any {
   return JSON.parse(callString(loadLib().symbols.hprof_snapshot_search(handle, ptr(encode(query)))))
+}
+
+export function snapshotFind(
+  handle: NativeHandle,
+  options: { exact?: boolean; name: string; minSelf?: number; type?: string; limit?: number },
+): unknown {
+  return JSON.parse(
+    callString(
+      loadLib().symbols.hprof_snapshot_find(
+        handle,
+        options.exact ? 1 : 0,
+        ptr(encode(options.name)),
+        BigInt(options.minSelf ?? 0),
+        ptr(encode(options.type ?? '')),
+        options.limit ?? 0,
+      ),
+    ),
+  )
+}
+
+export function snapshotProperties(handle: NativeHandle, nodeIndex: number): unknown {
+  return JSON.parse(callString(loadLib().symbols.hprof_snapshot_properties(handle, nodeIndex)))
+}
+
+export function snapshotRetainers(handle: NativeHandle, nodeIndex: number): unknown {
+  return JSON.parse(callString(loadLib().symbols.hprof_snapshot_retainers(handle, nodeIndex)))
+}
+
+export function snapshotChain(handle: NativeHandle, nodeIndex: number, maxDepth: number): unknown {
+  return JSON.parse(callString(loadLib().symbols.hprof_snapshot_chain(handle, nodeIndex, maxDepth)))
+}
+
+export function snapshotOwners(
+  handle: NativeHandle,
+  options: { exact?: boolean; name: string; minSelf?: number; depth?: number; top?: number },
+): unknown {
+  return JSON.parse(
+    callString(
+      loadLib().symbols.hprof_snapshot_owners(
+        handle,
+        options.exact ? 1 : 0,
+        ptr(encode(options.name)),
+        BigInt(options.minSelf ?? 0),
+        options.depth ?? 8,
+        options.top ?? 30,
+      ),
+    ),
+  )
 }
 
 export function snapshotRetained(handle: NativeHandle, topN = 30): any {

@@ -8,9 +8,13 @@ mod analyze;
 mod calltree;
 mod diff;
 mod dot;
+mod find;
 mod flame;
 mod inspect;
 mod list;
+mod owners;
+mod props;
+mod retainers;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -271,6 +275,10 @@ pub enum Command {
     Dot,
     List,
     Inspect,
+    Find,
+    Props,
+    Retainers,
+    Owners,
     Calltree,
     Flame,
     Ui,
@@ -295,6 +303,15 @@ pub struct Args {
     pub id: Option<usize>,
     /// inspect: show a single node by record index
     pub index: Option<usize>,
+    /// find/owners: only nodes with self_size >= min_self bytes
+    pub min_self: usize,
+    /// retainers: walk the owner chain instead of listing all incoming edges
+    /// (owners: chain depth; default 8)
+    pub depth: Option<usize>,
+    /// find: exact name match instead of substring
+    pub exact: bool,
+    /// find: only nodes of this node type
+    pub node_type: Option<String>,
     /// heapprofile: restrict contribution to frames from URLs containing this
     /// substring (analyze, calltree)
     pub url: Option<String>,
@@ -318,6 +335,10 @@ impl Default for Args {
             name: None,
             id: None,
             index: None,
+            min_self: 0,
+            depth: None,
+            exact: false,
+            node_type: None,
             url: None,
             top_explicit: false,
         }
@@ -378,6 +399,22 @@ fn parse_args(argv: &[String]) -> Args {
                     args.index = v.parse().ok();
                 }
             }
+            "--min-self" => {
+                if let Some(v) = next(&mut i) {
+                    args.min_self = v.parse().unwrap_or(0);
+                }
+            }
+            "--depth" => {
+                if let Some(v) = next(&mut i) {
+                    args.depth = v.parse().ok();
+                }
+            }
+            "--exact" => args.exact = true,
+            "--type" => {
+                if let Some(v) = next(&mut i) {
+                    args.node_type = Some(v);
+                }
+            }
             "--url" => {
                 if let Some(v) = next(&mut i) {
                     args.url = Some(v);
@@ -388,6 +425,10 @@ fn parse_args(argv: &[String]) -> Args {
             "dot" => args.command = Command::Dot,
             "list" => args.command = Command::List,
             "inspect" => args.command = Command::Inspect,
+            "find" => args.command = Command::Find,
+            "props" => args.command = Command::Props,
+            "retainers" => args.command = Command::Retainers,
+            "owners" => args.command = Command::Owners,
             "calltree" => args.command = Command::Calltree,
             "flame" => args.command = Command::Flame,
             "ui" => args.command = Command::Ui,
@@ -412,20 +453,24 @@ fn parse_args(argv: &[String]) -> Args {
 
 fn print_usage() {
     let usage = r#"
- {b}Usage:{r} hprof <command> [options] <file>
+ {b}Usage:{r} hprof <command> [options] <file>...
 
  {b}Commands:{r}
     {c}analyze{r}   Analyze profile file and print summary to stdout (default)
-    {c}diff{r}      Compare two profiles of the same type (baseline <profile>)
+    {c}diff{r}      Compare profiles of the same type; with 3+ files, pairwise
     {c}dot{r}       Emit call graph as DOT for use with graphviz
     {c}list{r}      List sampled locations grouped by file:line (heapprofile)
     {c}inspect{r}   Inspect a heap snapshot: instances by name, paths from root
+    {c}find{r}      Heap snapshot: nodes by name (substring/exact), no dominator analysis
+    {c}props{r}     Heap snapshot: a node's fields with resolved values
+    {c}retainers{r} Heap snapshot: who keeps a node alive (incoming edges / owner chain)
+    {c}owners{r}    Heap snapshot: group nodes by owner chain, diff across snapshots
     {c}calltree{r}  Inclusive call tree for a sampling profile (heapprofile)
     {c}flame{r}     Folded stacks (a;b;c <size>) for flamegraph.pl / speedscope
     {c}help{r}      Show this help message
 
  {b}Options:{r}
-   {y}--top <n>{r}       Number of top entries to show (default: 30)
+   {y}--top <n>{r}       Number of top entries to show (default: 30; {y}0{r} = all in find/owners)
    {y}--filter <re>{r}   Filter results by regex (timeline: names + stacks)
    {y}--focus <re>{r}    pprof-style focus: only frames matching contribute
    {y}--ignore <re>{r}   pprof-style ignore: drop flat attribution for matches
@@ -433,7 +478,14 @@ fn print_usage() {
    {y}--cum{r}           Show cumulative (self + descendants) instead of flat only
    {y}--retained{r}      heapsnapshot: add exclusive retained sizes to the summary
    {y}--url <substr>{r}   heapprofile: only frames from URLs containing this contribute
-   {y}--name <re>{r}      heaptimeline: show allocation stacks for matching constructor names
+   {y}--name <name>{r}    find/inspect/owners: node name to match (regex for inspect,
+                          plain substring/exact for find/owners)
+   {y}--exact{r}          find/owners: exact name match instead of substring
+   {y}--min-self <bytes>{r} find/owners: only nodes with self_size >= N
+   {y}--type <t>{r}       find: only nodes of this node type (object, string, ...)
+   {y}--id <n>{r}         inspect/props/retainers: address a node by DevTools id
+   {y}--index <n>{r}      inspect/props/retainers: address a node by record index
+   {y}--depth <n>{r}      retainers: switch to the owner-chain walk; owners: chain depth (default 8)
    {y}--json{r}          Output as JSON
 
  {b}Heap snapshot inspection:{r}
@@ -443,6 +495,29 @@ fn print_usage() {
        Node details + shortest path from the GC root (who keeps it alive).
    hprof inspect file.heapsnapshot --index 6456602
        Same, addressing the node by record index (as printed by --name).
+
+ {b}Heap snapshot queries (no dominator analysis, fast on multi-GB dumps):{r}
+   {gr}hprof find file.heapsnapshot --name RenderingGroup --exact{r}
+       Every node named exactly "RenderingGroup" (index, id, self, type, edges).
+       Omit {y}--exact{r} for substring; add {y}--min-self 1048576{r} to skip small
+       nodes, {y}--type object{r} to filter by node type, {y}--top 0{r} for all.
+   {gr}hprof props file.heapsnapshot --index 7396246{r}
+       All fields of a node with values resolved — numbers and strings are
+       inlined, objects become "name (type, index=..., id=...)". Use this to
+       read e.g. renderingGroupId of a GPUParticleSystem.
+   {gr}hprof retainers file.heapsnapshot --index 7396246{r}
+       Every incoming edge: who points at the node and how (edge name + type).
+   {gr}hprof retainers file.heapsnapshot --index 7396246 --depth 12{r}
+       First-parent (owner) chain walked 12 hops, target first — who owns the
+       object and who owns the owner.
+   {gr}hprof owners a.heapsnapshot b.heapsnapshot c.heapsnapshot --name '(object elements)' --exact --min-self 1048576 --depth 4{r}
+       Group matching nodes by their "owner -> parent -> ..." chain, summed by
+       self size, per file + pairwise deltas. The classic "(object elements)
+       grouped by owner" memory-leak analysis, no script needed.
+
+ {b}Multi-snapshot comparison:{r}
+   {gr}hprof diff a.heapsnapshot b.heapsnapshot c.heapsnapshot{r}
+       Pairwise diffs: a vs b, then b vs c (heapsnapshot and heapprofile).
 
  {b}Heap timeline analysis:{r}
    analyze on a .heaptimeline prints, in addition to the by-type summary:
@@ -505,10 +580,19 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // diff consumes both files as one operation — run it outside the per-file
-    // loop so the output is not duplicated
+    // diff and owners consume all files as one operation — run them outside
+    // the per-file loop so the output is not duplicated
     if args.command == Command::Diff {
         return match diff::run(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("  {} {e}", red("Error:"));
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if args.command == Command::Owners {
+        return match owners::run(&args.files, &args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("  {} {e}", red("Error:"));
@@ -533,6 +617,9 @@ fn main() -> ExitCode {
             Command::Dot => dot::run(file, type_name, &args),
             Command::List => list::run(file, type_name, &args),
             Command::Inspect => inspect::run(file, type_name, &args),
+            Command::Find => find::run(file, type_name, &args),
+            Command::Props => props::run(file, type_name, &args),
+            Command::Retainers => retainers::run(file, type_name, &args),
             Command::Calltree => calltree::run(file, type_name, &args),
             Command::Flame => flame::run(file, type_name, &args),
             _ => unreachable!(),

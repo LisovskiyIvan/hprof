@@ -456,6 +456,131 @@ pub unsafe extern "C" fn hprof_snapshot_diff(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_snapshot_find(
+    handle: *mut c_void,
+    exact: u8,
+    name: *const c_char,
+    min_self: u64,
+    type_filter: *const c_char,
+    limit: u32,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_snapshot(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let query = NameQuery {
+        exact: exact != 0,
+        name: unsafe { cstr_to_str(name) }.unwrap_or("").to_string(),
+        min_self: min_self as usize,
+        type_filter: unsafe { cstr_to_str(type_filter) }
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        limit: limit as usize,
+    };
+    match inst.snapshot.find_nodes(&query) {
+        Ok(matches) => {
+            let json = serde_json::to_string(&matches).unwrap_or_default();
+            HprofResult::ok_string(&json)
+        }
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_snapshot_properties(
+    handle: *mut c_void,
+    node_index: u32,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_snapshot(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    match inst.snapshot.get_node_properties(node_index as usize) {
+        Ok((node, props)) => {
+            let result = HprofPropertiesResult {
+                node: HprofNodeJson::from_node(&node),
+                properties: props,
+            };
+            let json = serde_json::to_string(&result).unwrap_or_default();
+            HprofResult::ok_string(&json)
+        }
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_snapshot_retainers(
+    handle: *mut c_void,
+    node_index: u32,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_snapshot(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    match inst.snapshot.get_retainers(node_index as usize) {
+        Ok(retainers) => {
+            let json = serde_json::to_string(&retainers).unwrap_or_default();
+            HprofResult::ok_string(&json)
+        }
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_snapshot_chain(
+    handle: *mut c_void,
+    node_index: u32,
+    max_depth: u32,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_snapshot(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    match inst
+        .snapshot
+        .retainer_chain(node_index as usize, max_depth as usize)
+    {
+        Ok(chain) => {
+            let json = serde_json::to_string(&chain).unwrap_or_default();
+            HprofResult::ok_string(&json)
+        }
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_snapshot_owners(
+    handle: *mut c_void,
+    exact: u8,
+    name: *const c_char,
+    min_self: u64,
+    max_depth: u32,
+    top: u32,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_snapshot(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let query = NameQuery {
+        exact: exact != 0,
+        name: unsafe { cstr_to_str(name) }.unwrap_or("").to_string(),
+        min_self: min_self as usize,
+        type_filter: None,
+        limit: 0,
+    };
+    match inst
+        .snapshot
+        .owner_groups(&query, max_depth as usize, top as usize)
+    {
+        Ok(analysis) => {
+            let json = serde_json::to_string(&analysis).unwrap_or_default();
+            HprofResult::ok_string(&json)
+        }
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn hprof_profile_destroy(handle: *mut c_void) {
     if handle.is_null() {
         return;

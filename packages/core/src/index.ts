@@ -31,6 +31,12 @@ export type {
   HeapSnapshotNodePageOptions,
   HeapSnapshotSearchMatch,
   HeapSnapshotRetainedEntry,
+  HeapSnapshotNameMatch,
+  HeapSnapshotProperty,
+  HeapSnapshotRetainer,
+  HeapSnapshotRetainerChainNode,
+  HeapSnapshotOwnerGroup,
+  HeapSnapshotOwnerAnalysis,
   SnapshotDiff,
 } from './heapsnapshot.ts'
 

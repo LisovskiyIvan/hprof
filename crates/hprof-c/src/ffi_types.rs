@@ -203,6 +203,12 @@ pub struct HprofEdgesResult {
 }
 
 #[derive(Serialize)]
+pub struct HprofPropertiesResult {
+    pub node: HprofNodeJson,
+    pub properties: Vec<NodeProperty>,
+}
+
+#[derive(Serialize)]
 pub struct HprofSearchMatchJson {
     pub index: usize,
     pub value: String,

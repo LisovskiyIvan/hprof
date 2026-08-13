@@ -100,6 +100,28 @@ hprof-c) сохранена, но не подключена — вернётся
 - [x] Цветной вывод (chalk/colors) или ANSI напрямую
 - [x] Таблицы в терминале (форматирование колонок)
 
+### 2.4 Команды-запросы по heapsnapshot (без dominator-анализа)
+
+Заменяют ad-hoc JS-скрипты, которые парсили `nodes[]/edges[]/strings[]`
+вручную (см. `/tmp/opencode/*.js`): полное описание в `hprof --help`.
+
+- [x] `find` — поиск нод по имени (substring/exact), фильтры `--min-self`,
+      `--type`, `--top 0` = все. Скан без retained: работает и для
+      `retained == 0` нод, не запускает Lengauer–Tarjan
+- [x] `props` — поля ноды с резолвом значений: number/bigint и string
+      инлайнятся, объекты → `(type, index, id)`; element-edge индекс — в
+      имени свойства `[i]` (`get_node_properties` в core)
+- [x] `retainers` — все входящие рёбра ноды (`get_retainers`), либо цепочка
+      первых родителей до `--depth N` с детектом циклов
+      (`retainer_chain`, кэш `ParentMap` — один проход по рёбрам)
+- [x] `owners` — группировка нод по цепочке владельцев
+      (`owner_groups`), multi-file попарный diff групп
+- [x] `diff` с 3+ файлами — попарное сравнение
+- [x] `--json` для всех новых команд
+- [x] FFI: `hprof_snapshot_find/properties/retainers/chain/owners` +
+      TS-биндинги `HeapSnapshot.findNodes/getNodeProperties/getRetainers/
+      getRetainerChain/ownerGroups`
+
 ### 2.3 CLI UX
 
 - [x] Прогресс-бар для больших файлов

@@ -73,6 +73,38 @@ For a 7.4M-node snapshot the dominator computation (Lengauer–Tarjan) takes
 ~2 s and is cached per process, so `analyze --retained` and `inspect` share
 it.
 
+### Name queries, properties, retainers (no dominator analysis)
+
+These scan the nodes/edges arrays directly — seconds on multi-GB dumps, no
+Lengauer–Tarjan. They replace the hand-rolled scripts people used to write
+against raw `.heapsnapshot` JSON:
+
+```bash
+# every node named exactly "RenderingGroup" (index, id, self, type, edges)
+hprof find Heap.heapsnapshot --name RenderingGroup --exact
+
+# substring match, skip nodes under 1 MB, only objects, all results
+hprof find Heap.heapsnapshot --name particle --min-self 1048576 --type object --top 0
+
+# a node's fields with values resolved — numbers/strings inlined,
+# objects as "name (type, index=..., id=...)"; read renderingGroupId etc.
+hprof props Heap.heapsnapshot --index 7396246
+
+# who keeps a node alive: every incoming edge
+hprof retainers Heap.heapsnapshot --index 7396246
+
+# first-parent (owner) chain, target first
+hprof retainers Heap.heapsnapshot --index 7396246 --depth 12
+
+# group matching nodes by their "owner -> parent -> ..." chain and diff
+# the groups across several snapshots — the classic "(object elements)
+# grouped by owner" leak analysis
+hprof owners a.heapsnapshot b.heapsnapshot --name '(object elements)' --exact \
+  --min-self 1048576 --depth 4
+```
+
+`diff` accepts more than two files and compares them pairwise.
+
 ## Heap Timeline Analysis
 
 `analyze` on a `.heaptimeline` prints, in addition to the by-type summary:
@@ -91,7 +123,9 @@ hprof analyze snapshots/Heap-20260508T151658.heaptimeline --filter 'Vector3' --j
 
 ## Other commands
 
-- `diff <baseline> <profile>` — compare two profiles of the same type
+- `diff <baseline> <profile> [<more>...]` — compare profiles of the same
+  type; with 3+ files the comparison is pairwise
+- `find` / `props` / `retainers` / `owners` — heap snapshot queries, see above
 - `list <file.heapprofile>` — sampled locations grouped by file:line
 - `dot <file.heapprofile>` — emit a call graph as DOT for graphviz
 

@@ -63,6 +63,56 @@ export interface HeapSnapshotSearchMatch {
   value: string
 }
 
+export interface HeapSnapshotNameMatch {
+  nodeIndex: number
+  id: number
+  name: string
+  type: string
+  selfSize: number
+  edgeCount: number
+}
+
+/** Value of a node property, resolved by the native side. `kind` mirrors the
+ * serde tag: `number`, `string`, or `ref` (object). The element index of an
+ * `element` edge is carried in `name` ("[i]"). */
+export interface HeapSnapshotProperty {
+  name: string
+  edgeType: string
+  kind: 'number' | 'string' | 'ref'
+  value: number | string | { index: number; id: number; type: string; name: string }
+}
+
+export interface HeapSnapshotRetainer {
+  source: number
+  edgeType: string
+  name: string
+}
+
+export interface HeapSnapshotRetainerChainNode {
+  nodeIndex: number
+  id: number
+  name: string
+  type: string
+  selfSize: number
+  edgeCount: number
+  edgeType: string
+  edgeName: string
+  cycle: boolean
+}
+
+export interface HeapSnapshotOwnerGroup {
+  chain: string
+  count: number
+  selfSize: number
+}
+
+export interface HeapSnapshotOwnerAnalysis {
+  name: string
+  totalNodes: number
+  totalSelf: number
+  groups: HeapSnapshotOwnerGroup[]
+}
+
 export interface HeapSnapshotRetainedEntry {
   nodeIndex: number
   name: string
@@ -184,7 +234,69 @@ export class HeapSnapshot {
 
   async searchStrings(query: string): Promise<HeapSnapshotSearchMatch[]> {
     const raw = ffi.snapshotSearch(this.handle, query)
-    return raw
+    return raw as HeapSnapshotSearchMatch[]
+  }
+
+  /** Find nodes by name (substring by default, exact with `exact: true`),
+   * optionally filtered by minimum self size and node type, ranked by self
+   * size. Unlike `getRetainedEntries` this needs no dominator analysis. */
+  findNodes(options: {
+    exact?: boolean
+    name: string
+    minSelf?: number
+    type?: string
+    limit?: number
+  }): HeapSnapshotNameMatch[] {
+    // FFI JSON shape is our own serde contract, covered by tests
+    return ffi.snapshotFind(this.handle, options) as HeapSnapshotNameMatch[]
+  }
+
+  /** All edges of a node with values resolved: numbers/strings inlined,
+   * objects as `{index, id, type, name}` references. */
+  getNodeProperties(
+    nodeIndex: number,
+  ): { node: HeapSnapshotNode; properties: HeapSnapshotProperty[] } {
+    const raw = ffi.snapshotProperties(this.handle, nodeIndex) as {
+      node: { type: string; name: string; self_size: number; id: number; edge_count: number }
+      properties: HeapSnapshotProperty[]
+    }
+    return {
+      node: {
+        type: raw.node.type,
+        name: raw.node.name,
+        selfSize: raw.node.self_size,
+        id: raw.node.id,
+        edgeCount: raw.node.edge_count,
+      },
+      properties: raw.properties,
+    }
+  }
+
+  /** All incoming edges of a node: who retains it and how. */
+  getRetainers(nodeIndex: number): HeapSnapshotRetainer[] {
+    // FFI JSON shape is our own serde contract, covered by tests
+    return ffi.snapshotRetainers(this.handle, nodeIndex) as HeapSnapshotRetainer[]
+  }
+
+  /** Walk the first-parent (owner) chain up to `maxDepth` hops, target
+   * first. `cycle` on the last hop means the walk hit an already-seen node. */
+  getRetainerChain(nodeIndex: number, maxDepth = 8): HeapSnapshotRetainerChainNode[] {
+    // FFI JSON shape is our own serde contract, covered by tests
+    return ffi.snapshotChain(this.handle, nodeIndex, maxDepth) as HeapSnapshotRetainerChainNode[]
+  }
+
+  /** Classify nodes matching `name` into owner groups: each match is walked
+   * up its first-parent chain (`depth` hops) and grouped by the resulting
+   * "owner -> parent -> ..." chain, summed by self size. */
+  ownerGroups(options: {
+    exact?: boolean
+    name: string
+    minSelf?: number
+    depth?: number
+    top?: number
+  }): HeapSnapshotOwnerAnalysis {
+    // FFI JSON shape is our own serde contract, covered by tests
+    return ffi.snapshotOwners(this.handle, options) as HeapSnapshotOwnerAnalysis
   }
 
   async getRetainedEntries(

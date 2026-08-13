@@ -22,6 +22,12 @@ pub struct HeapSnapshot {
     /// Cached dominator-tree analysis. Built on demand by `ensure_retained`
     /// and shared by `retained_summary`, `search_nodes` and `shortest_path`.
     retained_data: Option<RetainedData>,
+    /// Cached first-incoming-edge (parent) map. Built on demand by
+    /// `ensure_parent_map` and shared by `retainer_chain` and `owner_groups`.
+    /// Cheaper than `retained_data` — a single pass over the edges, no
+    /// dominator computation — so queries that only need "who owns this"
+    /// never pay for Lengauer–Tarjan.
+    parents: Option<ParentMap>,
 }
 
 /// Cached dominator-tree analysis (per-node retained sizes + reverse graph).
@@ -51,6 +57,16 @@ pub struct RetainedData {
     pub preorder: Vec<u32>,
     /// preorder number -> node index
     pub vertex: Vec<u32>,
+}
+
+/// First incoming edge per node (the "owner" edge), in node order.
+/// `index[n]` is the record index of the first node with an edge into `n`;
+/// `edge_type[n]` / `edge_name_or_index[n]` describe that edge (`u32::MAX`
+/// when `n` has no incoming edges).
+pub struct ParentMap {
+    pub index: Vec<u32>,
+    pub edge_type: Vec<u32>,
+    pub edge_name_or_index: Vec<u32>,
 }
 
 pub struct RawData {
@@ -219,6 +235,7 @@ impl HeapSnapshot {
             edge_starts: None,
             full_summary: None,
             retained_data: None,
+            parents: None,
         }
     }
 
@@ -1496,6 +1513,433 @@ impl HeapSnapshot {
             found: true,
             nodes,
             edges,
+        })
+    }
+
+    /// Build (or reuse) the first-incoming-edge map. One pass over the
+    /// forward edges; the first edge into a node wins (matches the classic
+    /// (object elements) owner walk). O(E), no dominator analysis.
+    fn ensure_parent_map(&mut self) -> crate::Result<()> {
+        if self.parents.is_some() {
+            return Ok(());
+        }
+        self.ensure_raw()?;
+        self.ensure_edges()?;
+        self.ensure_edge_starts();
+        let raw = self.raw.as_ref().unwrap();
+        let edge_starts = self.edge_starts.as_ref().unwrap();
+        let node_count = raw.meta.node_count;
+        let nfc = raw.node_field_count;
+        let edges = raw.edges.as_ref().unwrap();
+
+        let mut index = vec![u32::MAX; node_count];
+        let mut edge_type = vec![u32::MAX; node_count];
+        let mut edge_name_or_index = vec![u32::MAX; node_count];
+        for n in 0..node_count {
+            let start = edge_starts[n] as usize;
+            let end = edge_starts[n + 1] as usize;
+            for edge_index in start..end {
+                let base = edge_index * raw.edge_field_count;
+                let to_node = edges[base + raw.edge_offsets.to_node] as usize / nfc;
+                if to_node < node_count && index[to_node] == u32::MAX {
+                    index[to_node] = n as u32;
+                    edge_type[to_node] = edges[base + raw.edge_offsets.type_];
+                    edge_name_or_index[to_node] = edges[base + raw.edge_offsets.name_or_index];
+                }
+            }
+        }
+        self.parents = Some(ParentMap {
+            index,
+            edge_type,
+            edge_name_or_index,
+        });
+        Ok(())
+    }
+
+    /// Find nodes by name (exact or substring) with optional self-size and
+    /// node-type filters. Unlike `search_nodes` this does NOT require the
+    /// dominator analysis — it is a plain parallel scan, returns every match
+    /// (including nodes with `retained == 0`), and ranks by self size.
+    pub fn find_nodes(&mut self, query: &NameQuery) -> crate::Result<Vec<NameMatch>> {
+        self.ensure_raw()?;
+        let raw = self.raw.as_ref().unwrap();
+        let q = query.name.to_lowercase();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let nodes = &raw.nodes;
+        let nfc = raw.node_field_count;
+        let name_off = raw.node_offsets.name;
+        let type_off = raw.node_offsets.type_;
+        let self_off = raw.node_offsets.self_size;
+        let id_off = raw.node_offsets.id;
+        let edge_count_off = raw.node_offsets.edge_count;
+
+        // Pre-resolve every distinct node name once (the shared string memo
+        // is a RefCell, so parallel chunks decode through their own cache).
+        let mut distinct: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        distinct.reserve(raw.meta.node_count / 16);
+        for n in 0..raw.meta.node_count {
+            distinct.insert(nodes[n * nfc + name_off]);
+        }
+        // store lowercased names so exact/substring comparisons against the
+        // lowercased query are case-insensitive (search_nodes does the same)
+        let mut name_cache: HashMap<u32, String> = HashMap::with_capacity(distinct.len());
+        for idx in distinct.drain() {
+            let lower = raw
+                .strings
+                .resolve(&raw.mmap, idx as usize)
+                .unwrap_or_default()
+                .to_lowercase();
+            name_cache.insert(idx, lower);
+        }
+
+        let exact = query.exact;
+        let min_self = query.min_self;
+        let type_filter = query.type_filter.as_ref().map(|t| t.to_lowercase());
+        let limit = query.limit;
+        // read-only slices for the parallel closure (RawData is !Sync — its
+        // string memo is a RefCell — so only Sync fields may be captured)
+        let node_types = raw.node_types.as_slice();
+
+        let chunks_per_thread = (raw.meta.node_count / rayon::current_num_threads().max(1)).max(1);
+        let parts: Vec<Vec<(usize, usize)>> = (0..raw.meta.node_count)
+            .into_par_iter()
+            .chunks(chunks_per_thread)
+            .map(|chunk| {
+                let mut found: Vec<(usize, usize)> = Vec::new();
+                for n in chunk {
+                    let base = n * nfc;
+                    let name = &name_cache[&nodes[base + name_off]];
+                    let matches = if exact { name == &q } else { name.contains(&q) };
+                    if !matches {
+                        continue;
+                    }
+                    let self_size = nodes[base + self_off] as usize;
+                    if self_size < min_self {
+                        continue;
+                    }
+                    if let Some(tf) = &type_filter {
+                        let t = node_types
+                            .get(nodes[base + type_off] as usize)
+                            .map(|s| s.to_lowercase())
+                            .unwrap_or_default();
+                        if &t != tf {
+                            continue;
+                        }
+                    }
+                    found.push((n, self_size));
+                }
+                found
+            })
+            .collect();
+        let mut found: Vec<(usize, usize)> = parts.into_iter().flatten().collect();
+        found.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        if limit > 0 && found.len() > limit {
+            found.truncate(limit);
+        }
+
+        Ok(found
+            .into_iter()
+            .map(|(idx, _)| {
+                let base = idx * nfc;
+                let type_idx = nodes[base + type_off] as usize;
+                let name_idx = nodes[base + name_off] as usize;
+                NameMatch {
+                    node_index: idx,
+                    id: nodes[base + id_off] as usize,
+                    name: raw.strings.resolve(&raw.mmap, name_idx).unwrap_or_default(),
+                    type_: raw
+                        .node_types
+                        .get(type_idx)
+                        .cloned()
+                        .unwrap_or_else(|| type_idx.to_string()),
+                    self_size: nodes[base + self_off] as usize,
+                    edge_count: nodes[base + edge_count_off] as usize,
+                }
+            })
+            .collect())
+    }
+
+    /// Resolve a node's edges into displayable properties: primitive values
+    /// (numbers, strings) are inlined, object values become a reference to
+    /// the target node. This is what lets you read e.g. `renderingGroupId`
+    /// of a GPUParticleSystem without walking value nodes by hand.
+    pub fn get_node_properties(
+        &mut self,
+        node_index: usize,
+    ) -> crate::Result<(HeapSnapshotNode, Vec<NodeProperty>)> {
+        self.ensure_raw()?;
+        self.ensure_edges()?;
+        self.ensure_edge_starts();
+        let raw = self.raw.as_ref().unwrap();
+        if node_index >= raw.meta.node_count {
+            return Err(Error::NodeNotFound(node_index));
+        }
+
+        let node = Self::create_node(raw, node_index);
+        let edge_starts = self.edge_starts.as_ref().unwrap();
+        let start = edge_starts[node_index] as usize;
+        let end = edge_starts[node_index + 1] as usize;
+        let edges = raw.edges.as_ref().unwrap();
+        let nodes = &raw.nodes;
+        let nfc = raw.node_field_count;
+
+        let mut props = Vec::with_capacity(end - start);
+        for edge_index in start..end {
+            let base = edge_index * raw.edge_field_count;
+            let type_idx = edges[base + raw.edge_offsets.type_] as usize;
+            let edge_type = raw
+                .edge_types
+                .get(type_idx)
+                .cloned()
+                .unwrap_or_else(|| type_idx.to_string());
+            let name_or_index = edges[base + raw.edge_offsets.name_or_index] as usize;
+            let to_node = edges[base + raw.edge_offsets.to_node] as usize / nfc;
+            let name = if edge_type == "element" {
+                format!("[{name_or_index}]")
+            } else {
+                raw.strings
+                    .resolve(&raw.mmap, name_or_index)
+                    .unwrap_or_else(|| format!("#{name_or_index}"))
+            };
+
+            let value = if to_node >= raw.meta.node_count {
+                PropertyValue::Ref {
+                    index: to_node,
+                    id: 0,
+                    node_type: String::new(),
+                    name: format!("<out of range #{to_node}>"),
+                }
+            } else {
+                let tbase = to_node * nfc;
+                let ttype_idx = nodes[tbase + raw.node_offsets.type_] as usize;
+                let ttype = raw
+                    .node_types
+                    .get(ttype_idx)
+                    .cloned()
+                    .unwrap_or_else(|| ttype_idx.to_string());
+                let tname = raw
+                    .strings
+                    .resolve(&raw.mmap, nodes[tbase + raw.node_offsets.name] as usize)
+                    .unwrap_or_default();
+                if ttype == "number" || ttype == "bigint" {
+                    match tname.parse::<f64>() {
+                        Ok(v) => PropertyValue::Number(v),
+                        Err(_) => PropertyValue::Str(tname),
+                    }
+                } else if ttype == "string" {
+                    PropertyValue::Str(tname)
+                } else {
+                    PropertyValue::Ref {
+                        index: to_node,
+                        id: nodes[tbase + raw.node_offsets.id] as usize,
+                        node_type: ttype,
+                        name: tname,
+                    }
+                }
+            };
+            props.push(NodeProperty {
+                name,
+                edge_type,
+                value,
+            });
+        }
+        Ok((node, props))
+    }
+
+    /// All incoming edges of a node: who retains it and how. Single pass
+    /// over the edges array (no retained/dominator analysis needed).
+    pub fn get_retainers(&mut self, node_index: usize) -> crate::Result<Vec<RetainerRef>> {
+        self.ensure_raw()?;
+        self.ensure_edges()?;
+        self.ensure_edge_starts();
+        let raw = self.raw.as_ref().unwrap();
+        if node_index >= raw.meta.node_count {
+            return Err(Error::NodeNotFound(node_index));
+        }
+
+        let edge_starts = self.edge_starts.as_ref().unwrap();
+        let edges = raw.edges.as_ref().unwrap();
+        let nfc = raw.node_field_count;
+        let mut out = Vec::new();
+        for n in 0..raw.meta.node_count {
+            let start = edge_starts[n] as usize;
+            let end = edge_starts[n + 1] as usize;
+            for edge_index in start..end {
+                let base = edge_index * raw.edge_field_count;
+                let to_node = edges[base + raw.edge_offsets.to_node] as usize / nfc;
+                if to_node != node_index {
+                    continue;
+                }
+                let type_idx = edges[base + raw.edge_offsets.type_] as usize;
+                let edge_type = raw
+                    .edge_types
+                    .get(type_idx)
+                    .cloned()
+                    .unwrap_or_else(|| type_idx.to_string());
+                let name_or_index = edges[base + raw.edge_offsets.name_or_index] as usize;
+                let name = if edge_type == "element" {
+                    format!("[{name_or_index}]")
+                } else {
+                    raw.strings
+                        .resolve(&raw.mmap, name_or_index)
+                        .unwrap_or_else(|| format!("#{name_or_index}"))
+                };
+                out.push(RetainerRef {
+                    source: n,
+                    edge_type,
+                    name,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Walk the first-parent chain from `node_index` up to `max_depth` hops,
+    /// stopping on cycles (an already-seen node) or when a node has no
+    /// parent. The chain is ordered from the target upward: `[0]` is the
+    /// target itself, the last element is the top of the chain. `cycle` is
+    /// set on the final hop when the walk was cut short by a cycle.
+    pub fn retainer_chain(
+        &mut self,
+        node_index: usize,
+        max_depth: usize,
+    ) -> crate::Result<Vec<RetainerChainNode>> {
+        self.ensure_raw()?;
+        self.ensure_parent_map()?;
+        let raw = self.raw.as_ref().unwrap();
+        if node_index >= raw.meta.node_count {
+            return Err(Error::NodeNotFound(node_index));
+        }
+        if max_depth == 0 {
+            return Ok(Vec::new());
+        }
+
+        let pm = self.parents.as_ref().unwrap();
+        let nodes = &raw.nodes;
+        let nfc = raw.node_field_count;
+        let mut chain: Vec<RetainerChainNode> = Vec::with_capacity(max_depth.min(64) + 1);
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut cur = node_index;
+        let mut hops = 0usize;
+        loop {
+            if !seen.insert(cur) {
+                // cycle: the parent chain loops back to an already-seen node
+                if let Some(last) = chain.last_mut() {
+                    last.cycle = true;
+                }
+                break;
+            }
+            let base = cur * nfc;
+            let type_idx = nodes[base + raw.node_offsets.type_] as usize;
+            let name_idx = nodes[base + raw.node_offsets.name] as usize;
+            let parent = pm.index[cur];
+            let edge_type = if parent == u32::MAX {
+                String::new()
+            } else {
+                raw.edge_types
+                    .get(pm.edge_type[cur] as usize)
+                    .cloned()
+                    .unwrap_or_else(|| pm.edge_type[cur].to_string())
+            };
+            let edge_name = if parent == u32::MAX {
+                String::new()
+            } else if edge_type == "element" {
+                format!("[{}]", pm.edge_name_or_index[cur])
+            } else {
+                raw.strings
+                    .resolve(&raw.mmap, pm.edge_name_or_index[cur] as usize)
+                    .unwrap_or_else(|| format!("#{}", pm.edge_name_or_index[cur]))
+            };
+            chain.push(RetainerChainNode {
+                node_index: cur,
+                id: nodes[base + raw.node_offsets.id] as usize,
+                name: raw.strings.resolve(&raw.mmap, name_idx).unwrap_or_default(),
+                type_: raw
+                    .node_types
+                    .get(type_idx)
+                    .cloned()
+                    .unwrap_or_else(|| type_idx.to_string()),
+                self_size: nodes[base + raw.node_offsets.self_size] as usize,
+                edge_count: nodes[base + raw.node_offsets.edge_count] as usize,
+                edge_type,
+                edge_name,
+                cycle: false,
+            });
+            if parent == u32::MAX {
+                break;
+            }
+            cur = parent as usize;
+            hops += 1;
+            if hops >= max_depth {
+                break;
+            }
+        }
+        Ok(chain)
+    }
+
+    /// Classify nodes matched by `query` into owner groups: each match is
+    /// walked up its first-parent chain (`depth` hops) and the resulting
+    /// "owner -> parent -> ..." chain string is the group key. Groups carry
+    /// count and summed self size, sorted by self size descending.
+    pub fn owner_groups(
+        &mut self,
+        query: &NameQuery,
+        depth: usize,
+        top: usize,
+    ) -> crate::Result<OwnerAnalysis> {
+        let matches = self.find_nodes(query)?;
+        let mut map: AHashMap<String, (usize, usize)> = AHashMap::new();
+        let mut total_self = 0usize;
+        for m in &matches {
+            total_self += m.self_size;
+            let chain = self.retainer_chain(m.node_index, depth)?;
+            // chain[0] is the match itself; the owner chain starts at [1].
+            let mut parts: Vec<String> = Vec::new();
+            for (i, hop) in chain.iter().enumerate().skip(1) {
+                if i == 1 {
+                    // immediate owner: name, with a type fallback like the
+                    // classic scripts use for unnamed nodes
+                    if hop.name.is_empty() {
+                        parts.push(format!("({})", hop.type_));
+                    } else {
+                        parts.push(hop.name.clone());
+                    }
+                } else if !hop.name.is_empty() {
+                    parts.push(hop.name.clone());
+                }
+            }
+            let key = if parts.is_empty() {
+                "(none)".to_string()
+            } else {
+                parts.join(" → ")
+            };
+            let e = map.entry(key).or_insert((0, 0));
+            e.0 += m.self_size;
+            e.1 += 1;
+        }
+        let mut groups: Vec<OwnerGroup> = map
+            .into_iter()
+            .map(|(chain, (self_size, count))| OwnerGroup {
+                chain,
+                count,
+                self_size,
+            })
+            .collect();
+        groups.sort_unstable_by(|a, b| {
+            b.self_size
+                .cmp(&a.self_size)
+                .then_with(|| a.chain.cmp(&b.chain))
+        });
+        if top > 0 && groups.len() > top {
+            groups.truncate(top);
+        }
+        Ok(OwnerAnalysis {
+            name: query.name.clone(),
+            total_nodes: matches.len(),
+            total_self,
+            groups,
         })
     }
 

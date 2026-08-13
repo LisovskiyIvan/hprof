@@ -1,4 +1,7 @@
-//! `diff` command — compare two profiles of the same type.
+//! `diff` command — compare profiles of the same type.
+//!
+//! With more than two files the comparison is pairwise:
+//!   hprof diff a b c   →  a vs b, then b vs c.
 
 use hprof_core::{DiffEntry, HeapProfile, HeapSnapshot};
 use serde_json::json;
@@ -7,101 +10,119 @@ use crate::{dim, format_bytes, format_delta, green, print_header, print_table, r
 
 pub fn run(args: &Args) -> Result<(), String> {
     if args.files.len() < 2 {
-        return Err("diff requires two files: <baseline> <profile>".to_string());
+        return Err(
+            "diff requires at least two files: <baseline> <profile> [<more>...]".to_string(),
+        );
     }
-    let baseline_path = &args.files[0];
-    let profile_path = &args.files[1];
+    let mut docs: Vec<serde_json::Value> = Vec::new();
+    // pairwise: files[0] vs files[1], files[1] vs files[2], ...
+    for pair in args.files.windows(2) {
+        let baseline_path = &pair[0];
+        let profile_path = &pair[1];
 
-    let base_type = hprof_core::detect_profile_type(baseline_path).map_err(|e| e.to_string())?;
-    let prof_type = hprof_core::detect_profile_type(profile_path).map_err(|e| e.to_string())?;
-    if base_type != prof_type {
-        return Err(format!(
-            "cannot diff {base_type} with {prof_type} — types must match"
-        ));
+        let base_type =
+            hprof_core::detect_profile_type(baseline_path).map_err(|e| e.to_string())?;
+        let prof_type = hprof_core::detect_profile_type(profile_path).map_err(|e| e.to_string())?;
+        if base_type != prof_type {
+            return Err(format!(
+                "cannot diff {base_type} with {prof_type} — types must match ({baseline_path} vs {profile_path})"
+            ));
+        }
+
+        match prof_type {
+            "heapprofile" => {
+                let d = diff_heapprofile(baseline_path, profile_path)?;
+                if args.json {
+                    docs.push(json!({
+                        "baseline": baseline_path,
+                        "profile": profile_path,
+                        "type": "heapprofile",
+                        "baselineTotal": d.baseline_total,
+                        "profileTotal": d.profile_total,
+                        "deltaTotal": d.delta_total,
+                        "byFrame": d.by_frame,
+                        "byUrl": d.by_url,
+                        "byFunction": d.by_function,
+                    }));
+                } else {
+                    print_header(
+                        &format!("{profile_path} vs {baseline_path}"),
+                        Some(&format!(
+                            "diff | baseline: {} → profile: {} | delta: {}",
+                            format_bytes(d.baseline_total),
+                            yellow(&format_bytes(d.profile_total)),
+                            format_delta(d.delta_total)
+                        )),
+                    );
+                    print_diff_table("FUNCTION DELTA", &d.by_function, args.top);
+                    print_diff_table("FRAME DELTA", &d.by_frame, args.top);
+                }
+            }
+            "heapsnapshot" => {
+                let d = diff_heapsnapshot(baseline_path, profile_path)?;
+                if args.json {
+                    docs.push(json!({
+                        "baseline": baseline_path,
+                        "profile": profile_path,
+                        "type": "heapsnapshot",
+                        "baselineTotal": d.baseline_total,
+                        "profileTotal": d.profile_total,
+                        "deltaTotal": d.delta_total,
+                        "byNodeName": d.by_node_name,
+                        "byNodeType": d.by_node_type,
+                    }));
+                } else {
+                    print_header(
+                        &format!("{profile_path} vs {baseline_path}"),
+                        Some(&format!(
+                            "diff | baseline: {} → profile: {} | delta: {}",
+                            format_bytes(d.baseline_total),
+                            yellow(&format_bytes(d.profile_total)),
+                            format_delta(d.delta_total)
+                        )),
+                    );
+                    print_diff_table("NODE NAME DELTA", &d.by_node_name, args.top);
+                    print_diff_table("NODE TYPE DELTA", &d.by_node_type, args.top);
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "diff is not implemented for heaptimeline files ({profile_path})"
+                ));
+            }
+        }
+
+        if !args.json && args.files.len() > 2 {
+            println!();
+        }
     }
 
-    match prof_type {
-        "heapprofile" => diff_heapprofile(baseline_path, profile_path, args),
-        "heapsnapshot" => diff_heapsnapshot(baseline_path, profile_path, args),
-        _ => Err("diff is not implemented for heaptimeline files".to_string()),
+    if args.json {
+        if docs.len() == 1 {
+            println!("{}", serde_json::to_string_pretty(&docs[0]).unwrap());
+        } else {
+            println!("{}", serde_json::to_string_pretty(&json!(docs)).unwrap());
+        }
     }
+    Ok(())
 }
 
-fn diff_heapprofile(baseline_path: &str, profile_path: &str, args: &Args) -> Result<(), String> {
+fn diff_heapprofile(
+    baseline_path: &str,
+    profile_path: &str,
+) -> Result<hprof_core::ProfileDiff, String> {
     let mut baseline = HeapProfile::new(baseline_path.to_string());
     let mut profile = HeapProfile::new(profile_path.to_string());
-    let d = profile.diff(&mut baseline).map_err(|e| e.to_string())?;
-
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "baseline": baseline_path,
-                "profile": profile_path,
-                "type": "heapprofile",
-                "baselineTotal": d.baseline_total,
-                "profileTotal": d.profile_total,
-                "deltaTotal": d.delta_total,
-                "byFrame": d.by_frame,
-                "byUrl": d.by_url,
-                "byFunction": d.by_function,
-            }))
-            .unwrap()
-        );
-        return Ok(());
-    }
-
-    print_header(
-        &format!("{profile_path} vs {baseline_path}"),
-        Some(&format!(
-            "diff | baseline: {} → profile: {} | delta: {}",
-            format_bytes(d.baseline_total),
-            yellow(&format_bytes(d.profile_total)),
-            format_delta(d.delta_total)
-        )),
-    );
-
-    print_diff_table("FUNCTION DELTA", &d.by_function, args.top);
-    print_diff_table("FRAME DELTA", &d.by_frame, args.top);
-    Ok(())
+    profile.diff(&mut baseline).map_err(|e| e.to_string())
 }
 
-fn diff_heapsnapshot(baseline_path: &str, profile_path: &str, args: &Args) -> Result<(), String> {
+fn diff_heapsnapshot(
+    baseline_path: &str,
+    profile_path: &str,
+) -> Result<hprof_core::SnapshotDiff, String> {
     let mut baseline = HeapSnapshot::new(baseline_path.to_string());
     let mut profile = HeapSnapshot::new(profile_path.to_string());
-    let d = profile.diff(&mut baseline).map_err(|e| e.to_string())?;
-
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "baseline": baseline_path,
-                "profile": profile_path,
-                "type": "heapsnapshot",
-                "baselineTotal": d.baseline_total,
-                "profileTotal": d.profile_total,
-                "deltaTotal": d.delta_total,
-                "byNodeName": d.by_node_name,
-                "byNodeType": d.by_node_type,
-            }))
-            .unwrap()
-        );
-        return Ok(());
-    }
-
-    print_header(
-        &format!("{profile_path} vs {baseline_path}"),
-        Some(&format!(
-            "diff | baseline: {} → profile: {} | delta: {}",
-            format_bytes(d.baseline_total),
-            yellow(&format_bytes(d.profile_total)),
-            format_delta(d.delta_total)
-        )),
-    );
-
-    print_diff_table("NODE NAME DELTA", &d.by_node_name, args.top);
-    print_diff_table("NODE TYPE DELTA", &d.by_node_type, args.top);
-    Ok(())
+    profile.diff(&mut baseline).map_err(|e| e.to_string())
 }
 
 fn print_diff_table(title: &str, entries: &[DiffEntry], top: usize) {
