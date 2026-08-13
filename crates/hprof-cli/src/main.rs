@@ -5,8 +5,10 @@
 //! binary: parse, summarize, retained sizes, retention paths.
 
 mod analyze;
+mod calltree;
 mod diff;
 mod dot;
+mod flame;
 mod inspect;
 mod list;
 
@@ -269,6 +271,8 @@ pub enum Command {
     Dot,
     List,
     Inspect,
+    Calltree,
+    Flame,
     Ui,
     Help,
 }
@@ -291,6 +295,11 @@ pub struct Args {
     pub id: Option<usize>,
     /// inspect: show a single node by record index
     pub index: Option<usize>,
+    /// heapprofile: restrict contribution to frames from URLs containing this
+    /// substring (analyze, calltree)
+    pub url: Option<String>,
+    /// whether --top was passed explicitly (flame does not cap by default)
+    pub top_explicit: bool,
 }
 
 impl Default for Args {
@@ -309,6 +318,8 @@ impl Default for Args {
             name: None,
             id: None,
             index: None,
+            url: None,
+            top_explicit: false,
         }
     }
 }
@@ -324,6 +335,7 @@ fn parse_args(argv: &[String]) -> Args {
         };
         match arg.as_str() {
             "--top" => {
+                args.top_explicit = true;
                 if let Some(v) = next(&mut i) {
                     args.top = v.parse().unwrap_or(args.top);
                 }
@@ -366,11 +378,18 @@ fn parse_args(argv: &[String]) -> Args {
                     args.index = v.parse().ok();
                 }
             }
+            "--url" => {
+                if let Some(v) = next(&mut i) {
+                    args.url = Some(v);
+                }
+            }
             "analyze" => args.command = Command::Analyze,
             "diff" => args.command = Command::Diff,
             "dot" => args.command = Command::Dot,
             "list" => args.command = Command::List,
             "inspect" => args.command = Command::Inspect,
+            "calltree" => args.command = Command::Calltree,
+            "flame" => args.command = Command::Flame,
             "ui" => args.command = Command::Ui,
             "help" => args.command = Command::Help,
             "bench" => {
@@ -401,6 +420,8 @@ fn print_usage() {
     {c}dot{r}       Emit call graph as DOT for use with graphviz
     {c}list{r}      List sampled locations grouped by file:line (heapprofile)
     {c}inspect{r}   Inspect a heap snapshot: instances by name, paths from root
+    {c}calltree{r}  Inclusive call tree for a sampling profile (heapprofile)
+    {c}flame{r}     Folded stacks (a;b;c <size>) for flamegraph.pl / speedscope
     {c}help{r}      Show this help message
 
  {b}Options:{r}
@@ -411,6 +432,8 @@ fn print_usage() {
    {y}--hide <re>{r}     pprof-style hide: drop matching frames from visualisations
    {y}--cum{r}           Show cumulative (self + descendants) instead of flat only
    {y}--retained{r}      heapsnapshot: add exclusive retained sizes to the summary
+   {y}--url <substr>{r}   heapprofile: only frames from URLs containing this contribute
+   {y}--name <re>{r}      heaptimeline: show allocation stacks for matching constructor names
    {y}--json{r}          Output as JSON
 
  {b}Heap snapshot inspection:{r}
@@ -427,6 +450,16 @@ fn print_usage() {
      - top allocation sites as stack traces (leaf <- caller)
      - object-growth profile over the recording
    {gr}--filter Vector3{r} narrows names and stacks to matching entries.
+
+ {b}Flame output:{r}
+   Folded stacks for flamegraph.pl / speedscope (heapprofile, heaptimeline):
+     {gr}hprof flame file.heapprofile | flamegraph.pl > flame.svg{r}
+     {gr}hprof flame file.heaptimeline | flamegraph.pl > flame.svg{r}
+   {y}--top <n>{r} caps the lines; {y}--filter <re>{r} keeps only matching stacks.
+
+ {b}Call tree:{r}
+   {gr}hprof calltree file.heapprofile{r} — inclusive (self + subtree) tree,
+   prune with {y}--url <substr>{r} or {y}--focus <re>{r}.
 
  {b}Dot output:{r}
    Pipe to graphviz to render a graph. Examples:
@@ -500,6 +533,8 @@ fn main() -> ExitCode {
             Command::Dot => dot::run(file, type_name, &args),
             Command::List => list::run(file, type_name, &args),
             Command::Inspect => inspect::run(file, type_name, &args),
+            Command::Calltree => calltree::run(file, type_name, &args),
+            Command::Flame => flame::run(file, type_name, &args),
             _ => unreachable!(),
         };
 

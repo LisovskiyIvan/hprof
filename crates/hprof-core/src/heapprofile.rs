@@ -85,6 +85,85 @@ impl HeapProfile {
         Ok(result)
     }
 
+    /// Flat summary scoped to frames whose script URL contains `url`
+    /// (case-insensitive). Unlike `--filter` on the flat keys, this also
+    /// scopes `by_function` (function names alone carry no URL). `None`
+    /// behaves exactly like `summarize`.
+    pub fn summarize_scoped(
+        &mut self,
+        top: Option<usize>,
+        filter: Option<&str>,
+        url: Option<&str>,
+    ) -> crate::Result<HeapProfileSummary> {
+        let Some(url) = url.filter(|u| !u.is_empty()) else {
+            return self.summarize(top, filter);
+        };
+        let url = url.to_lowercase();
+        let data = self.data_arc()?;
+
+        let mut by_frame: HashMap<String, usize> = HashMap::new();
+        let mut by_url: HashMap<String, usize> = HashMap::new();
+        let mut by_function: HashMap<String, usize> = HashMap::new();
+        let mut total_size = 0usize;
+
+        let mut stack: Vec<&HeapProfileNode> = vec![&data.head];
+        while let Some(node) = stack.pop() {
+            let self_size = node.self_size;
+            if self_size > 0 {
+                let u = url_of(node);
+                if u.to_lowercase().contains(&url) {
+                    total_size += self_size;
+                    *by_frame.entry(frame_label(node)).or_insert(0) += self_size;
+                    *by_url.entry(u).or_insert(0) += self_size;
+                    *by_function.entry(fn_name_of(node)).or_insert(0) += self_size;
+                }
+            }
+            for child in &node.children {
+                stack.push(child);
+            }
+        }
+
+        let summary = HeapProfileSummary {
+            total_size,
+            by_frame,
+            by_url,
+            by_function,
+        };
+        Ok(slice_flat_summary(&summary, top, filter))
+    }
+
+    /// Folded stacks in flamegraph.pl format — one `a;b;c <bytes>` line per
+    /// tree node with self size > 0, frames joined with `;` (chperf
+    /// convention; no URLs so shared frames merge). Pipe to flamegraph.pl or
+    /// speedscope. The tree is already aggregated, so identical stacks are
+    /// naturally merged.
+    pub fn folded_stacks(&mut self) -> crate::Result<String> {
+        let data = self.data_arc()?;
+        let mut out = String::with_capacity(1 << 16);
+        let mut path: Vec<String> = Vec::with_capacity(32);
+        // (node, exited) — iterative DFS keeping the ancestor name path
+        let mut stack: Vec<(&HeapProfileNode, bool)> = vec![(&data.head, false)];
+        while let Some((node, exited)) = stack.pop() {
+            if exited {
+                path.pop();
+                continue;
+            }
+            path.push(fn_name_of(node));
+            let self_size = node.self_size;
+            if self_size > 0 {
+                out.push_str(&path.join(";"));
+                out.push(' ');
+                out.push_str(&self_size.to_string());
+                out.push('\n');
+            }
+            stack.push((node, true));
+            for child in &node.children {
+                stack.push((child, false));
+            }
+        }
+        Ok(out)
+    }
+
     /// Build a flamegraph tree. Single recursive pass; children are processed
     /// in parallel via rayon where the tree is wide enough to benefit.
     pub fn to_flamegraph(&mut self, filters: &FilterOptions) -> crate::Result<FlamegraphFrame> {

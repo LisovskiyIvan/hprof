@@ -123,9 +123,15 @@ fn analyze_heapprofile(file: &str, args: &Args) -> Result<(), String> {
         return Ok(());
     }
 
-    let summary = profile
-        .summarize(Some(args.top), args.filter.as_deref())
-        .map_err(|e| e.to_string())?;
+    let summary = if args.url.is_some() {
+        profile
+            .summarize_scoped(Some(args.top), args.filter.as_deref(), args.url.as_deref())
+            .map_err(|e| e.to_string())?
+    } else {
+        profile
+            .summarize(Some(args.top), args.filter.as_deref())
+            .map_err(|e| e.to_string())?
+    };
 
     if args.json {
         println!(
@@ -589,6 +595,33 @@ fn analyze_heaptimeline(file: &str, args: &Args) -> Result<(), String> {
             })
             .collect();
         print_table(&["SIZE", "COUNT", "STACK (leaf <- caller)"], &stack_rows);
+    }
+
+    // ---- allocation stacks for a specific constructor ----
+    if let Some(name_re) = &args.name {
+        let by_name = timeline
+            .name_stacks(name_re, Some(args.top))
+            .map_err(|e| e.to_string())?;
+        print_header(
+            &format!("Allocation stacks for '{}'", name_re),
+            Some(&format!(
+                "{} · {} allocations",
+                format_bytes(by_name.total_size),
+                by_name.total_count
+            )),
+        );
+        let rows: Vec<Vec<String>> = by_name
+            .entries
+            .iter()
+            .map(|e| {
+                vec![
+                    green(&format_bytes(e.size)),
+                    dim(&e.count.to_string()),
+                    format_stack(&e.stack),
+                ]
+            })
+            .collect();
+        print_table(&["SIZE", "COUNT", "STACK (leaf <- caller)"], &rows);
     }
 
     Ok(())

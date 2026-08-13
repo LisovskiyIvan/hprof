@@ -438,6 +438,37 @@ fn stack_frames(data: &mut TimelineData, ti: usize) -> Vec<TimelineStackFrame> {
     frames
 }
 
+/// Ancestor chain of function names for trace node `ti` (root first).
+/// Allocation-only variant of `stack_frames` used by `folded_stacks`.
+fn stack_names(data: &mut TimelineData, ti: usize) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut cur = Some(ti);
+    let mut guard = 0;
+    while let Some(ci) = cur {
+        let (fii, parent) = match data.trace_nodes.get(ci) {
+            Some(tn) => (tn.func_idx, tn.parent),
+            None => break,
+        };
+        let name_idx = match data.trace_infos.get(fii as usize) {
+            Some(info) => info.name_idx,
+            None => 0,
+        };
+        let name = if name_idx == 0 {
+            "(root)".to_string()
+        } else {
+            resolve_string(data, name_idx)
+        };
+        names.push(name);
+        cur = parent;
+        guard += 1;
+        if guard > 128 {
+            break;
+        }
+    }
+    names.reverse();
+    names
+}
+
 pub struct HeapTimeline {
     file_path: String,
     snapshot_meta: Option<SnapshotMeta>,
@@ -669,6 +700,36 @@ impl HeapTimeline {
             total_count: total_count as usize,
             entries,
         })
+    }
+
+    /// Folded stacks in flamegraph.pl format — one `a;b;c <bytes>` line per
+    /// distinct allocation stack, aggregated across the trace tree (chperf
+    /// `--flame` convention; frames joined with `;`). Compact even for
+    /// 17M-node timelines because the tree merges identical stacks.
+    pub fn folded_stacks(&mut self) -> crate::Result<String> {
+        let node_count = self.data()?.trace_nodes.len();
+        let mut agg: HashMap<Vec<String>, u64> = HashMap::new();
+        for ti in 0..node_count {
+            let size = {
+                let data = self.data.as_ref().unwrap();
+                data.trace_nodes[ti].size
+            };
+            if size == 0 {
+                continue;
+            }
+            let names = stack_names(self.data.as_mut().unwrap(), ti);
+            *agg.entry(names).or_insert(0) += size as u64;
+        }
+        let mut entries: Vec<(Vec<String>, u64)> = agg.into_iter().collect();
+        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut out = String::with_capacity(entries.len() * 64);
+        for (stack, size) in entries {
+            out.push_str(&stack.join(";"));
+            out.push(' ');
+            out.push_str(&size.to_string());
+            out.push('\n');
+        }
+        Ok(out)
     }
 
     /// Stack distribution for nodes whose name matches `name_re`.
