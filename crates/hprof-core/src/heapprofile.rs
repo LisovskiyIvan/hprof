@@ -811,7 +811,9 @@ fn parse_profile(file_path: &str) -> crate::Result<HeapProfileResult> {
 
 #[inline]
 fn skip_ws(data: &[u8], pos: &mut usize) {
-    while *pos < data.len() && (data[*pos] == b' ' || data[*pos] == b'\n' || data[*pos] == b'\t' || data[*pos] == b'\r') {
+    while *pos < data.len()
+        && (data[*pos] == b' ' || data[*pos] == b'\n' || data[*pos] == b'\t' || data[*pos] == b'\r')
+    {
         *pos += 1;
     }
 }
@@ -856,7 +858,9 @@ fn parse_f64(data: &[u8], pos: &mut usize) -> f64 {
     if *pos < data.len() && (data[*pos] == b'-' || data[*pos] == b'+') {
         *pos += 1;
     }
-    while *pos < data.len() && (data[*pos].is_ascii_digit() || matches!(data[*pos], b'.' | b'e' | b'E' | b'-' | b'+')) {
+    while *pos < data.len()
+        && (data[*pos].is_ascii_digit() || matches!(data[*pos], b'.' | b'e' | b'E' | b'-' | b'+'))
+    {
         *pos += 1;
     }
     std::str::from_utf8(&data[start..*pos])
@@ -1023,4 +1027,3 @@ fn number_after_key(data: &[u8], key: &[u8]) -> f64 {
     }
     parse_f64(data, &mut pos)
 }
-

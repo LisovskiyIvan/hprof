@@ -500,3 +500,42 @@ pub struct SnapshotDiff {
     pub by_node_name: Vec<DiffEntry>,
     pub by_node_type: Vec<DiffEntry>,
 }
+
+// ============================================================================
+// HeapSnapshot inspection: shortest path from GC root
+// ============================================================================
+
+/// One node on a retention path (root -> target).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathNode {
+    /// record index into the nodes array
+    pub index: usize,
+    /// DevTools node id (stable across snapshots)
+    pub id: usize,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub self_size: usize,
+}
+
+/// The edge connecting two consecutive path nodes (retainer -> retained).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathEdge {
+    pub type_: String,
+    /// property name, or "[i]" for element edges
+    pub name: String,
+}
+
+/// Shortest path from the GC root to a node, following incoming edges.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShortestPath {
+    /// false when the node is unreachable from the root (or the depth limit
+    /// was hit before the root was reached)
+    pub found: bool,
+    /// nodes[0] is the root; nodes[i] -> edges[i] -> nodes[i+1]
+    pub nodes: Vec<PathNode>,
+    pub edges: Vec<PathEdge>,
+}

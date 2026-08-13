@@ -10,10 +10,12 @@ bun install
 
 ## Local development
 
-Start the profile API server from the repository root:
+Start the profile API server from the repository root (the UI is
+deferred — the CLI is native Rust now; the server is launched directly):
 
 ```bash
-bun packages/cli/src/cli.ts ui snapshots/Heap-20260508T151623.heapsnapshot
+cargo build --release -p hprof-c
+bun -e 'import { startServer } from "@hprof/ui"; await startServer({ files: ["snapshots/Heap-20260508T151623.heapsnapshot"], port: 3000 })'
 ```
 
 Then start the Vite dev server in this directory:

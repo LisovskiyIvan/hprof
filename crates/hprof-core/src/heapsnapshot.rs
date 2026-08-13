@@ -19,6 +19,38 @@ pub struct HeapSnapshot {
     /// single biggest perf win for snapshot analysis — avoids re-parsing the
     /// 1.5GB mmap on every diff / flamegraph / treemap call.
     full_summary: Option<HeapSnapshotSummary>,
+    /// Cached dominator-tree analysis. Built on demand by `ensure_retained`
+    /// and shared by `retained_summary`, `search_nodes` and `shortest_path`.
+    retained_data: Option<RetainedData>,
+}
+
+/// Cached dominator-tree analysis (per-node retained sizes + reverse graph).
+///
+/// The reverse CSR and all dominator arrays are indexed by *preorder number*
+/// (pre space) — that is what Lengauer–Tarjan works in, and the BFS in
+/// `shortest_path` reuses the same index. `preorder`/`vertex` translate
+/// between node indices and pre numbers.
+///
+/// `rev_starts`/`rev_sources` form a flat CSR of *incoming* edges: node with
+/// pre `w` is referenced by sources `rev_sources[rev_starts[w]..rev_starts[w+1]]`.
+/// One pass over the forward edges builds it, and it serves both the idom
+/// iteration (predecessors) and the shortest-path BFS. The old per-node
+/// `Vec<Vec<usize>>` predecessor table cost ~370MB for a 7.4M-node snapshot;
+/// this flat layout costs ~124MB and is faster to build.
+pub struct RetainedData {
+    /// retained (self + dominated subtree) size per node, node space
+    pub retained: Vec<f64>,
+    /// incoming-edge CSR indexed by preorder number
+    pub rev_starts: Vec<u32>,
+    /// preorder numbers of the sources of incoming edges
+    pub rev_sources: Vec<u32>,
+    /// immediate dominator per node (node space); `u32::MAX` for nodes
+    /// unreachable from root
+    pub idoms: Vec<u32>,
+    /// node index -> preorder number (`u32::MAX` when unreachable)
+    pub preorder: Vec<u32>,
+    /// preorder number -> node index
+    pub vertex: Vec<u32>,
 }
 
 pub struct RawData {
@@ -186,6 +218,7 @@ impl HeapSnapshot {
             raw: None,
             edge_starts: None,
             full_summary: None,
+            retained_data: None,
         }
     }
 
@@ -487,6 +520,18 @@ impl HeapSnapshot {
         })
     }
 
+    /// Fetch a single node by record index (name resolved). Used by the CLI
+    /// `inspect --id` flow to render a node's details without pulling its
+    /// edge list.
+    pub fn get_node(&mut self, node_index: usize) -> crate::Result<HeapSnapshotNode> {
+        self.ensure_raw()?;
+        let raw = self.raw.as_ref().unwrap();
+        if node_index >= raw.meta.node_count {
+            return Err(Error::NodeNotFound(node_index));
+        }
+        Ok(Self::create_node(raw, node_index))
+    }
+
     pub fn get_node_page(&mut self, options: NodePageOptions) -> crate::Result<NodePage> {
         self.ensure_raw()?;
         let raw = self.raw.as_ref().unwrap();
@@ -569,7 +614,11 @@ impl HeapSnapshot {
             // materialize the kept nodes, resolve strings for the page rows
             let mut kept: Vec<usize> = heap.into_iter().map(|h| h.idx).collect();
             kept.sort_by(|&a, &b| compare_node_indices(raw, a, b, options.sort, options.dir));
-            let rows: Vec<usize> = kept.into_iter().skip(page * page_size).take(page_size).collect();
+            let rows: Vec<usize> = kept
+                .into_iter()
+                .skip(page * page_size)
+                .take(page_size)
+                .collect();
             let nodes = rows
                 .iter()
                 .map(|&idx| Self::create_node_raw(raw, idx, true))
@@ -700,21 +749,10 @@ impl HeapSnapshot {
     ) -> crate::Result<(HeapSnapshotNode, Vec<HeapSnapshotEdge>)> {
         self.ensure_raw()?;
         self.ensure_edges()?;
+        self.ensure_edge_starts();
         let raw = self.raw.as_ref().unwrap();
         if node_index >= raw.meta.node_count {
             return Err(Error::NodeNotFound(node_index));
-        }
-
-        if self.edge_starts.is_none() {
-            let mut starts = Vec::with_capacity(raw.meta.node_count + 1);
-            let mut offset = 0u32;
-            for i in 0..raw.meta.node_count {
-                starts.push(offset);
-                let base = i * raw.node_field_count;
-                offset += raw.nodes[base + raw.node_offsets.edge_count];
-            }
-            starts.push(offset);
-            self.edge_starts = Some(starts);
         }
 
         let node = Self::create_node(raw, node_index);
@@ -766,9 +804,230 @@ impl HeapSnapshot {
             .collect())
     }
 
+    /// Build (or reuse) the per-node edge-start index. `get_node_edges`,
+    /// `ensure_retained` and path reconstruction all need it.
+    fn ensure_edge_starts(&mut self) {
+        if self.edge_starts.is_some() {
+            return;
+        }
+        let raw = self.raw.as_ref().unwrap();
+        let node_count = raw.meta.node_count;
+        let mut starts = Vec::with_capacity(node_count + 1);
+        let mut offset = 0u32;
+        for i in 0..node_count {
+            starts.push(offset);
+            let base = i * raw.node_field_count;
+            offset += raw.nodes[base + raw.node_offsets.edge_count];
+        }
+        starts.push(offset);
+        self.edge_starts = Some(starts);
+    }
+
+    /// Compute (and cache) the dominator-tree analysis: per-node retained
+    /// sizes plus a flat reverse (incoming-edge) CSR. Shared by
+    /// `get_retained_entries`, `retained_summary`, `search_nodes` and
+    /// `shortest_path`, so a CLI session that uses several of these pays the
+    /// cost once. The reverse CSR doubles as the predecessor table for the
+    /// idom iteration and as the traversal index for path BFS.
+    pub fn ensure_retained(&mut self) -> crate::Result<()> {
+        if self.retained_data.is_some() {
+            return Ok(());
+        }
+        self.ensure_raw()?;
+        self.ensure_edges()?;
+        self.ensure_edge_starts();
+        let raw = self.raw.as_ref().unwrap();
+        let edge_starts = self.edge_starts.as_ref().unwrap();
+        let node_count = raw.meta.node_count;
+
+        // iterative DFS from root (node 0), assigning preorder numbers. The
+        // DFS tree (dfs_parent) plus the reverse CSR feed Lengauer–Tarjan.
+        let mut preorder = vec![u32::MAX; node_count];
+        let mut vertex: Vec<u32> = Vec::with_capacity(node_count);
+        let mut dfs_parent: Vec<u32> = Vec::with_capacity(node_count);
+        // per-node cursor into its own edge range (edge_starts[v]..edge_starts[v+1])
+        let mut next_edge: Vec<u32> = edge_starts[..node_count].to_vec();
+        let mut pre = 0u32;
+        preorder[0] = 0;
+        vertex.push(0);
+        dfs_parent.push(0);
+        let mut stack: Vec<u32> = vec![0u32];
+        while let Some(&v_node) = stack.last() {
+            let end = edge_starts[v_node as usize + 1] as usize;
+            let mut e = next_edge[v_node as usize] as usize;
+            let mut descended = false;
+            while e < end {
+                let base = e * raw.edge_field_count;
+                let to_node = raw.edges.as_ref().unwrap()[base + raw.edge_offsets.to_node] as usize
+                    / raw.node_field_count;
+                if to_node < node_count && preorder[to_node] == u32::MAX {
+                    next_edge[v_node as usize] = (e + 1) as u32;
+                    pre += 1;
+                    preorder[to_node] = pre;
+                    vertex.push(to_node as u32);
+                    dfs_parent.push(preorder[v_node as usize]);
+                    stack.push(to_node as u32);
+                    descended = true;
+                    break;
+                }
+                e += 1;
+            }
+            if !descended {
+                stack.pop();
+            }
+        }
+
+        // flat reverse CSR in pre space: node with pre `w` is referenced by
+        // sources rev_sources[rev_starts[w]..rev_starts[w+1]] (pre numbers).
+        // Sources unreachable from root cannot dominate anything and are
+        // skipped.
+        let mut counts = vec![0u32; node_count];
+        for n in 0..node_count {
+            let start = edge_starts[n] as usize;
+            let end = edge_starts[n + 1] as usize;
+            for edge_index in start..end {
+                let base = edge_index * raw.edge_field_count;
+                let to_node = raw.edges.as_ref().unwrap()[base + raw.edge_offsets.to_node] as usize
+                    / raw.node_field_count;
+                if to_node < node_count && preorder[to_node] != u32::MAX {
+                    counts[preorder[to_node] as usize] += 1;
+                }
+            }
+        }
+        let mut rev_starts = vec![0u32; node_count + 1];
+        for n in 0..node_count {
+            rev_starts[n + 1] = rev_starts[n] + counts[n];
+        }
+        let mut cursor = rev_starts.clone();
+        let mut rev_sources = vec![0u32; rev_starts[node_count] as usize];
+        for n in 0..node_count {
+            let start = edge_starts[n] as usize;
+            let end = edge_starts[n + 1] as usize;
+            for edge_index in start..end {
+                let base = edge_index * raw.edge_field_count;
+                let to_node = raw.edges.as_ref().unwrap()[base + raw.edge_offsets.to_node] as usize
+                    / raw.node_field_count;
+                if to_node < node_count && preorder[to_node] != u32::MAX {
+                    let w = preorder[to_node] as usize;
+                    rev_sources[cursor[w] as usize] = preorder[n];
+                    cursor[w] += 1;
+                }
+            }
+        }
+
+        // Lengauer–Tarjan dominators (with path compression). All arrays are
+        // indexed by preorder number; 0 = root. Runs in O(E · α(V)) — the
+        // Cooper–Harvey–Kennedy refinement took ~74s on a 7.4M-node snapshot,
+        // this finishes in seconds.
+        fn eval(v: u32, semi: &[u32], label: &mut [u32], ancestor: &mut [u32]) -> u32 {
+            if ancestor[v as usize] == 0 {
+                return label[v as usize];
+            }
+            compress(v, semi, label, ancestor);
+            label[v as usize]
+        }
+
+        // Iterative compress (recursion could blow the stack on deep chains).
+        fn compress(v: u32, semi: &[u32], label: &mut [u32], ancestor: &mut [u32]) {
+            if ancestor[ancestor[v as usize] as usize] == 0 {
+                return;
+            }
+            let mut chain: Vec<u32> = Vec::new();
+            let mut x = v;
+            while ancestor[ancestor[x as usize] as usize] != 0 {
+                chain.push(x);
+                x = ancestor[x as usize];
+            }
+            while let Some(y) = chain.pop() {
+                let a = ancestor[y as usize];
+                if semi[label[a as usize] as usize] < semi[label[y as usize] as usize] {
+                    label[y as usize] = label[a as usize];
+                }
+                ancestor[y as usize] = ancestor[a as usize];
+            }
+        }
+
+        let n = node_count;
+        let mut semi: Vec<u32> = (0..n as u32).collect();
+        let mut label: Vec<u32> = (0..n as u32).collect();
+        let mut ancestor = vec![0u32; n];
+        let mut idom_pre = vec![u32::MAX; n];
+        idom_pre[0] = 0;
+        let mut bucket_head = vec![u32::MAX; n];
+        let mut bucket_next = vec![u32::MAX; n];
+
+        for w in (1..n).rev() {
+            let wu = w;
+            let preds = &rev_sources[rev_starts[wu] as usize..rev_starts[wu + 1] as usize];
+            for &v in preds {
+                let u = eval(v, &semi, &mut label, &mut ancestor);
+                if semi[u as usize] < semi[wu] {
+                    semi[wu] = semi[u as usize];
+                }
+            }
+            let sw = semi[wu] as usize;
+            bucket_next[wu] = bucket_head[sw];
+            bucket_head[sw] = w as u32;
+            ancestor[wu] = dfs_parent[wu];
+            let p = dfs_parent[wu] as usize;
+            let mut v = bucket_head[p];
+            while v != u32::MAX {
+                let vu = v as usize;
+                let u = eval(v, &semi, &mut label, &mut ancestor);
+                idom_pre[vu] = if semi[u as usize] < semi[vu] {
+                    u
+                } else {
+                    p as u32
+                };
+                v = bucket_next[vu];
+            }
+            bucket_head[p] = u32::MAX;
+        }
+        for w in 1..n {
+            let wu = w;
+            if idom_pre[wu] != semi[wu] {
+                idom_pre[wu] = idom_pre[idom_pre[wu] as usize];
+            }
+        }
+
+        // retained = self + dominated subtree, accumulated in pre space, then
+        // mapped back to node space. Process in REVERSE preorder so children
+        // (higher pre) are final before they are folded into their idom.
+        let mut retained_pre = vec![0.0f64; n];
+        for (w, &node) in vertex.iter().enumerate() {
+            let base = node as usize * raw.node_field_count;
+            retained_pre[w] = raw.nodes[base + raw.node_offsets.self_size] as f64;
+        }
+        for w in (1..vertex.len()).rev() {
+            retained_pre[idom_pre[w] as usize] += retained_pre[w];
+        }
+        let mut retained = vec![0.0f64; node_count];
+        for (w, &node) in vertex.iter().enumerate() {
+            retained[node as usize] = retained_pre[w];
+        }
+
+        let mut idoms = vec![u32::MAX; node_count];
+        for (w, &node) in vertex.iter().enumerate() {
+            idoms[node as usize] = vertex[idom_pre[w] as usize];
+        }
+
+        self.retained_data = Some(RetainedData {
+            retained,
+            rev_starts,
+            rev_sources,
+            idoms,
+            preorder,
+            vertex,
+        });
+        Ok(())
+    }
+
     pub fn get_retained_entries(&mut self, top_n: usize) -> crate::Result<RetainedResult> {
         self.ensure_raw()?;
 
+        // Exact retained sizes need the full dominator computation (~1GB peak
+        // on a 7.4M-node snapshot). For very large snapshots the UI keeps the
+        // fast approximate top-by-self-size view so it stays responsive.
         if self.raw.as_ref().unwrap().meta.node_count > 5_000_000 {
             let raw = self.raw.as_ref().unwrap();
             let mut selected: Vec<(usize, HeapSnapshotNode)> = Vec::with_capacity(top_n);
@@ -805,12 +1064,29 @@ impl HeapSnapshot {
             });
         }
 
-        self.ensure_edges()?;
+        self.ensure_retained()?;
         let raw = self.raw.as_ref().unwrap();
-        let retained = self.build_retained_sizes(raw)?;
-        let mut indexed: Vec<(usize, f64)> = retained.into_iter().enumerate().collect();
-        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        indexed.truncate(top_n);
+        let rd = self.retained_data.as_ref().unwrap();
+        let mut indexed: Vec<(usize, usize)> = Vec::with_capacity(top_n);
+        for (idx, &size) in rd.retained.iter().enumerate() {
+            if size <= 0.0 {
+                continue;
+            }
+            if indexed.len() < top_n {
+                indexed.push((idx, size as usize));
+                continue;
+            }
+            let mut worst = 0usize;
+            for i in 1..indexed.len() {
+                if indexed[i].1 < indexed[worst].1 {
+                    worst = i;
+                }
+            }
+            if size as usize > indexed[worst].1 {
+                indexed[worst] = (idx, size as usize);
+            }
+        }
+        indexed.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         Ok(RetainedResult {
             approximate: false,
@@ -823,7 +1099,7 @@ impl HeapSnapshot {
                         name: node.name,
                         type_: node.type_,
                         self_size: node.self_size,
-                        retained_size: size as usize,
+                        retained_size: size,
                         approximate: false,
                     }
                 })
@@ -831,121 +1107,338 @@ impl HeapSnapshot {
         })
     }
 
-    fn build_retained_sizes(&self, raw: &RawData) -> crate::Result<Vec<f64>> {
+    /// Aggregate *exclusive* retained sizes by node name and type: a node's
+    /// retained size is attributed to its name bucket only when its immediate
+    /// dominator carries a different name (the same convention Chrome
+    /// DevTools uses for the "Retained size by constructor" view). This makes
+    /// the summary answer "what actually holds this memory", not just "what
+    /// has big self size".
+    pub fn retained_summary(
+        &mut self,
+        top: usize,
+        filter: Option<&str>,
+    ) -> crate::Result<HeapSnapshotSummary> {
+        self.ensure_retained()?;
+        // total sizes come from the cached full summary
+        let _ = self.stream_summary(usize::MAX, None)?;
+        let full = self.full_summary.as_ref().unwrap();
+        let raw = self.raw.as_ref().unwrap();
+        let rd = self.retained_data.as_ref().unwrap();
         let node_count = raw.meta.node_count;
-        let mut edge_starts = vec![0u32; node_count + 1];
-        let mut offset = 0u32;
-        for i in 0..node_count {
-            edge_starts[i] = offset;
-            let base = i * raw.node_field_count;
-            offset += raw.nodes[base + raw.node_offsets.edge_count];
-        }
-        edge_starts[node_count] = offset;
 
-        let mut post_order = Vec::with_capacity(node_count);
-        let mut visited = vec![false; node_count];
-        let mut stack = vec![0i64];
-        while let Some(node_idx) = stack.pop() {
-            if node_idx < 0 {
-                post_order.push((!node_idx) as usize);
+        let mut by_name: AHashMap<u32, (usize, usize)> = AHashMap::new();
+        let mut by_type: AHashMap<u32, (usize, usize)> = AHashMap::new();
+        for n in 1..node_count {
+            // node 0 is the synthetic root (name "", type "synthetic"); its
+            // retained is the whole heap plus exclusive double-counts, which
+            // is pure noise in a "by constructor" view. DevTools shows the
+            // "(GC roots)" bucket instead, which is real.
+            let retained = rd.retained[n] as usize;
+            if retained == 0 {
                 continue;
             }
-            let node_idx = node_idx as usize;
-            if visited[node_idx] {
-                continue;
+            let base = n * raw.node_field_count;
+            let name_idx = raw.nodes[base + raw.node_offsets.name];
+            let type_idx = raw.nodes[base + raw.node_offsets.type_];
+            let dom = rd.idoms[n] as usize;
+            let (dom_name, dom_type) = if dom < node_count && dom != n {
+                let dbase = dom * raw.node_field_count;
+                (
+                    raw.nodes[dbase + raw.node_offsets.name],
+                    raw.nodes[dbase + raw.node_offsets.type_],
+                )
+            } else {
+                (u32::MAX, u32::MAX)
+            };
+            if dom_name != name_idx {
+                let e = by_name.entry(name_idx).or_insert((0, 0));
+                e.0 += retained;
+                e.1 += 1;
             }
-            visited[node_idx] = true;
-            stack.push(!(node_idx as i64));
-            let start = edge_starts[node_idx] as usize;
-            let end = edge_starts[node_idx + 1] as usize;
-            let edges_vec = raw.edges.as_ref().unwrap();
-            for edge_index in start..end {
-                let base = edge_index * raw.edge_field_count;
-                let to_node =
-                    edges_vec[base + raw.edge_offsets.to_node] as usize / raw.node_field_count;
-                if to_node < node_count && !visited[to_node] {
-                    stack.push(to_node as i64);
-                }
-            }
-        }
-
-        let mut idoms = vec![-1i32; node_count];
-        idoms[0] = 0;
-
-        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); node_count];
-        for n in 0..node_count {
-            let start = edge_starts[n] as usize;
-            let end = edge_starts[n + 1] as usize;
-            let edges_vec = raw.edges.as_ref().unwrap();
-            for edge_index in start..end {
-                let base = edge_index * raw.edge_field_count;
-                let to_node =
-                    edges_vec[base + raw.edge_offsets.to_node] as usize / raw.node_field_count;
-                if to_node < node_count {
-                    preds[to_node].push(n);
-                }
+            if dom_type != type_idx {
+                let e = by_type.entry(type_idx).or_insert((0, 0));
+                e.0 += retained;
+                e.1 += 1;
             }
         }
 
-        fn intersect(idoms: &[i32], mut a: usize, mut b: usize) -> usize {
-            while a != b {
-                while a > b {
-                    a = idoms[a] as usize;
+        let filter_re = filter.and_then(|f| regex::Regex::new(f).ok());
+        let mut names: Vec<(String, TypeSummary)> = by_name
+            .into_iter()
+            .filter_map(|(idx, (size, count))| {
+                if size == 0 {
+                    return None;
                 }
-                while b > a {
-                    b = idoms[b] as usize;
-                }
-            }
-            a
-        }
-
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for &n in &post_order {
-                if n == 0 {
-                    continue;
-                }
-                let pred_list = &preds[n];
-                if pred_list.is_empty() {
-                    continue;
-                }
-                let mut new_idom: Option<usize> = None;
-                for &p in pred_list {
-                    if idoms[p] == -1 {
-                        continue;
-                    }
-                    new_idom = Some(match new_idom {
-                        None => p,
-                        Some(cur) => intersect(&idoms, cur, p),
-                    });
-                }
-                if let Some(nid) = new_idom {
-                    if idoms[n] as usize != nid {
-                        idoms[n] = nid as i32;
-                        changed = true;
+                let name = raw
+                    .strings
+                    .resolve(&raw.mmap, idx as usize)
+                    .unwrap_or_else(|| format!("<string#{}>", idx));
+                if let Some(re) = &filter_re {
+                    if !re.is_match(&name) {
+                        return None;
                     }
                 }
-            }
+                Some((name, TypeSummary { size, count }))
+            })
+            .collect();
+        names.sort_by(|a, b| b.1.size.cmp(&a.1.size));
+        if top != usize::MAX {
+            names.truncate(top);
         }
 
-        let mut retained = vec![0.0f64; node_count];
-        for i in 0..node_count {
-            let base = i * raw.node_field_count;
-            retained[i] = raw.nodes[base + raw.node_offsets.self_size] as f64;
+        let mut types: Vec<(String, TypeSummary)> = by_type
+            .into_iter()
+            .filter_map(|(idx, (size, count))| {
+                if size == 0 {
+                    return None;
+                }
+                let type_name = raw
+                    .node_types
+                    .get(idx as usize)
+                    .cloned()
+                    .unwrap_or_else(|| idx.to_string());
+                if let Some(re) = &filter_re {
+                    if !re.is_match(&type_name) {
+                        return None;
+                    }
+                }
+                Some((type_name, TypeSummary { size, count }))
+            })
+            .collect();
+        types.sort_by(|a, b| b.1.size.cmp(&a.1.size));
+        if top != usize::MAX {
+            types.truncate(top);
         }
 
-        for &n in &post_order {
-            if n == 0 {
+        Ok(HeapSnapshotSummary {
+            total_size: full.total_size,
+            total_count: full.total_count,
+            by_node_name: names.into_iter().collect(),
+            by_node_type: types.into_iter().collect(),
+        })
+    }
+
+    /// Top instances whose (case-insensitive) name contains `query`, ranked by
+    /// retained size. Powers `hprof inspect --name`.
+    pub fn search_nodes(&mut self, query: &str, top: usize) -> crate::Result<Vec<RetainedEntry>> {
+        self.ensure_retained()?;
+        let raw = self.raw.as_ref().unwrap();
+        let rd = self.retained_data.as_ref().unwrap();
+        let q = query.to_lowercase();
+        let name_offset = raw.node_offsets.name;
+
+        // Resolve each distinct name once; the string table memo clones on
+        // every resolve, which would re-copy 3.6MB source maps per node.
+        let mut name_cache: HashMap<u32, String> = HashMap::new();
+        let mut found: Vec<(usize, usize)> = Vec::new();
+        for n in 0..raw.meta.node_count {
+            let base = n * raw.node_field_count;
+            let name_idx = raw.nodes[base + name_offset];
+            let lower = name_cache.entry(name_idx).or_insert_with(|| {
+                raw.strings
+                    .resolve(&raw.mmap, name_idx as usize)
+                    .unwrap_or_default()
+                    .to_lowercase()
+            });
+            if !lower.contains(&q) {
                 continue;
             }
-            let dom = idoms[n] as usize;
-            if dom < node_count {
-                retained[dom] += retained[n];
+            let retained = rd.retained[n] as usize;
+            if retained == 0 {
+                continue;
+            }
+            found.push((n, retained));
+        }
+
+        found.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        found.truncate(top);
+
+        Ok(found
+            .into_iter()
+            .map(|(idx, retained)| {
+                let node = Self::create_node_raw(raw, idx, true);
+                RetainedEntry {
+                    node_index: idx,
+                    name: node.name,
+                    type_: node.type_,
+                    self_size: node.self_size,
+                    retained_size: retained,
+                    approximate: false,
+                }
+            })
+            .collect())
+    }
+
+    /// Resolve a DevTools node id to a record index (single scan; ids are not
+    /// stored in index order).
+    pub fn find_by_id(&mut self, id: usize) -> crate::Result<Option<usize>> {
+        self.ensure_raw()?;
+        let raw = self.raw.as_ref().unwrap();
+        let id_offset = raw.node_offsets.id;
+        for n in 0..raw.meta.node_count {
+            let base = n * raw.node_field_count;
+            if raw.nodes[base + id_offset] as usize == id {
+                return Ok(Some(n));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Retained size of a single node (drives `inspect --id` details). Forces
+    /// the dominator computation when it has not run yet.
+    pub fn retained_size_of(&mut self, node_index: usize) -> crate::Result<usize> {
+        self.ensure_retained()?;
+        let raw = self.raw.as_ref().unwrap();
+        let rd = self.retained_data.as_ref().unwrap();
+        if node_index >= raw.meta.node_count {
+            return Err(Error::NodeNotFound(node_index));
+        }
+        Ok(rd.retained[node_index] as usize)
+    }
+
+    /// The edge from `from` to `to` (bounded scan of `from`'s forward edges),
+    /// as (edge_type, property name / "[i]").
+    fn path_edge(
+        &self,
+        raw: &RawData,
+        edge_starts: &[u32],
+        from: usize,
+        to: usize,
+    ) -> Option<(String, String)> {
+        let start = edge_starts[from] as usize;
+        let end = edge_starts[from + 1] as usize;
+        for edge_index in start..end {
+            let base = edge_index * raw.edge_field_count;
+            let to_node = raw.edges.as_ref().unwrap()[base + raw.edge_offsets.to_node] as usize
+                / raw.node_field_count;
+            if to_node != to {
+                continue;
+            }
+            let type_idx = raw.edges.as_ref().unwrap()[base + raw.edge_offsets.type_] as usize;
+            let type_ = raw
+                .edge_types
+                .get(type_idx)
+                .cloned()
+                .unwrap_or_else(|| type_idx.to_string());
+            let name_or_index =
+                raw.edges.as_ref().unwrap()[base + raw.edge_offsets.name_or_index] as usize;
+            let name = if type_ == "element" {
+                name_or_index.to_string()
+            } else {
+                raw.strings
+                    .resolve(&raw.mmap, name_or_index)
+                    .unwrap_or_else(|| format!("#{}", name_or_index))
+            };
+            return Some((type_, name));
+        }
+        None
+    }
+
+    /// Shortest path from the GC root to `node_index`, following incoming
+    /// edges (BFS over the reverse CSR). Returns `found: false` when the node
+    /// is unreachable from the root within `max_depth` hops.
+    pub fn shortest_path(
+        &mut self,
+        node_index: usize,
+        max_depth: usize,
+    ) -> crate::Result<ShortestPath> {
+        self.ensure_retained()?;
+        let raw = self.raw.as_ref().unwrap();
+        let rd = self.retained_data.as_ref().unwrap();
+        let node_count = raw.meta.node_count;
+        if node_index >= node_count {
+            return Err(Error::NodeNotFound(node_index));
+        }
+        let target_pre = rd.preorder[node_index];
+        if target_pre == u32::MAX {
+            // unreachable from root — no path exists
+            return Ok(ShortestPath {
+                found: false,
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            });
+        }
+
+        // BFS from the target over incoming edges (pre space) until root.
+        let n = node_count;
+        let mut parent: Vec<u32> = vec![u32::MAX; n];
+        let mut depth = vec![0u32; n];
+        parent[target_pre as usize] = target_pre;
+        let mut queue: Vec<u32> = vec![target_pre];
+        let mut head = 0usize;
+        let mut found = false;
+        while head < queue.len() {
+            let w = queue[head] as usize;
+            head += 1;
+            if w == 0 {
+                found = true;
+                break;
+            }
+            let d = depth[w];
+            if d >= max_depth as u32 {
+                continue;
+            }
+            for &s in &rd.rev_sources[rd.rev_starts[w] as usize..rd.rev_starts[w + 1] as usize] {
+                let s = s as usize;
+                if parent[s] == u32::MAX {
+                    parent[s] = w as u32;
+                    depth[s] = d + 1;
+                    queue.push(s as u32);
+                }
             }
         }
 
-        Ok(retained)
+        if !found {
+            return Ok(ShortestPath {
+                found: false,
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            });
+        }
+
+        // reconstruct: root -> ... -> target via parent pointers (pre space),
+        // mapped to node indices
+        let mut pres: Vec<usize> = vec![0usize];
+        let mut cur = 0usize;
+        while cur != target_pre as usize {
+            cur = parent[cur] as usize;
+            pres.push(cur);
+        }
+
+        let edge_starts = self.edge_starts.as_ref().unwrap();
+        let nodes = pres
+            .iter()
+            .map(|&w| {
+                let i = rd.vertex[w] as usize;
+                let node = Self::create_node_raw(raw, i, true);
+                PathNode {
+                    index: i,
+                    id: node.id,
+                    name: node.name,
+                    type_: node.type_,
+                    self_size: node.self_size,
+                }
+            })
+            .collect();
+        let mut edges = Vec::with_capacity(pres.len().saturating_sub(1));
+        for w in pres.windows(2) {
+            let from = rd.vertex[w[0]] as usize;
+            let to = rd.vertex[w[1]] as usize;
+            edges.push(
+                self.path_edge(raw, edge_starts, from, to)
+                    .map(|(type_, name)| PathEdge { type_, name })
+                    .unwrap_or_else(|| PathEdge {
+                        type_: String::new(),
+                        name: String::new(),
+                    }),
+            );
+        }
+
+        Ok(ShortestPath {
+            found: true,
+            nodes,
+            edges,
+        })
     }
 
     pub fn node_field_count(&self) -> Option<usize> {

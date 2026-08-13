@@ -11,11 +11,18 @@ CLI + Web UI tool for analyzing V8 memory profiles:
 ## Architecture
 
 ```
+crates/
+├── hprof-core/   # Парсинг и анализ (Rust)
+├── hprof-cli/    # CLI утилита hprof (Rust, нативно против hprof-core)
+└── hprof-c/      # cdylib FFI-мост (для будущего UI)
 packages/
-├── core/      # Парсинг и анализ (нет зависимостей на FS кроме bun/node)
-├── cli/       # CLI утилита hprof
-└── ui/        # HTTP-сервер + SPA фронтенд
+├── core/         # TS FFI-биндинги (UI отложен)
+└── ui/           # HTTP-сервер + SPA фронтенд (отложен)
 ```
+
+CLI полностью на Rust — без FFI-прослойки: `analyze`, `diff`, `dot`,
+`list`, `inspect`, `--retained`. UI-часть (packages/ui + packages/core +
+hprof-c) сохранена, но не подключена — вернётся позже.
 
 ---
 
@@ -73,7 +80,11 @@ packages/
 
 ---
 
-## Phase 2: `@hprof/cli` — CLI
+## Phase 2: CLI (портирован в `crates/hprof-cli` на Rust)
+
+> Первоначальный Bun/TS CLI (`packages/cli`) удалён; команды и JSON-контракты
+> портированы один-в-один в нативный Rust CLI (`cargo build --release` →
+> `target/release/hprof`). Пункты ниже отражают исходный план.
 
 ### 2.1 Базовая структура (`src/cli.ts`)
 

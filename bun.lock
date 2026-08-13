@@ -17,17 +17,6 @@
         "@hprof/core": "workspace:*",
       },
     },
-    "packages/cli": {
-      "name": "@hprof/cli",
-      "version": "0.1.0",
-      "bin": {
-        "hprof": "src/cli.ts",
-      },
-      "dependencies": {
-        "@hprof/core": "workspace:*",
-        "@hprof/ui": "workspace:*",
-      },
-    },
     "packages/core": {
       "name": "@hprof/core",
       "version": "0.1.0",
@@ -87,8 +76,6 @@
     },
   },
   "packages": {
-    "@hprof/cli": ["@hprof/cli@workspace:packages/cli"],
-
     "@hprof/core": ["@hprof/core@workspace:packages/core"],
 
     "@hprof/hprof-bin-darwin-arm64": ["@hprof/hprof-bin-darwin-arm64@workspace:packages/hprof-bin-darwin-arm64"],

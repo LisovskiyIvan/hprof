@@ -89,7 +89,6 @@ fn read_num(data: &[u8], pos: &mut usize) -> u64 {
     v
 }
 
-
 /// Decode one JSON string from `raw[start..end]` (escape sequences included).
 fn decode_json_string(raw: &[u8]) -> String {
     let mut s: Vec<u8> = Vec::with_capacity(raw.len());
@@ -246,7 +245,10 @@ fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<Timelin
         let mut node_vals = [0u32; 16];
         while field < node_field_count {
             // skip commas/whitespace, stop at ']'
-            while pos < nodes_data.len() && nodes_data[pos] != b']' && !nodes_data[pos].is_ascii_digit() {
+            while pos < nodes_data.len()
+                && nodes_data[pos] != b']'
+                && !nodes_data[pos].is_ascii_digit()
+            {
                 pos += 1;
             }
             if pos >= nodes_data.len() || nodes_data[pos] == b']' {
@@ -269,7 +271,8 @@ fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<Timelin
 
     // ---- strings table ----
     let strings_marker = b"\"strings\":[";
-    let strings_start = find_marker(data, strings_marker).ok_or(Error::HeaderParseFailed)? + strings_marker.len();
+    let strings_start =
+        find_marker(data, strings_marker).ok_or(Error::HeaderParseFailed)? + strings_marker.len();
     let strings_end = find_array_end(data, strings_start - 1);
 
     let mut string_spans: Vec<(u32, u32)> = Vec::with_capacity(1 << 16);
@@ -320,7 +323,7 @@ fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<Timelin
     let tt_data = &data[tt_start - 1..=tt_end]; // includes the root '['
     let mut trace_nodes: Vec<TraceNode> = Vec::new();
     let mut tpos = 1usize; // past the root '['
-    // root node: fields are [id, function_info_index, count, size, children]
+                           // root node: fields are [id, function_info_index, count, size, children]
     let root_id = read_num(tt_data, &mut tpos) as u32;
     let root_fii = read_num(tt_data, &mut tpos) as u32;
     let root_count = read_num(tt_data, &mut tpos) as u32;
@@ -346,7 +349,8 @@ fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<Timelin
 
     // ---- samples: flat pairs (timestamp_us, last_assigned_id) ----
     let smp_marker = b"\"samples\":[";
-    let smp_start = find_marker(data, smp_marker).ok_or(Error::HeaderParseFailed)? + smp_marker.len();
+    let smp_start =
+        find_marker(data, smp_marker).ok_or(Error::HeaderParseFailed)? + smp_marker.len();
     let smp_end = find_array_end(data, smp_start - 1);
     let smp_nums = crate::heapsnapshot::parse_numbers_fast(&data[smp_start..=smp_end]);
     let mut samples: Vec<(u64, u64)> = Vec::with_capacity(smp_nums.len() / 2);
@@ -364,7 +368,7 @@ fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<Timelin
         names,
         sizes,
         tids,
-        type_names: node_types.iter().cloned().collect(),
+        type_names: node_types.to_vec(),
         total_allocated,
         strings_start,
         string_spans,
@@ -381,10 +385,8 @@ fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<Timelin
 // ---------------------------------------------------------------------------
 
 fn resolve_string(data: &mut TimelineData, idx: u32) -> String {
-    if let Some(cached) = data.string_memo.get(idx as usize) {
-        if let Some(s) = cached {
-            return s.clone();
-        }
+    if let Some(Some(s)) = data.string_memo.get(idx as usize) {
+        return s.clone();
     }
     let span = data.string_spans.get(idx as usize).cloned();
     let decoded = match span {
@@ -551,8 +553,10 @@ impl HeapTimeline {
                 None => e.2.push((ty, size, 1)),
             }
         }
-        let mut sorted: Vec<(u32, u64, u64)> = agg.iter().map(|(&k, &(s, c, _))| (k, s, c)).collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut sorted: Vec<(u32, u64, u64)> =
+            agg.iter().map(|(&k, &(s, c, _))| (k, s, c)).collect();
+        // size desc, ties by name index so the cutoff is deterministic
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         let total_size = data.total_allocated;
         let total_count = data.node_count;
@@ -651,7 +655,14 @@ impl HeapTimeline {
                 }
             })
             .collect();
-        entries.sort_by(|a, b| b.size.cmp(&a.size));
+        // size desc, ties broken by stack signature so repeated runs (and
+        // the cutoff at `top`) are deterministic — HashMap iteration order
+        // is not
+        entries.sort_by(|a, b| {
+            b.size
+                .cmp(&a.size)
+                .then_with(|| stack_signature(&a.stack).cmp(&stack_signature(&b.stack)))
+        });
         entries.truncate(top);
         Ok(TimelineStacksResult {
             total_size: total_size as usize,
@@ -666,8 +677,8 @@ impl HeapTimeline {
         name_re: &str,
         top: Option<usize>,
     ) -> crate::Result<TimelineNameStacksResult> {
-        let re = Regex::new(name_re)
-            .map_err(|e| Error::Other(format!("invalid name regex: {e}")))?;
+        let re =
+            Regex::new(name_re).map_err(|e| Error::Other(format!("invalid name regex: {e}")))?;
         let top = top.unwrap_or(10);
 
         // find matching name indices (decode each distinct name once)
@@ -728,7 +739,11 @@ impl HeapTimeline {
                 stack,
             })
             .collect();
-        entries.sort_by(|a, b| b.size.cmp(&a.size));
+        entries.sort_by(|a, b| {
+            b.size
+                .cmp(&a.size)
+                .then_with(|| stack_signature(&a.stack).cmp(&stack_signature(&b.stack)))
+        });
         entries.truncate(top);
         Ok(TimelineNameStacksResult {
             name: name_re.to_string(),
@@ -766,10 +781,8 @@ impl HeapTimeline {
             e.0 += size;
             e.1 += 1;
         }
-        let mut sorted: Vec<(u32, u64, u64)> = agg
-            .into_iter()
-            .map(|(k, (s, c))| (k, s, c))
-            .collect();
+        let mut sorted: Vec<(u32, u64, u64)> =
+            agg.into_iter().map(|(k, (s, c))| (k, s, c)).collect();
         sorted.sort_by(|a, b| b.1.cmp(&a.1));
         let mut out = Vec::new();
         for (name_idx, size, count) in sorted {
@@ -789,4 +802,16 @@ impl HeapTimeline {
         }
         Ok(out)
     }
+}
+
+/// Stable identity for a stack trace (used for deterministic tie-breaking).
+fn stack_signature(stack: &[TimelineStackFrame]) -> String {
+    let mut sig = String::with_capacity(stack.len() * 32);
+    for f in stack {
+        sig.push_str(&f.name);
+        sig.push(0x1f as char);
+        sig.push_str(&f.script);
+        sig.push(0x1e as char);
+    }
+    sig
 }

@@ -84,6 +84,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hprof-cli"
+version = "0.1.0"
+dependencies = [
+ "hprof-core",
+ "regex",
+ "serde_json",
+]
+
+[[package]]
 name = "hprof-core"
 version = "0.1.0"
 dependencies = [
