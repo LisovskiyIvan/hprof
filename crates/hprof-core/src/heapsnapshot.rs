@@ -150,11 +150,10 @@ impl StringTable {
 
     /// All strings containing `query` (case-insensitive), up to `limit`.
     pub fn search(&self, mmap: &Mmap, query: &str, limit: usize) -> Vec<(usize, String)> {
-        let q = query.to_lowercase();
         let mut out = Vec::new();
         for idx in 0..self.spans.len() {
             if let Some(v) = self.resolve(mmap, idx) {
-                if v.to_lowercase().contains(&q) {
+                if contains_ci(&v, query) {
                     out.push((idx, v));
                     if out.len() >= limit {
                         break;
@@ -227,6 +226,51 @@ pub(crate) fn decode_json_string(raw: &[u8]) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&s).into_owned()
+}
+
+/// ASCII-fast, allocation-free case-insensitive substring search. Non-ASCII
+/// input falls back to a lowercased comparison. `needle` is the raw (not
+/// pre-lowercased) query.
+#[inline]
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    if hay.is_ascii() && needle.is_ascii() {
+        let h = hay.as_bytes();
+        let n = needle.as_bytes();
+        if n.is_empty() {
+            return true;
+        }
+        if n.len() > h.len() {
+            return false;
+        }
+        let n0 = n[0].to_ascii_lowercase();
+        let mut i = 0usize;
+        while i + n.len() <= h.len() {
+            if h[i].to_ascii_lowercase() == n0 {
+                let mut j = 1usize;
+                while j < n.len() && h[i + j].eq_ignore_ascii_case(&n[j]) {
+                    j += 1;
+                }
+                if j == n.len() {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
+    } else {
+        hay.to_lowercase().contains(&needle.to_lowercase())
+    }
+}
+
+/// ASCII-fast, allocation-free case-insensitive equality (non-ASCII input
+/// falls back to lowercased comparison, matching the pre-fold behaviour).
+#[inline]
+fn eq_ci(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a.to_lowercase() == b.to_lowercase()
+    }
 }
 
 impl HeapSnapshot {
@@ -564,13 +608,15 @@ impl HeapSnapshot {
         let wanted = (page + 1) * page_size;
         let mut total = 0usize;
 
-        let query_lower;
+        // keep the query in its original case — `contains_ci` folds ASCII
+        // without allocating, avoiding a lowercased copy per scanned node
+        let query_orig;
         let q_match = if let Some(q) = options.query {
             if q.is_empty() {
                 None
             } else {
-                query_lower = q.to_lowercase();
-                Some(&query_lower[..])
+                query_orig = q;
+                Some(query_orig)
             }
         } else {
             None
@@ -680,7 +726,7 @@ impl HeapSnapshot {
             };
 
             if let Some(ql) = q_match {
-                if !name.to_lowercase().contains(ql) {
+                if !contains_ci(&name, ql) {
                     continue;
                 }
             }
@@ -1319,13 +1365,15 @@ impl HeapSnapshot {
         self.ensure_retained()?;
         let raw = self.raw.as_ref().unwrap();
         let rd = self.retained_data.as_ref().unwrap();
-        let q = query.to_lowercase();
 
         // Pre-resolve every distinct node name once, in parallel. The string
         // memo is a RefCell (not Sync), so parallel chunks decode through the
         // raw byte spans instead. Serial decode+lowercase through the memo was
         // the dominant cost of find/search on multi-GB snapshots (measurably
-        // slower than a full `analyze`).
+        // slower than a full `analyze`); matching now folds case on the fly
+        // (`contains_ci`) without allocating a lowercased copy per name — the
+        // snapshots contain multi-megabyte inline strings that make that
+        // allocation dominant.
         let nodes = &raw.nodes;
         let nfc = raw.node_field_count;
         let name_off = raw.node_offsets.name;
@@ -1349,7 +1397,7 @@ impl HeapSnapshot {
                         .get(idx as usize)
                         .map(|&(s, e)| decode_json_string(&mmap_bytes[sbase + s as usize..sbase + e as usize]))
                         .unwrap_or_default();
-                    (idx, decoded.to_lowercase())
+                    (idx, decoded)
                 })
                 .collect();
             pairs.into_iter().collect()
@@ -1365,8 +1413,7 @@ impl HeapSnapshot {
                 for n in chunk {
                     let base = n * nfc;
                     let name_idx = nodes[base + name_off];
-                    let lower = &name_cache[&name_idx];
-                    if !lower.contains(&q) {
+                    if !contains_ci(&name_cache[&name_idx], query) {
                         continue;
                     }
                     let retained = retained[n] as usize;
@@ -1615,8 +1662,7 @@ impl HeapSnapshot {
     pub fn find_nodes(&mut self, query: &NameQuery) -> crate::Result<Vec<NameMatch>> {
         self.ensure_raw()?;
         let raw = self.raw.as_ref().unwrap();
-        let q = query.name.to_lowercase();
-        if q.is_empty() {
+        if query.name.is_empty() {
             return Ok(Vec::new());
         }
         let nodes = &raw.nodes;
@@ -1637,8 +1683,9 @@ impl HeapSnapshot {
             }
             set.into_iter().collect()
         };
-        // store lowercased names so exact/substring comparisons against the
-        // lowercased query are case-insensitive (search_nodes does the same)
+        // store the original decoded names; case-insensitive comparisons fold
+        // on the fly (`contains_ci` / `eq_ci`), avoiding a lowercased copy of
+        // every distinct name (multi-megabyte inline strings included)
         let name_cache: HashMap<u32, String> = {
             // capture only Sync pieces (StringTable itself holds a RefCell)
             let spans: &[(u32, u32)] = &raw.strings.spans;
@@ -1651,7 +1698,7 @@ impl HeapSnapshot {
                         .get(idx as usize)
                         .map(|&(s, e)| decode_json_string(&mmap_bytes[sbase + s as usize..sbase + e as usize]))
                         .unwrap_or_default();
-                    (idx, decoded.to_lowercase())
+                    (idx, decoded)
                 })
                 .collect();
             pairs.into_iter().collect()
@@ -1659,8 +1706,11 @@ impl HeapSnapshot {
 
         let exact = query.exact;
         let min_self = query.min_self;
-        let type_filter = query.type_filter.as_ref().map(|t| t.to_lowercase());
         let limit = query.limit;
+        let query_name = query.name.as_str();
+        // the type filter folds case on the fly (eq_ci) instead of
+        // lowercasing the type string of every scanned node
+        let type_filter = query.type_filter.as_deref();
         // read-only slices for the parallel closure (RawData is !Sync — its
         // string memo is a RefCell — so only Sync fields may be captured)
         let node_types = raw.node_types.as_slice();
@@ -1674,7 +1724,11 @@ impl HeapSnapshot {
                 for n in chunk {
                     let base = n * nfc;
                     let name = &name_cache[&nodes[base + name_off]];
-                    let matches = if exact { name == &q } else { name.contains(&q) };
+                    let matches = if exact {
+                        eq_ci(name, query_name)
+                    } else {
+                        contains_ci(name, query_name)
+                    };
                     if !matches {
                         continue;
                     }
@@ -1682,12 +1736,12 @@ impl HeapSnapshot {
                     if self_size < min_self {
                         continue;
                     }
-                    if let Some(tf) = &type_filter {
+                    if let Some(tf) = type_filter {
                         let t = node_types
                             .get(nodes[base + type_off] as usize)
-                            .map(|s| s.to_lowercase())
-                            .unwrap_or_default();
-                        if &t != tf {
+                            .map(|s| s.as_str())
+                            .unwrap_or("");
+                        if !eq_ci(t, tf) {
                             continue;
                         }
                     }
@@ -2585,6 +2639,33 @@ mod tests {
             decode_json_string("x\\uD83D\\uDE00y".as_bytes()),
             "x\u{1F600}y"
         );
+    }
+
+    #[test]
+    fn contains_ci_matches_mixed_case_needles() {
+        // regression: the sliding window once lowercased only the haystack
+        // bytes, so a mixed-case needle like "vECTOR3" matched almost nothing
+        assert!(contains_ci("new BABYLON.Vector3(0)", "vECTOR3"));
+        assert!(contains_ci("vector3", "VECTOR3"));
+        assert!(contains_ci("VECTOR3", "vector3"));
+        assert!(contains_ci("Vector3", "VeCtOr3"));
+        assert!(contains_ci("abc", ""));
+        assert!(!contains_ci("Vector", "vector3"));
+        assert!(!contains_ci("vec", "vector3"));
+        // non-ASCII falls back to Unicode-aware comparison
+        assert!(contains_ci("Функция (ФУНКЦИЯ)", "функция"));
+        assert!(!contains_ci("Функция", "вектор"));
+    }
+
+    #[test]
+    fn eq_ci_ascii_and_unicode() {
+        assert!(eq_ci("RenderingGroup", "renderinggroup"));
+        assert!(eq_ci("object", "OBJECT"));
+        assert!(!eq_ci("object", "objects"));
+        assert!(eq_ci("Функция", "функция"));
+        assert!(!eq_ci("Функция", "вектор"));
+        // empty strings are equal
+        assert!(eq_ci("", ""));
     }
 
     #[test]
