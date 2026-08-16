@@ -25,7 +25,7 @@ use std::fs;
 use memmap2::Mmap;
 use regex::Regex;
 
-use crate::heapsnapshot::{find_array_end, find_marker};
+use crate::heapsnapshot::{decode_json_string, find_array_end, find_marker};
 use crate::types::*;
 use rayon::prelude::*;
 
@@ -88,66 +88,6 @@ fn read_num(data: &[u8], pos: &mut usize) -> u64 {
         *pos += 1;
     }
     v
-}
-
-/// Decode one JSON string from `raw[start..end]` (escape sequences included).
-fn decode_json_string(raw: &[u8]) -> String {
-    let mut s: Vec<u8> = Vec::with_capacity(raw.len());
-    let mut i = 0usize;
-    let len = raw.len();
-    while i < len {
-        let c = raw[i];
-        if c == b'\\' && i + 1 < len {
-            match raw[i + 1] {
-                b'"' => s.push(b'"'),
-                b'\\' => s.push(b'\\'),
-                b'/' => s.push(b'/'),
-                b'b' => s.push(8),
-                b'f' => s.push(12),
-                b'n' => s.push(b'\n'),
-                b'r' => s.push(b'\r'),
-                b't' => s.push(b'\t'),
-                b'u' => {
-                    let hexv = |idx: usize| -> u16 {
-                        let mut v: u16 = 0;
-                        for &b in &raw[idx..idx + 4] {
-                            v = v * 16
-                                + match b {
-                                    b'0'..=b'9' => (b - b'0') as u16,
-                                    b'a'..=b'f' => (b - b'a' + 10) as u16,
-                                    b'A'..=b'F' => (b - b'A' + 10) as u16,
-                                    _ => 0,
-                                };
-                        }
-                        v
-                    };
-                    let hi = i + 2;
-                    let mut cp: u32 = hexv(hi) as u32;
-                    i += 6;
-                    if (0xD800..0xDC00).contains(&cp)
-                        && i + 5 < len
-                        && raw[i + 1] == b'\\'
-                        && raw[i + 2] == b'u'
-                    {
-                        let lo = hexv(i + 3) as u32;
-                        i += 6;
-                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                    }
-                    if let Some(ch) = char::from_u32(cp) {
-                        let mut buf = [0u8; 4];
-                        s.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                    }
-                    continue;
-                }
-                other => s.push(other),
-            }
-            i += 2;
-            continue;
-        }
-        s.push(c);
-        i += 1;
-    }
-    String::from_utf8_lossy(&s).into_owned()
 }
 
 // ---------------------------------------------------------------------------

@@ -59,7 +59,9 @@ fn print_pair_diff(baseline_path: &str, profile_path: &str, b: &OwnerAnalysis, p
     keys.sort();
     keys.dedup();
 
-    let mut rows: Vec<Vec<String>> = Vec::new();
+    // keep numeric deltas so the table sorts by real values, not formatted
+    // strings; order by |self delta| desc, then |count delta|, then chain
+    let mut data: Vec<(i64, i64, String)> = Vec::new();
     for k in &keys {
         let bg = b.groups.iter().find(|g| &g.chain == *k);
         let pg = p.groups.iter().find(|g| &g.chain == *k);
@@ -72,21 +74,32 @@ fn print_pair_diff(baseline_path: &str, profile_path: &str, b: &OwnerAnalysis, p
         let bcount = bg.map(|g| g.count).unwrap_or(0);
         let pcount = pg.map(|g| g.count).unwrap_or(0);
         let dcount = pcount as i64 - bcount as i64;
-        rows.push(vec![
-            if dself >= 0 {
-                red(&format!("+{}", format_bytes(dself as usize)))
-            } else {
-                green(&format!("-{}", format_bytes(dself.unsigned_abs() as usize)))
-            },
-            if dcount >= 0 {
-                red(&format!("+{dcount}"))
-            } else {
-                green(&format!("{dcount}"))
-            },
-            k.to_string(),
-        ]);
+        data.push((dself, dcount, k.to_string()));
     }
-    rows.sort_by(|a, b| b[1].cmp(&a[1]).then_with(|| a[2].cmp(&b[2])));
+    data.sort_by(|a, b| {
+        b.0.unsigned_abs()
+            .cmp(&a.0.unsigned_abs())
+            .then_with(|| b.1.unsigned_abs().cmp(&a.1.unsigned_abs()))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    let rows: Vec<Vec<String>> = data
+        .into_iter()
+        .map(|(dself, dcount, chain)| {
+            vec![
+                if dself >= 0 {
+                    red(&format!("+{}", format_bytes(dself as usize)))
+                } else {
+                    green(&format!("-{}", format_bytes(dself.unsigned_abs() as usize)))
+                },
+                if dcount >= 0 {
+                    red(&format!("+{dcount}"))
+                } else {
+                    green(&format!("{dcount}"))
+                },
+                chain,
+            ]
+        })
+        .collect();
     if rows.is_empty() {
         return;
     }

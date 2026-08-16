@@ -197,15 +197,18 @@ pub(crate) fn decode_json_string(raw: &[u8]) -> String {
                         }
                         v
                     };
-                    let hi = i + 2;
-                    let mut cp: u32 = hexv(hi) as u32;
+                    let mut cp: u32 = hexv(i + 2) as u32;
+                    // i += 6 lands on the byte right after the 4 hex digits,
+                    // which is where a following low-surrogate '\uXXXX' would
+                    // begin (the old code checked raw[i+1]/raw[i+2]/hexv(i+3),
+                    // which skipped the low surrogate and dropped both chars)
                     i += 6;
                     if (0xD800..0xDC00).contains(&cp)
                         && i + 5 < len
-                        && raw[i + 1] == b'\\'
-                        && raw[i + 2] == b'u'
+                        && raw[i] == b'\\'
+                        && raw[i + 1] == b'u'
                     {
-                        let lo = hexv(i + 3) as u32;
+                        let lo = hexv(i + 2) as u32;
                         i += 6;
                         cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                     }
@@ -368,7 +371,21 @@ impl HeapSnapshot {
                     (open + 1, end)
                 }
             };
-            parse_numbers_par(&raw.mmap[start..=end])
+            let mut edges = parse_numbers_par(&raw.mmap[start..=end]);
+            // `to_node` is written by V8 as the absolute record base
+            // (node_index * node_field_count). Normalize it to a plain node
+            // index in place (done once at parse time, no extra allocation) so
+            // every consumer — including the hottest loops (DFS, reverse-CSR,
+            // parent map) — skips a per-edge division.
+            let nfc = raw.node_field_count as u32;
+            let to_off = raw.edge_offsets.to_node;
+            let efc = raw.edge_field_count;
+            for rec in edges.chunks_mut(efc) {
+                if rec.len() > to_off {
+                    rec[to_off] /= nfc;
+                }
+            }
+            edges
         };
         self.raw.as_mut().unwrap().edges = Some(edges);
         Ok(())
@@ -773,8 +790,7 @@ impl HeapSnapshot {
             let base = edge_index * raw.edge_field_count;
             let type_idx = edges_vec[base + raw.edge_offsets.type_] as usize;
             let name_or_index_val = edges_vec[base + raw.edge_offsets.name_or_index] as usize;
-            let to_node =
-                edges_vec[base + raw.edge_offsets.to_node] as usize / raw.node_field_count;
+            let to_node = edges_vec[base + raw.edge_offsets.to_node] as usize;
 
             let edge_type = raw
                 .edge_types
@@ -865,8 +881,7 @@ impl HeapSnapshot {
             let mut descended = false;
             while e < end {
                 let base = e * raw.edge_field_count;
-                let to_node = raw.edges.as_ref().unwrap()[base + raw.edge_offsets.to_node] as usize
-                    / raw.node_field_count;
+                let to_node = raw.edges.as_ref().unwrap()[base + raw.edge_offsets.to_node] as usize;
                 if to_node < node_count && preorder[to_node] == u32::MAX {
                     next_edge[v_node as usize] = (e + 1) as u32;
                     pre += 1;
@@ -883,6 +898,9 @@ impl HeapSnapshot {
                 stack.pop();
             }
         }
+        // the per-node edge cursor is dead after the DFS — free it now rather
+        // than holding ~104MB through the CSR + Lengauer–Tarjan phases
+        drop(next_edge);
 
         // flat reverse CSR in pre space: node with pre `w` is referenced by
         // sources rev_sources[rev_starts[w]..rev_starts[w+1]] (pre numbers).
@@ -899,8 +917,7 @@ impl HeapSnapshot {
             let end = edge_starts[n + 1] as usize;
             for edge_index in start..end {
                 let base = edge_index * raw.edge_field_count;
-                let to_node = raw.edges.as_ref().unwrap()[base + raw.edge_offsets.to_node] as usize
-                    / raw.node_field_count;
+                let to_node = raw.edges.as_ref().unwrap()[base + raw.edge_offsets.to_node] as usize;
                 if to_node < node_count && preorder[to_node] != u32::MAX {
                     counts[preorder[to_node] as usize] += 1;
                 }
@@ -909,6 +926,7 @@ impl HeapSnapshot {
         // reuse `counts` as the write cursor so no second 105MB scratch vec
         // is needed: prefix-sum it in place into `rev_starts` afterwards.
         let mut rev_starts = counts.clone();
+        rev_starts.push(0); // rev_starts has one extra slot for the total
         let mut prefix = 0u32;
         for n in 0..reachable {
             let c = rev_starts[n];
@@ -926,8 +944,7 @@ impl HeapSnapshot {
             let end = edge_starts[n + 1] as usize;
             for edge_index in start..end {
                 let base = edge_index * raw.edge_field_count;
-                let to_node = raw.edges.as_ref().unwrap()[base + raw.edge_offsets.to_node] as usize
-                    / raw.node_field_count;
+                let to_node = raw.edges.as_ref().unwrap()[base + raw.edge_offsets.to_node] as usize;
                 if to_node < node_count && preorder[to_node] != u32::MAX {
                     let w = preorder[to_node] as usize;
                     rev_sources[cursor[w] as usize] = preorder[n];
@@ -1030,6 +1047,17 @@ impl HeapSnapshot {
                 idom_pre[wu] = idom_pre[idom_pre[wu] as usize];
             }
         }
+        // Lengauer–Tarjan scratch is dead: free the ~600MB of semi/label/
+        // ancestor/bucket arrays (plus dfs_parent) before allocating the
+        // node-space retained/idoms, so those land in recycled memory instead
+        // of growing the process further.
+        drop(dfs_parent);
+        drop(semi);
+        drop(label);
+        drop(ancestor);
+        drop(bucket_head);
+        drop(bucket_next);
+        drop(scratch);
 
         // retained = self + dominated subtree, accumulated in NODE space (one
         // array instead of a pre-space buffer + a remap copy). Children (higher
@@ -1410,8 +1438,7 @@ impl HeapSnapshot {
         let end = edge_starts[from + 1] as usize;
         for edge_index in start..end {
             let base = edge_index * raw.edge_field_count;
-            let to_node = raw.edges.as_ref().unwrap()[base + raw.edge_offsets.to_node] as usize
-                / raw.node_field_count;
+            let to_node = raw.edges.as_ref().unwrap()[base + raw.edge_offsets.to_node] as usize;
             if to_node != to {
                 continue;
             }
@@ -1555,7 +1582,6 @@ impl HeapSnapshot {
         let raw = self.raw.as_ref().unwrap();
         let edge_starts = self.edge_starts.as_ref().unwrap();
         let node_count = raw.meta.node_count;
-        let nfc = raw.node_field_count;
         let edges = raw.edges.as_ref().unwrap();
 
         let mut index = vec![u32::MAX; node_count];
@@ -1566,7 +1592,7 @@ impl HeapSnapshot {
             let end = edge_starts[n + 1] as usize;
             for edge_index in start..end {
                 let base = edge_index * raw.edge_field_count;
-                let to_node = edges[base + raw.edge_offsets.to_node] as usize / nfc;
+                let to_node = edges[base + raw.edge_offsets.to_node] as usize;
                 if to_node < node_count && index[to_node] == u32::MAX {
                     index[to_node] = n as u32;
                     edge_type[to_node] = edges[base + raw.edge_offsets.type_];
@@ -1732,7 +1758,7 @@ impl HeapSnapshot {
                 .cloned()
                 .unwrap_or_else(|| type_idx.to_string());
             let name_or_index = edges[base + raw.edge_offsets.name_or_index] as usize;
-            let to_node = edges[base + raw.edge_offsets.to_node] as usize / nfc;
+            let to_node = edges[base + raw.edge_offsets.to_node] as usize;
             let name = if edge_type == "element" {
                 format!("[{name_or_index}]")
             } else {
@@ -1798,14 +1824,13 @@ impl HeapSnapshot {
 
         let edge_starts = self.edge_starts.as_ref().unwrap();
         let edges = raw.edges.as_ref().unwrap();
-        let nfc = raw.node_field_count;
         let mut out = Vec::new();
         for n in 0..raw.meta.node_count {
             let start = edge_starts[n] as usize;
             let end = edge_starts[n + 1] as usize;
             for edge_index in start..end {
                 let base = edge_index * raw.edge_field_count;
-                let to_node = edges[base + raw.edge_offsets.to_node] as usize / nfc;
+            let to_node = edges[base + raw.edge_offsets.to_node] as usize;
                 if to_node != node_index {
                     continue;
                 }
@@ -2506,3 +2531,191 @@ pub fn parse_numbers_par(data: &[u8]) -> Vec<u32> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn type_summary(size: usize, count: usize) -> TypeSummary {
+        TypeSummary { size, count }
+    }
+
+    // -------------------------------------------------------------------
+    // Low-level parsers
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parse_numbers_fast_ignores_separators() {
+        let data = b"0, 1,\n2,\t3,456 ,789";
+        assert_eq!(parse_numbers_fast(data), vec![0, 1, 2, 3, 456, 789]);
+    }
+
+    #[test]
+    fn parse_numbers_fast_stops_at_bracket() {
+        let data = b"5, 7] 9, 11";
+        assert_eq!(parse_numbers_fast(data), vec![5, 7]);
+    }
+
+    #[test]
+    fn parse_numbers_par_matches_serial_across_chunk_boundaries() {
+        // > 1MiB of digits so the parallel path (splits at commas) triggers
+        let mut s = String::with_capacity(2 << 20);
+        for i in 0..250_000u32 {
+            s.push_str(&i.to_string());
+            s.push(',');
+        }
+        let data = s.as_bytes();
+        let fast = parse_numbers_fast(data);
+        let par = parse_numbers_par(data);
+        assert_eq!(par, fast);
+        assert_eq!(par.len(), 250_000);
+    }
+
+    #[test]
+    fn decode_json_string_plain_and_escapes() {
+        assert_eq!(decode_json_string(b"hello"), "hello");
+        assert_eq!(decode_json_string(b"a\\nb\\t\\\\c\\\"d\\/e"), "a\nb\t\\c\"d/e");
+        assert_eq!(decode_json_string(b"\\u00410\\u0fff"), "A0\u{0fff}");
+    }
+
+    #[test]
+    fn decode_json_string_surrogate_pair() {
+        // U+1F600 "😀" is encoded as the \uD83D\uDE00 pair
+        assert_eq!(
+            decode_json_string("x\\uD83D\\uDE00y".as_bytes()),
+            "x\u{1F600}y"
+        );
+    }
+
+    #[test]
+    fn find_array_end_respects_nesting_and_string_content() {
+        // nested arrays
+        assert_eq!(find_array_end(b"[[1,2],[3,4]]\"x\"", 0), 12);
+        // brackets inside strings (incl. escaped quotes) must be ignored
+        let d = b"[\"a]\", \"b\\\"[\"]";
+        assert_eq!(find_array_end(d, 0), 13);
+    }
+
+    #[test]
+    fn find_matching_brace_nested_and_strings() {
+        let data = br#"{"a":{"b":1},"c":"}"}"#;
+        let start = 0usize;
+        // the '}' inside the "c" string must not close the object; the final
+        // brace is at index 20
+        assert_eq!(
+            find_matching_brace(std::str::from_utf8(data).unwrap(), start),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn find_marker_basic() {
+        assert_eq!(find_marker(b"xx\"nodes\":[yy", b"\"nodes\":["), Some(2));
+        assert_eq!(find_marker(b"xxnode:[yy", b"\"nodes\":["), None);
+    }
+
+    // -------------------------------------------------------------------
+    // Summary slicing
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn slice_summary_selects_top_k_sorted_desc() {
+        let mut full = HeapSnapshotSummary {
+            total_size: 1000,
+            total_count: 100,
+            by_node_name: HashMap::new(),
+            by_node_type: HashMap::new(),
+        };
+        for i in 0..100usize {
+            full.by_node_name
+                .insert(format!("n{i}"), type_summary(i, 1));
+        }
+        let sliced = slice_summary(&full, 5, None);
+        assert_eq!(sliced.by_node_name.len(), 5);
+        let mut sorted: Vec<_> = sliced.by_node_name.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.size.cmp(&a.1.size));
+        assert_eq!(
+            sorted.iter().map(|(_, t)| t.size).collect::<Vec<_>>(),
+            vec![99, 98, 97, 96, 95]
+        );
+    }
+
+    #[test]
+    fn slice_summary_applies_filter() {
+        let mut full = HeapSnapshotSummary {
+            total_size: 1000,
+            total_count: 100,
+            by_node_name: HashMap::new(),
+            by_node_type: HashMap::new(),
+        };
+        for i in 0..100usize {
+            full.by_node_name.insert(format!("n{i}"), type_summary(i, 1));
+        }
+        let sliced = slice_summary(&full, usize::MAX, Some("n9[0-9]$"));
+        // matches n90..n99 (10 entries); the single-digit "n9" must not match
+        assert_eq!(sliced.by_node_name.len(), 10);
+        assert!(sliced.by_node_name.values().all(|t| t.size >= 90));
+    }
+
+    #[test]
+    fn slice_summary_top_usize_max_returns_all() {
+        let mut full = HeapSnapshotSummary {
+            total_size: 10,
+            total_count: 3,
+            by_node_name: HashMap::new(),
+            by_node_type: HashMap::new(),
+        };
+        full.by_node_name.insert("a".into(), type_summary(1, 1));
+        full.by_node_name.insert("b".into(), type_summary(2, 1));
+        let sliced = slice_summary(&full, usize::MAX, None);
+        assert_eq!(sliced.by_node_name.len(), 2);
+    }
+
+    // -------------------------------------------------------------------
+    // Dominator analysis on unreachable nodes (regression)
+    // -------------------------------------------------------------------
+
+    /// Synthetic V8 `.heapsnapshot`. Node 3 has no incoming edges and is
+    /// unreachable from the root: the dominator analysis used to index
+    /// `dfs_parent` (sized to the reachable set) by a node_count-sized
+    /// preorder number and panicked. Retained sizes:
+    ///   node 1 retains only itself (root also reaches node 2 directly),
+    ///   node 2 the same; node 3 is never dominated.
+    #[test]
+    fn retained_analysis_handles_unreachable_nodes() {
+        let json = r#"{"snapshot":{"meta":{
+            "node_fields":["type","name","id","self_size","edge_count","detachedness"],
+            "node_types":[["hidden","object","synthetic"],"string","number","number","number","number"],
+            "edge_fields":["type","name_or_index","to_node"],
+            "edge_types":[["internal","property","element"],"string_or_number","node"],
+            "trace_function_info_fields":["function_id","name","script_name","script_id","line","column"],
+            "trace_node_fields":["id","function_info_index","count","size","children"],
+            "sample_fields":["timestamp_us","last_assigned_id"],
+            "location_fields":["object_index","script_id","line","column"]
+        },"node_count":4,"edge_count":4},
+        "nodes":[2,0,0,0,2,0, 1,1,1,10,1,0, 1,2,2,10,1,0, 1,3,3,10,0,0],
+        "edges":[0,0,6, 0,0,12, 0,0,12, 0,0,6],
+        "strings":["","n1","n2","n3"]}"#;
+        let path = std::env::temp_dir()
+            .join(format!("hprof_unreachable_{}.heapsnapshot", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, json).unwrap();
+
+        let mut snap = HeapSnapshot::new(path.to_string_lossy().into_owned());
+        let res = snap.get_retained_entries(10).unwrap();
+        assert!(!res.approximate); // 4 nodes → exact dominators, not the fallback
+        let by_index = |i: usize| res.retained.iter().find(|e| e.node_index == i);
+        assert!(by_index(3).is_none(), "unreachable node must have retained == 0");
+        assert_eq!(by_index(1).unwrap().retained_size, 10);
+        assert_eq!(by_index(2).unwrap().retained_size, 10);
+
+        // the downstream consumers must also survive the unreachable node
+        let _ = snap.retained_summary(usize::MAX, None).unwrap();
+        let found = snap.search_nodes("n", 10).unwrap();
+        assert!(!found.iter().any(|e| e.node_index == 3));
+        let path_res = snap.shortest_path(3, 16).unwrap();
+        assert!(!path_res.found, "node 3 is garbage — no path from root");
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
