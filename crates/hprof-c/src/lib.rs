@@ -170,11 +170,25 @@ pub unsafe extern "C" fn hprof_snapshot_retained(
     handle: *mut c_void,
     top_n: u32,
 ) -> *mut HprofResult {
+    unsafe { hprof_snapshot_retained_mode(handle, top_n, 0) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_snapshot_retained_mode(
+    handle: *mut c_void,
+    top_n: u32,
+    exact: u8,
+) -> *mut HprofResult {
     let inst = match unsafe { as_snapshot(handle) } {
         Ok(i) => i,
         Err(e) => return e,
     };
-    match inst.snapshot.get_retained_entries(top_n as usize) {
+    let result = if exact != 0 {
+        inst.snapshot.get_retained_entries_exact(top_n as usize)
+    } else {
+        inst.snapshot.get_retained_entries(top_n as usize)
+    };
+    match result {
         Ok(result) => {
             let json =
                 serde_json::to_string(&HprofRetainedResultJson::from(result)).unwrap_or_default();
@@ -447,10 +461,138 @@ pub unsafe extern "C" fn hprof_snapshot_diff(
         Err(e) => return e,
     };
     match inst.snapshot.diff(&mut baseline.snapshot) {
-        Ok(diff) => {
-            let json = serde_json::to_string(&diff).unwrap_or_default();
-            HprofResult::ok_string(&json)
-        }
+        Ok(diff) => match inst.snapshot.object_diff(&mut baseline.snapshot, 100) {
+            Ok(objects) => {
+                let mut value = serde_json::to_value(diff).unwrap_or_default();
+                if let serde_json::Value::Object(map) = &mut value {
+                    map.insert(
+                        "objects".to_string(),
+                        serde_json::to_value(objects).unwrap_or_default(),
+                    );
+                }
+                HprofResult::ok_string(&serde_json::to_string(&value).unwrap_or_default())
+            }
+            Err(e) => HprofResult::err(&e.to_string()),
+        },
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_snapshot_object_diff(
+    handle: *mut c_void,
+    baseline_handle: *mut c_void,
+    limit: u32,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_snapshot(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let baseline = match unsafe { as_snapshot(baseline_handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    match inst
+        .snapshot
+        .object_diff(&mut baseline.snapshot, limit as usize)
+    {
+        Ok(diff) => HprofResult::ok_string(&serde_json::to_string(&diff).unwrap_or_default()),
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_snapshot_detached(
+    handle: *mut c_void,
+    limit: u32,
+    depth: u32,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_snapshot(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    match inst
+        .snapshot
+        .detached_summary(limit as usize, depth as usize)
+    {
+        Ok(result) => HprofResult::ok_string(&serde_json::to_string(&result).unwrap_or_default()),
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_snapshot_size_histogram(handle: *mut c_void) -> *mut HprofResult {
+    let inst = match unsafe { as_snapshot(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    match inst.snapshot.size_histogram() {
+        Ok(result) => HprofResult::ok_string(&serde_json::to_string(&result).unwrap_or_default()),
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_snapshot_string_stats(
+    handle: *mut c_void,
+    limit: u32,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_snapshot(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    match inst.snapshot.string_stats(limit as usize) {
+        Ok(result) => HprofResult::ok_string(&serde_json::to_string(&result).unwrap_or_default()),
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_snapshot_find_edges(
+    handle: *mut c_void,
+    exact: u8,
+    name: *const c_char,
+    type_filter: *const c_char,
+    edge_type: *const c_char,
+    limit: u32,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_snapshot(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let query = EdgeQuery {
+        name: unsafe { cstr_to_str(name) }.unwrap_or("").to_string(),
+        exact: exact != 0,
+        type_filter: unsafe { cstr_to_str(type_filter) }
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        edge_type: unsafe { cstr_to_str(edge_type) }
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        limit: limit as usize,
+    };
+    match inst.snapshot.find_edges(&query) {
+        Ok(result) => HprofResult::ok_string(&serde_json::to_string(&result).unwrap_or_default()),
+        Err(e) => HprofResult::err(&e.to_string()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hprof_snapshot_dot(
+    handle: *mut c_void,
+    node_index: u32,
+    depth: u32,
+    max_nodes: u32,
+) -> *mut HprofResult {
+    let inst = match unsafe { as_snapshot(handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    match inst
+        .snapshot
+        .to_dot_subgraph(node_index as usize, depth as usize, max_nodes as usize)
+    {
+        Ok(result) => HprofResult::ok_string(&result),
         Err(e) => HprofResult::err(&e.to_string()),
     }
 }

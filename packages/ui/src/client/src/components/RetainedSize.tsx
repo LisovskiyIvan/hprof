@@ -26,13 +26,14 @@ export default function RetainedSize({ base }: { base: string }) {
   const [data, setData] = useState<RetainedEntry[] | null>(null)
   const [approximate, setApproximate] = useState(false)
   const [top, setTop] = useState(50)
+  const [exact, setExact] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     setLoading(true)
     setError(null)
-    fetchJson<{ retained: RetainedEntry[]; approximate?: boolean }>(`${base}/retained?top=${top}`)
+    fetchJson<{ retained: RetainedEntry[]; approximate?: boolean }>(`${base}/retained?top=${top}&exact=${exact ? '1' : '0'}`)
       .then((d) => {
         setData(d.retained)
         setApproximate(Boolean(d.approximate))
@@ -42,7 +43,7 @@ export default function RetainedSize({ base }: { base: string }) {
         setLoading(false)
         setError(e.message)
       })
-  }, [base, top])
+  }, [base, top, exact])
 
   if (loading)
     return (
@@ -72,6 +73,10 @@ export default function RetainedSize({ base }: { base: string }) {
         <span className="text-xs text-gray-500">
           Retained size = self size + size of objects exclusively retained
         </span>
+        <label className="ml-auto text-xs text-gray-400 flex items-center gap-1">
+          <input type="checkbox" checked={exact} onChange={(e) => setExact(e.target.checked)} />
+          exact dominators
+        </label>
       </div>
 
       {approximate && (

@@ -71,10 +71,10 @@ pub struct ParentMap {
 
 /// Node records in struct-of-arrays layout, one entry per node. The fields
 /// V8 writes per record are split into typed columns; fields we never read
-/// (`detachedness`, `trace_node_id`) are dropped entirely. For a 26M-node
-/// snapshot this is ~470MB instead of ~625MB interleaved, and the column
-/// scans (summary aggregation, find) read contiguous memory instead of
-/// striding through interleaved records.
+/// (`trace_node_id`) are dropped entirely. For a 26M-node snapshot this is
+/// ~500MB instead of ~625MB interleaved, and the column scans (summary
+/// aggregation, find) read contiguous memory instead of striding through
+/// interleaved records.
 pub struct NodeColumns {
     /// index into `node_types` (V8 has a small fixed set; u16 is ample)
     pub types: Vec<u16>,
@@ -83,6 +83,8 @@ pub struct NodeColumns {
     pub ids: Vec<u32>,
     pub self_sizes: Vec<u32>,
     pub edge_counts: Vec<u32>,
+    /// V8 detachedness marker; zero means attached/unknown.
+    pub detachedness: Vec<u8>,
 }
 
 pub struct RawData {
@@ -414,6 +416,15 @@ impl HeapSnapshot {
                     .par_chunks(node_field_count)
                     .map(|r| r[node_offsets.edge_count])
                     .collect();
+                let detachedness: Vec<u8> = flat
+                    .par_chunks(node_field_count)
+                    .map(|r| {
+                        node_offsets
+                            .detachedness
+                            .map(|offset| r[offset] as u8)
+                            .unwrap_or(0)
+                    })
+                    .collect();
                 drop(flat);
                 NodeColumns {
                     types,
@@ -421,6 +432,7 @@ impl HeapSnapshot {
                     ids,
                     self_sizes,
                     edge_counts,
+                    detachedness,
                 }
             }
         };
@@ -909,6 +921,105 @@ impl HeapSnapshot {
         Ok((node, edges))
     }
 
+    /// Emit a bounded outgoing object graph around a node as Graphviz DOT.
+    /// This is intentionally separate from the heapprofile call graph: the
+    /// nodes here are real heap objects and edge labels are properties or
+    /// element indexes.
+    pub fn to_dot_subgraph(
+        &mut self,
+        root: usize,
+        max_depth: usize,
+        max_nodes: usize,
+    ) -> crate::Result<String> {
+        self.ensure_raw()?;
+        self.ensure_edges()?;
+        self.ensure_edge_starts();
+        let raw = self.raw.as_ref().unwrap();
+        if root >= raw.meta.node_count {
+            return Err(Error::NodeNotFound(root));
+        }
+        let node_limit = if max_nodes == 0 { 1_000 } else { max_nodes };
+        let edge_starts = self.edge_starts.as_ref().unwrap();
+        let edges = raw.edges.as_ref().unwrap();
+        let mut seen = std::collections::HashSet::with_capacity(node_limit.min(1024));
+        let mut queue = std::collections::VecDeque::new();
+        let mut graph_edges: Vec<(usize, usize, String)> = Vec::new();
+        seen.insert(root);
+        queue.push_back((root, 0usize));
+
+        while let Some((source, depth)) = queue.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+            let start = edge_starts[source] as usize;
+            let end = edge_starts[source + 1] as usize;
+            for edge_index in start..end {
+                let base = edge_index * raw.edge_field_count;
+                let target = edges[base + raw.edge_offsets.to_node] as usize;
+                if target >= raw.meta.node_count {
+                    continue;
+                }
+                if !seen.contains(&target) && seen.len() >= node_limit {
+                    continue;
+                }
+                let is_new = seen.insert(target);
+                let type_index = edges[base + raw.edge_offsets.type_] as usize;
+                let edge_type = raw
+                    .edge_types
+                    .get(type_index)
+                    .cloned()
+                    .unwrap_or_else(|| type_index.to_string());
+                let name_index = edges[base + raw.edge_offsets.name_or_index] as usize;
+                let edge_name = if edge_type == "element" {
+                    format!("[{name_index}]")
+                } else {
+                    raw.strings
+                        .resolve(&raw.mmap, name_index)
+                        .unwrap_or_else(|| format!("#{name_index}"))
+                };
+                graph_edges.push((source, target, format!("{edge_type}: {edge_name}")));
+                if is_new && depth + 1 < max_depth {
+                    queue.push_back((target, depth + 1));
+                }
+            }
+        }
+
+        fn dot_escape(value: &str) -> String {
+            value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+        }
+
+        let mut nodes: Vec<usize> = seen.into_iter().collect();
+        nodes.sort_unstable();
+        let mut out = String::from("digraph heap {\n  rankdir=LR;\n");
+        for index in nodes {
+            let node = Self::create_node(raw, index);
+            let label = format!(
+                "#{} {}\\n{}\\nself {}",
+                index,
+                node.name,
+                node.type_,
+                crate::types::format_bytes(node.self_size)
+            );
+            let shape = if index == root { "doublecircle" } else { "box" };
+            out.push_str(&format!(
+                "  n{index} [shape={shape}, label=\"{}\"];\n",
+                dot_escape(&label)
+            ));
+        }
+        for (source, target, label) in graph_edges {
+            out.push_str(&format!(
+                "  n{source} -> n{target} [label=\"{}\"];\n",
+                dot_escape(&label)
+            ));
+        }
+        out.push_str("}\n");
+        Ok(out)
+    }
+
     pub fn search_strings(&mut self, query: &str) -> crate::Result<Vec<SearchMatch>> {
         self.ensure_raw()?;
         let raw = self.raw.as_ref().unwrap();
@@ -1182,12 +1293,33 @@ impl HeapSnapshot {
     }
 
     pub fn get_retained_entries(&mut self, top_n: usize) -> crate::Result<RetainedResult> {
+        self.get_retained_entries_with_mode(top_n, false)
+    }
+
+    /// Return the largest individual nodes by retained size. On very large
+    /// snapshots the default is an explicitly marked self-size approximation;
+    /// callers that can afford the dominator peak may request an exact result.
+    pub fn get_retained_entries_exact(&mut self, top_n: usize) -> crate::Result<RetainedResult> {
+        self.get_retained_entries_with_mode(top_n, true)
+    }
+
+    fn get_retained_entries_with_mode(
+        &mut self,
+        top_n: usize,
+        exact: bool,
+    ) -> crate::Result<RetainedResult> {
         self.ensure_raw()?;
 
         // Exact retained sizes need the full dominator computation (~1GB peak
-        // on a 7.4M-node snapshot). For very large snapshots the UI keeps the
-        // fast approximate top-by-self-size view so it stays responsive.
-        if self.raw.as_ref().unwrap().meta.node_count > 5_000_000 {
+        // on a 7.4M-node snapshot). For very large snapshots the default keeps
+        // the fast approximate top-by-self-size view so it stays responsive.
+        if top_n == 0 {
+            return Ok(RetainedResult {
+                approximate: !exact && self.raw.as_ref().unwrap().meta.node_count > 5_000_000,
+                retained: Vec::new(),
+            });
+        }
+        if !exact && self.raw.as_ref().unwrap().meta.node_count > 5_000_000 {
             let raw = self.raw.as_ref().unwrap();
             let mut selected: Vec<(usize, HeapSnapshotNode)> = Vec::with_capacity(top_n);
             for node_index in 0..raw.meta.node_count {
@@ -1433,7 +1565,9 @@ impl HeapSnapshot {
                 .map(|idx| {
                     let decoded = spans
                         .get(idx as usize)
-                        .map(|&(s, e)| decode_json_string(&mmap_bytes[sbase + s as usize..sbase + e as usize]))
+                        .map(|&(s, e)| {
+                            decode_json_string(&mmap_bytes[sbase + s as usize..sbase + e as usize])
+                        })
                         .unwrap_or_default();
                     (idx, decoded)
                 })
@@ -1726,7 +1860,9 @@ impl HeapSnapshot {
                 .map(|idx| {
                     let decoded = spans
                         .get(idx as usize)
-                        .map(|&(s, e)| decode_json_string(&mmap_bytes[sbase + s as usize..sbase + e as usize]))
+                        .map(|&(s, e)| {
+                            decode_json_string(&mmap_bytes[sbase + s as usize..sbase + e as usize])
+                        })
                         .unwrap_or_default();
                     (idx, decoded)
                 })
@@ -1891,6 +2027,97 @@ impl HeapSnapshot {
         Ok((node, props))
     }
 
+    /// Find incoming object properties/edges by their displayed name. This
+    /// scans the edge array without building dominators and returns the
+    /// retaining source plus the referenced target for each match.
+    pub fn find_edges(&mut self, query: &EdgeQuery) -> crate::Result<Vec<EdgeMatch>> {
+        self.ensure_raw()?;
+        self.ensure_edges()?;
+        self.ensure_edge_starts();
+        let raw = self.raw.as_ref().unwrap();
+        let edge_starts = self.edge_starts.as_ref().unwrap();
+        let edges = raw.edges.as_ref().unwrap();
+        let mut matches = Vec::new();
+
+        if query.name.is_empty() {
+            return Ok(matches);
+        }
+
+        'nodes: for source_index in 0..raw.meta.node_count {
+            let source_type_index = raw.nodes.types[source_index] as usize;
+            let source_type = raw
+                .node_types
+                .get(source_type_index)
+                .cloned()
+                .unwrap_or_else(|| source_type_index.to_string());
+            if let Some(filter) = query.type_filter.as_deref() {
+                if !eq_ci(&source_type, filter) {
+                    continue;
+                }
+            }
+            let start = edge_starts[source_index] as usize;
+            let end = edge_starts[source_index + 1] as usize;
+            for edge_index in start..end {
+                let base = edge_index * raw.edge_field_count;
+                let edge_type_index = edges[base + raw.edge_offsets.type_] as usize;
+                let edge_type = raw
+                    .edge_types
+                    .get(edge_type_index)
+                    .cloned()
+                    .unwrap_or_else(|| edge_type_index.to_string());
+                if let Some(filter) = query.edge_type.as_deref() {
+                    if !eq_ci(&edge_type, filter) {
+                        continue;
+                    }
+                }
+                let name_or_index = edges[base + raw.edge_offsets.name_or_index] as usize;
+                let name = if edge_type == "element" {
+                    format!("[{name_or_index}]")
+                } else {
+                    raw.strings
+                        .resolve(&raw.mmap, name_or_index)
+                        .unwrap_or_else(|| format!("#{name_or_index}"))
+                };
+                let name_matches = if query.exact {
+                    eq_ci(&name, &query.name)
+                } else {
+                    contains_ci(&name, &query.name)
+                };
+                if !name_matches {
+                    continue;
+                }
+
+                let target_index = edges[base + raw.edge_offsets.to_node] as usize;
+                let (target_id, target_name, target_type) = if target_index < raw.meta.node_count {
+                    let target = Self::create_node(raw, target_index);
+                    (target.id, target.name, target.type_)
+                } else {
+                    (0, format!("<out of range #{target_index}>"), String::new())
+                };
+                let source_name = raw
+                    .strings
+                    .resolve(&raw.mmap, raw.nodes.names[source_index] as usize)
+                    .unwrap_or_default();
+                matches.push(EdgeMatch {
+                    source_index,
+                    source_id: raw.nodes.ids[source_index] as usize,
+                    source_name,
+                    source_type: source_type.clone(),
+                    edge_type,
+                    name,
+                    target_index,
+                    target_id,
+                    target_name,
+                    target_type,
+                });
+                if query.limit > 0 && matches.len() >= query.limit {
+                    break 'nodes;
+                }
+            }
+        }
+        Ok(matches)
+    }
+
     /// All incoming edges of a node: who retains it and how. Single pass
     /// over the edges array (no retained/dominator analysis needed).
     pub fn get_retainers(&mut self, node_index: usize) -> crate::Result<Vec<RetainerRef>> {
@@ -1910,7 +2137,7 @@ impl HeapSnapshot {
             let end = edge_starts[n + 1] as usize;
             for edge_index in start..end {
                 let base = edge_index * raw.edge_field_count;
-            let to_node = edges[base + raw.edge_offsets.to_node] as usize;
+                let to_node = edges[base + raw.edge_offsets.to_node] as usize;
                 if to_node != node_index {
                     continue;
                 }
@@ -2225,6 +2452,482 @@ impl HeapSnapshot {
             by_node_name: diff_snapshot_maps(&other.by_node_name, &base.by_node_name),
             by_node_type: diff_snapshot_maps(&other.by_node_type, &base.by_node_type),
         })
+    }
+
+    /// Compare object identities between this snapshot (the current/profile)
+    /// and `baseline`. V8 node ids are stable across snapshots, so the merge
+    /// reports genuinely new/deleted objects instead of only aggregate name
+    /// deltas. Only the top `limit` objects are materialized; the counts and
+    /// byte totals cover every node.
+    pub fn object_diff(
+        &mut self,
+        baseline: &mut HeapSnapshot,
+        limit: usize,
+    ) -> crate::Result<SnapshotObjectDiff> {
+        self.ensure_raw()?;
+        baseline.ensure_raw()?;
+        let profile_raw = self.raw.as_ref().unwrap();
+        let baseline_raw = baseline.raw.as_ref().unwrap();
+        Ok(diff_snapshot_objects(baseline_raw, profile_raw, limit))
+    }
+
+    /// Return detached V8 nodes, ranked by self size. `depth` optionally adds
+    /// the first-parent owner chain for each selected node.
+    pub fn detached_summary(
+        &mut self,
+        limit: usize,
+        depth: usize,
+    ) -> crate::Result<DetachedSummary> {
+        self.ensure_raw()?;
+        let raw = self.raw.as_ref().unwrap();
+        let mut candidates: Vec<(usize, usize)> = Vec::with_capacity(limit.min(64));
+        let mut total_count = 0usize;
+        let mut total_size = 0usize;
+        for index in 0..raw.meta.node_count {
+            let marker = raw.nodes.detachedness.get(index).copied().unwrap_or(0);
+            if marker == 0 {
+                continue;
+            }
+            let size = raw.nodes.self_sizes[index] as usize;
+            total_count += 1;
+            total_size += size;
+            if limit == 0 {
+                continue;
+            }
+            candidates.push((index, size));
+            if candidates.len() > limit {
+                let worst = candidates
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, item)| (item.1, item.0))
+                    .map(|(i, _)| i)
+                    .unwrap();
+                candidates.swap_remove(worst);
+            }
+        }
+        candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let mut entries = Vec::with_capacity(candidates.len());
+        for (index, _) in candidates {
+            let (node, detachedness) = {
+                let raw = self.raw.as_ref().unwrap();
+                (
+                    snapshot_object(raw, index),
+                    raw.nodes.detachedness.get(index).copied().unwrap_or(0),
+                )
+            };
+            let owner_chain = if depth == 0 {
+                String::new()
+            } else {
+                let chain = self.retainer_chain(index, depth)?;
+                let parts = chain
+                    .iter()
+                    .skip(1)
+                    .map(|hop| {
+                        if hop.name.is_empty() {
+                            format!("({})", hop.type_)
+                        } else {
+                            hop.name.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if parts.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    parts.join(" → ")
+                }
+            };
+            entries.push(DetachedNode {
+                node,
+                detachedness,
+                owner_chain,
+            });
+        }
+
+        Ok(DetachedSummary {
+            total_count,
+            total_size,
+            entries,
+        })
+    }
+
+    /// Build a power-of-two histogram of node self sizes. Bucket zero contains
+    /// zero-byte nodes; the remaining buckets are `[2^n, 2^(n+1)-1]`.
+    pub fn size_histogram(&mut self) -> crate::Result<SizeHistogram> {
+        self.ensure_raw()?;
+        let raw = self.raw.as_ref().unwrap();
+        let mut buckets: std::collections::BTreeMap<usize, (usize, usize)> =
+            std::collections::BTreeMap::new();
+        let mut total_size = 0usize;
+        for &raw_size in &raw.nodes.self_sizes {
+            let size = raw_size as usize;
+            let bucket = if size == 0 {
+                0
+            } else {
+                (usize::BITS - size.leading_zeros()) as usize
+            };
+            let entry = buckets.entry(bucket).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += size;
+            total_size += size;
+        }
+        let bits = usize::BITS as usize;
+        let buckets = buckets
+            .into_iter()
+            .map(|(bucket, (count, total_size))| {
+                let min_size = if bucket == 0 {
+                    0
+                } else {
+                    1usize << (bucket - 1)
+                };
+                let max_size = if bucket == 0 {
+                    0
+                } else if bucket >= bits {
+                    usize::MAX
+                } else {
+                    (1usize << bucket) - 1
+                };
+                SizeBucket {
+                    min_size,
+                    max_size,
+                    count,
+                    total_size,
+                }
+            })
+            .collect();
+        Ok(SizeHistogram {
+            total_count: raw.nodes.self_sizes.len(),
+            total_size,
+            buckets,
+        })
+    }
+
+    /// Summarize strings by their actual contents and reference count. Node
+    /// names and non-element property names are counted; duplicate string
+    /// table entries with the same decoded content are merged.
+    pub fn string_stats(&mut self, limit: usize) -> crate::Result<StringStats> {
+        self.ensure_raw()?;
+        self.ensure_edges()?;
+        let raw = self.raw.as_ref().unwrap();
+        let mut references = vec![0usize; raw.strings.spans.len()];
+        for &name_index in &raw.nodes.names {
+            if let Some(count) = references.get_mut(name_index as usize) {
+                *count += 1;
+            }
+        }
+        let edges = raw.edges.as_ref().unwrap();
+        for edge in edges.chunks(raw.edge_field_count) {
+            if edge.len() <= raw.edge_offsets.name_or_index {
+                continue;
+            }
+            let type_index = edge[raw.edge_offsets.type_] as usize;
+            let is_element = raw
+                .edge_types
+                .get(type_index)
+                .map(|kind| kind == "element")
+                .unwrap_or(false);
+            if is_element {
+                continue;
+            }
+            let name_index = edge[raw.edge_offsets.name_or_index] as usize;
+            if let Some(count) = references.get_mut(name_index) {
+                *count += 1;
+            }
+        }
+
+        let mut total_bytes = 0usize;
+        for &(start, end) in &raw.strings.spans {
+            total_bytes += end.saturating_sub(start) as usize;
+        }
+        let mut referenced_string_count = 0usize;
+        let mut referenced_bytes = 0usize;
+        let mut by_value: AHashMap<String, (usize, usize)> = AHashMap::new();
+        for (index, &count) in references.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            referenced_string_count += 1;
+            let value = raw
+                .strings
+                .resolve(&raw.mmap, index)
+                .unwrap_or_else(|| format!("<string#{index}>"));
+            let byte_length = value.len();
+            referenced_bytes += byte_length.saturating_mul(count);
+            let entry = by_value.entry(value).or_insert((0, byte_length));
+            entry.0 += count;
+        }
+        let mut entries: Vec<StringStatEntry> = by_value
+            .into_iter()
+            .map(|(value, (references, byte_length))| StringStatEntry {
+                referenced_bytes: references.saturating_mul(byte_length),
+                value,
+                references,
+                byte_length,
+            })
+            .collect();
+        entries.sort_unstable_by(|a, b| {
+            b.referenced_bytes
+                .cmp(&a.referenced_bytes)
+                .then_with(|| b.references.cmp(&a.references))
+                .then_with(|| a.value.cmp(&b.value))
+        });
+        if limit > 0 && entries.len() > limit {
+            entries.truncate(limit);
+        }
+        Ok(StringStats {
+            total_strings: raw.strings.spans.len(),
+            total_bytes,
+            referenced_strings: referenced_string_count,
+            referenced_bytes,
+            entries,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ObjectPresenceCandidate {
+    id: u32,
+    index: usize,
+    size: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ObjectGrowthCandidate {
+    id: u32,
+    baseline_index: usize,
+    profile_index: usize,
+    baseline_size: usize,
+    profile_size: usize,
+    delta: i64,
+}
+
+fn sorted_node_indices(ids: &[u32]) -> Option<Vec<u32>> {
+    if ids.windows(2).all(|w| w[0] <= w[1]) {
+        return None;
+    }
+    let mut order: Vec<u32> = (0..ids.len() as u32).collect();
+    order.sort_unstable_by_key(|&index| ids[index as usize]);
+    Some(order)
+}
+
+#[inline]
+fn ordered_id_index(ids: &[u32], order: Option<&Vec<u32>>, position: usize) -> (u32, usize) {
+    let index = order
+        .and_then(|items| items.get(position).copied())
+        .map(|index| index as usize)
+        .unwrap_or(position);
+    (ids[index], index)
+}
+
+fn push_presence_candidate(
+    candidates: &mut Vec<ObjectPresenceCandidate>,
+    candidate: ObjectPresenceCandidate,
+    limit: usize,
+) {
+    if limit == 0 {
+        return;
+    }
+    candidates.push(candidate);
+    if candidates.len() > limit {
+        let worst = candidates
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, item)| (item.size, item.id))
+            .map(|(index, _)| index)
+            .unwrap();
+        candidates.swap_remove(worst);
+    }
+}
+
+fn push_growth_candidate(
+    candidates: &mut Vec<ObjectGrowthCandidate>,
+    candidate: ObjectGrowthCandidate,
+    limit: usize,
+) {
+    if limit == 0 {
+        return;
+    }
+    candidates.push(candidate);
+    if candidates.len() > limit {
+        let worst = candidates
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, item)| (item.delta, item.id))
+            .map(|(index, _)| index)
+            .unwrap();
+        candidates.swap_remove(worst);
+    }
+}
+
+fn snapshot_object(raw: &RawData, index: usize) -> SnapshotObject {
+    let node = HeapSnapshot::create_node(raw, index);
+    SnapshotObject {
+        index,
+        id: node.id,
+        name: node.name,
+        type_: node.type_,
+        self_size: node.self_size,
+        edge_count: node.edge_count,
+    }
+}
+
+fn diff_snapshot_objects(
+    baseline: &RawData,
+    profile: &RawData,
+    limit: usize,
+) -> SnapshotObjectDiff {
+    let baseline_ids = &baseline.nodes.ids;
+    let profile_ids = &profile.nodes.ids;
+    let baseline_order = sorted_node_indices(baseline_ids);
+    let profile_order = sorted_node_indices(profile_ids);
+
+    let mut base_pos = 0usize;
+    let mut profile_pos = 0usize;
+    let mut matched_count = 0usize;
+    let mut new_count = 0usize;
+    let mut deleted_count = 0usize;
+    let mut new_size = 0usize;
+    let mut deleted_size = 0usize;
+    let mut delta_size = 0i64;
+    let mut new_objects = Vec::with_capacity(limit.min(64));
+    let mut deleted_objects = Vec::with_capacity(limit.min(64));
+    let mut grown_objects = Vec::with_capacity(limit.min(64));
+
+    while base_pos < baseline_ids.len() || profile_pos < profile_ids.len() {
+        let base = (base_pos < baseline_ids.len())
+            .then(|| ordered_id_index(baseline_ids, baseline_order.as_ref(), base_pos));
+        let current = (profile_pos < profile_ids.len())
+            .then(|| ordered_id_index(profile_ids, profile_order.as_ref(), profile_pos));
+
+        match (base, current) {
+            (Some((base_id, base_index)), Some((profile_id, profile_index)))
+                if base_id == profile_id =>
+            {
+                matched_count += 1;
+                let baseline_node_size = baseline.nodes.self_sizes[base_index] as usize;
+                let profile_node_size = profile.nodes.self_sizes[profile_index] as usize;
+                let delta = profile_node_size as i64 - baseline_node_size as i64;
+                delta_size += delta;
+                if delta > 0 {
+                    push_growth_candidate(
+                        &mut grown_objects,
+                        ObjectGrowthCandidate {
+                            id: profile_id,
+                            baseline_index: base_index,
+                            profile_index,
+                            baseline_size: baseline_node_size,
+                            profile_size: profile_node_size,
+                            delta,
+                        },
+                        limit,
+                    );
+                }
+                base_pos += 1;
+                profile_pos += 1;
+            }
+            (Some((base_id, base_index)), Some((profile_id, _))) if base_id < profile_id => {
+                let size = baseline.nodes.self_sizes[base_index] as usize;
+                deleted_count += 1;
+                deleted_size += size;
+                delta_size -= size as i64;
+                push_presence_candidate(
+                    &mut deleted_objects,
+                    ObjectPresenceCandidate {
+                        id: base_id,
+                        index: base_index,
+                        size,
+                    },
+                    limit,
+                );
+                base_pos += 1;
+            }
+            (Some((_base_id, _)), Some((_profile_id, profile_index))) => {
+                let size = profile.nodes.self_sizes[profile_index] as usize;
+                new_count += 1;
+                new_size += size;
+                delta_size += size as i64;
+                push_presence_candidate(
+                    &mut new_objects,
+                    ObjectPresenceCandidate {
+                        id: profile_ids[profile_index],
+                        index: profile_index,
+                        size,
+                    },
+                    limit,
+                );
+                profile_pos += 1;
+            }
+            (Some((base_id, base_index)), None) => {
+                let size = baseline.nodes.self_sizes[base_index] as usize;
+                deleted_count += 1;
+                deleted_size += size;
+                delta_size -= size as i64;
+                push_presence_candidate(
+                    &mut deleted_objects,
+                    ObjectPresenceCandidate {
+                        id: base_id,
+                        index: base_index,
+                        size,
+                    },
+                    limit,
+                );
+                base_pos += 1;
+            }
+            (None, Some((_profile_id, profile_index))) => {
+                let size = profile.nodes.self_sizes[profile_index] as usize;
+                new_count += 1;
+                new_size += size;
+                delta_size += size as i64;
+                push_presence_candidate(
+                    &mut new_objects,
+                    ObjectPresenceCandidate {
+                        id: profile_ids[profile_index],
+                        index: profile_index,
+                        size,
+                    },
+                    limit,
+                );
+                profile_pos += 1;
+            }
+            (None, None) => break,
+        }
+    }
+
+    new_objects.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.id.cmp(&b.id)));
+    deleted_objects.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.id.cmp(&b.id)));
+    grown_objects.sort_unstable_by(|a, b| b.delta.cmp(&a.delta).then_with(|| a.id.cmp(&b.id)));
+
+    SnapshotObjectDiff {
+        matched_count,
+        new_count,
+        deleted_count,
+        new_size,
+        deleted_size,
+        delta_size,
+        new_objects: new_objects
+            .into_iter()
+            .map(|candidate| snapshot_object(profile, candidate.index))
+            .collect(),
+        deleted_objects: deleted_objects
+            .into_iter()
+            .map(|candidate| snapshot_object(baseline, candidate.index))
+            .collect(),
+        grown_objects: grown_objects
+            .into_iter()
+            .map(|candidate| {
+                let node = snapshot_object(profile, candidate.profile_index);
+                SnapshotObjectChange {
+                    id: candidate.id as usize,
+                    baseline_index: candidate.baseline_index,
+                    profile_index: candidate.profile_index,
+                    name: node.name,
+                    type_: node.type_,
+                    baseline_size: candidate.baseline_size,
+                    profile_size: candidate.profile_size,
+                    delta: candidate.delta,
+                }
+            })
+            .collect(),
     }
 }
 
@@ -2715,12 +3418,19 @@ fn node_columns_streaming(
             let mut ids = Vec::with_capacity(recs);
             let mut self_sizes = Vec::with_capacity(recs);
             let mut edge_counts = Vec::with_capacity(recs);
+            let mut detachedness = Vec::with_capacity(recs);
             for rec in nums.chunks(nfc) {
                 types.push(rec[offsets.type_] as u16);
                 names.push(rec[offsets.name]);
                 ids.push(rec[offsets.id]);
                 self_sizes.push(rec[offsets.self_size]);
                 edge_counts.push(rec[offsets.edge_count]);
+                detachedness.push(
+                    offsets
+                        .detachedness
+                        .map(|offset| rec[offset] as u8)
+                        .unwrap_or(0),
+                );
             }
             drop(nums); // free this chunk's numbers before the next chunk
             Some(NodeColumns {
@@ -2729,6 +3439,7 @@ fn node_columns_streaming(
                 ids,
                 self_sizes,
                 edge_counts,
+                detachedness,
             })
         })
         .collect();
@@ -2739,12 +3450,14 @@ fn node_columns_streaming(
     let mut ids = Vec::with_capacity(cap);
     let mut self_sizes = Vec::with_capacity(cap);
     let mut edge_counts = Vec::with_capacity(cap);
+    let mut detachedness = Vec::with_capacity(cap);
     for p in parts {
         types.extend_from_slice(&p.types);
         names.extend_from_slice(&p.names);
         ids.extend_from_slice(&p.ids);
         self_sizes.extend_from_slice(&p.self_sizes);
         edge_counts.extend_from_slice(&p.edge_counts);
+        detachedness.extend_from_slice(&p.detachedness);
     }
     Some(NodeColumns {
         types,
@@ -2752,6 +3465,7 @@ fn node_columns_streaming(
         ids,
         self_sizes,
         edge_counts,
+        detachedness,
     })
 }
 
@@ -2865,6 +3579,7 @@ mod tests {
             id: 2,
             self_size: 3,
             edge_count: 4,
+            detachedness: Some(5),
         };
         let nfc = 6usize; // incl. an unread field (detachedness at index 5)
         let mut s = String::new();
@@ -2879,7 +3594,7 @@ mod tests {
                     2 => (r * 13).to_string(),          // id
                     3 => ((r * 37) % 4096).to_string(), // self size
                     4 => (r % 30).to_string(),          // edge count
-                    _ => "0".to_string(),               // detachedness (dropped)
+                    _ => (r % 3).to_string(),           // detachedness
                 });
             }
         }
@@ -2892,19 +3607,24 @@ mod tests {
             ids: flat.par_chunks(nfc).map(|r| r[2]).collect(),
             self_sizes: flat.par_chunks(nfc).map(|r| r[3]).collect(),
             edge_counts: flat.par_chunks(nfc).map(|r| r[4]).collect(),
+            detachedness: flat.par_chunks(nfc).map(|r| r[5] as u8).collect(),
         };
         assert_eq!(streamed.types, reference.types);
         assert_eq!(streamed.names, reference.names);
         assert_eq!(streamed.ids, reference.ids);
         assert_eq!(streamed.self_sizes, reference.self_sizes);
         assert_eq!(streamed.edge_counts, reference.edge_counts);
+        assert_eq!(streamed.detachedness, reference.detachedness);
         assert_eq!(streamed.types.len(), 50_000);
     }
 
     #[test]
     fn decode_json_string_plain_and_escapes() {
         assert_eq!(decode_json_string(b"hello"), "hello");
-        assert_eq!(decode_json_string(b"a\\nb\\t\\\\c\\\"d\\/e"), "a\nb\t\\c\"d/e");
+        assert_eq!(
+            decode_json_string(b"a\\nb\\t\\\\c\\\"d\\/e"),
+            "a\nb\t\\c\"d/e"
+        );
         assert_eq!(decode_json_string(b"\\u00410\\u0fff"), "A0\u{0fff}");
     }
 
@@ -3006,7 +3726,8 @@ mod tests {
             by_node_type: HashMap::new(),
         };
         for i in 0..100usize {
-            full.by_node_name.insert(format!("n{i}"), type_summary(i, 1));
+            full.by_node_name
+                .insert(format!("n{i}"), type_summary(i, 1));
         }
         let sliced = slice_summary(&full, usize::MAX, Some("n9[0-9]$"));
         // matches n90..n99 (10 entries); the single-digit "n9" must not match
@@ -3053,8 +3774,10 @@ mod tests {
         "nodes":[2,0,0,0,2,0, 1,1,1,10,1,0, 1,2,2,10,1,0, 1,3,3,10,0,0],
         "edges":[0,0,6, 0,0,12, 0,0,12, 0,0,6],
         "strings":["","n1","n2","n3"]}"#;
-        let path = std::env::temp_dir()
-            .join(format!("hprof_unreachable_{}.heapsnapshot", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "hprof_unreachable_{}.heapsnapshot",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, json).unwrap();
 
@@ -3062,7 +3785,10 @@ mod tests {
         let res = snap.get_retained_entries(10).unwrap();
         assert!(!res.approximate); // 4 nodes → exact dominators, not the fallback
         let by_index = |i: usize| res.retained.iter().find(|e| e.node_index == i);
-        assert!(by_index(3).is_none(), "unreachable node must have retained == 0");
+        assert!(
+            by_index(3).is_none(),
+            "unreachable node must have retained == 0"
+        );
         assert_eq!(by_index(1).unwrap().retained_size, 10);
         assert_eq!(by_index(2).unwrap().retained_size, 10);
 
@@ -3073,5 +3799,47 @@ mod tests {
         let path_res = snap.shortest_path(3, 16).unwrap();
         assert!(!path_res.found, "node 3 is garbage — no path from root");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn object_diff_and_snapshot_reports_use_identity_and_detachedness() {
+        let meta = r#"{"node_fields":["type","name","id","self_size","edge_count","detachedness"],"node_types":[["hidden","object"]],"edge_fields":["type","name_or_index","to_node"],"edge_types":[["property"]]}"#;
+        let baseline_json = format!(
+            r#"{{"snapshot":{{"meta":{meta},"node_count":3,"edge_count":0}},"nodes":[0,0,1,0,0,0,1,1,3,10,0,1,1,2,5,5,0,0],"edges":[],"strings":["","A","B"]}}"#
+        );
+        let profile_json = format!(
+            r#"{{"snapshot":{{"meta":{meta},"node_count":3,"edge_count":0}},"nodes":[0,0,1,0,0,0,1,1,3,30,0,0,1,2,7,8,0,0],"edges":[],"strings":["","A","C"]}}"#
+        );
+        let base_path = std::env::temp_dir().join(format!(
+            "hprof_object_diff_base_{}.heapsnapshot",
+            std::process::id()
+        ));
+        let profile_path = std::env::temp_dir().join(format!(
+            "hprof_object_diff_profile_{}.heapsnapshot",
+            std::process::id()
+        ));
+        std::fs::write(&base_path, baseline_json).unwrap();
+        std::fs::write(&profile_path, profile_json).unwrap();
+
+        let mut baseline = HeapSnapshot::new(base_path.to_string_lossy().into_owned());
+        let mut profile = HeapSnapshot::new(profile_path.to_string_lossy().into_owned());
+        let diff = profile.object_diff(&mut baseline, 10).unwrap();
+        assert_eq!(diff.matched_count, 2);
+        assert_eq!(diff.new_count, 1);
+        assert_eq!(diff.deleted_count, 1);
+        assert_eq!(diff.delta_size, 23);
+        assert_eq!(diff.grown_objects[0].id, 3);
+        assert_eq!(diff.grown_objects[0].delta, 20);
+
+        let detached = profile.detached_summary(10, 0).unwrap();
+        assert_eq!(detached.total_count, 0);
+        let histogram = profile.size_histogram().unwrap();
+        assert_eq!(histogram.total_count, 3);
+        assert_eq!(histogram.total_size, 38);
+        let strings = profile.string_stats(10).unwrap();
+        assert!(strings.entries.iter().any(|entry| entry.value == "A"));
+
+        let _ = std::fs::remove_file(base_path);
+        let _ = std::fs::remove_file(profile_path);
     }
 }

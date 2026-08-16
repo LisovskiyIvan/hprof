@@ -70,6 +70,7 @@ const ffiDefinition = {
   hprof_snapshot_edges: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.ptr },
   hprof_snapshot_search: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.ptr },
   hprof_snapshot_retained: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.ptr },
+  hprof_snapshot_retained_mode: { args: [FFIType.ptr, FFIType.u32, FFIType.u8], returns: FFIType.ptr },
   hprof_snapshot_flamegraph: {
     args: [FFIType.ptr, FFIType.u32, FFIType.cstring],
     returns: FFIType.ptr,
@@ -79,6 +80,15 @@ const ffiDefinition = {
     returns: FFIType.ptr,
   },
   hprof_snapshot_diff: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
+  hprof_snapshot_object_diff: { args: [FFIType.ptr, FFIType.ptr, FFIType.u32], returns: FFIType.ptr },
+  hprof_snapshot_detached: { args: [FFIType.ptr, FFIType.u32, FFIType.u32], returns: FFIType.ptr },
+  hprof_snapshot_size_histogram: { args: [FFIType.ptr], returns: FFIType.ptr },
+  hprof_snapshot_string_stats: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.ptr },
+  hprof_snapshot_find_edges: {
+    args: [FFIType.ptr, FFIType.u8, FFIType.cstring, FFIType.cstring, FFIType.cstring, FFIType.u32],
+    returns: FFIType.ptr,
+  },
+  hprof_snapshot_dot: { args: [FFIType.ptr, FFIType.u32, FFIType.u32, FFIType.u32], returns: FFIType.ptr },
   hprof_snapshot_find: {
     args: [FFIType.ptr, FFIType.u8, FFIType.cstring, FFIType.u64, FFIType.cstring, FFIType.u32],
     returns: FFIType.ptr,
@@ -308,6 +318,12 @@ export function snapshotRetained(handle: NativeHandle, topN = 30): any {
   return JSON.parse(callString(loadLib().symbols.hprof_snapshot_retained(handle, topN)))
 }
 
+export function snapshotRetainedMode(handle: NativeHandle, topN = 30, exact = false): any {
+  return JSON.parse(
+    callString(loadLib().symbols.hprof_snapshot_retained_mode(handle, topN, exact ? 1 : 0)),
+  )
+}
+
 export function snapshotFlamegraph(handle: NativeHandle, top?: number, filter?: string): any {
   return JSON.parse(
     callString(
@@ -326,6 +342,61 @@ export function snapshotTreemap(handle: NativeHandle, top?: number, filter?: str
 
 export function snapshotDiff(handle: NativeHandle, baselineHandle: NativeHandle): any {
   return JSON.parse(callString(loadLib().symbols.hprof_snapshot_diff(handle, baselineHandle)))
+}
+
+export function snapshotObjectDiff(
+  handle: NativeHandle,
+  baselineHandle: NativeHandle,
+  limit = 100,
+): any {
+  return JSON.parse(
+    callString(loadLib().symbols.hprof_snapshot_object_diff(handle, baselineHandle, limit)),
+  )
+}
+
+export function snapshotDetached(handle: NativeHandle, limit = 30, depth = 0): any {
+  return JSON.parse(callString(loadLib().symbols.hprof_snapshot_detached(handle, limit, depth)))
+}
+
+export function snapshotSizeHistogram(handle: NativeHandle): any {
+  return JSON.parse(callString(loadLib().symbols.hprof_snapshot_size_histogram(handle)))
+}
+
+export function snapshotStringStats(handle: NativeHandle, limit = 30): any {
+  return JSON.parse(callString(loadLib().symbols.hprof_snapshot_string_stats(handle, limit)))
+}
+
+export function snapshotFindEdges(
+  handle: NativeHandle,
+  options: {
+    exact?: boolean
+    name: string
+    type?: string
+    edgeType?: string
+    limit?: number
+  },
+): any {
+  return JSON.parse(
+    callString(
+      loadLib().symbols.hprof_snapshot_find_edges(
+        handle,
+        options.exact ? 1 : 0,
+        ptr(encode(options.name)),
+        ptr(encode(options.type ?? '')),
+        ptr(encode(options.edgeType ?? '')),
+        options.limit ?? 30,
+      ),
+    ),
+  )
+}
+
+export function snapshotDot(
+  handle: NativeHandle,
+  nodeIndex: number,
+  depth = 2,
+  maxNodes = 1000,
+): string {
+  return callString(loadLib().symbols.hprof_snapshot_dot(handle, nodeIndex, depth, maxNodes))
 }
 
 export function snapshotDestroy(handle: NativeHandle): void {

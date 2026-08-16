@@ -6,8 +6,10 @@
 
 mod analyze;
 mod calltree;
+mod detached;
 mod diff;
 mod dot;
+mod edges;
 mod find;
 mod flame;
 mod inspect;
@@ -15,6 +17,12 @@ mod list;
 mod owners;
 mod props;
 mod retainers;
+mod session;
+mod sizes;
+mod strings;
+mod top;
+mod trend;
+mod ui;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -275,6 +283,12 @@ impl Drop for WorkingNote {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Analyze,
+    Detached,
+    Edges,
+    Sizes,
+    Strings,
+    Session,
+    Trend,
     Diff,
     Dot,
     List,
@@ -285,6 +299,7 @@ pub enum Command {
     Owners,
     Calltree,
     Flame,
+    Top,
     Ui,
     Help,
 }
@@ -316,11 +331,17 @@ pub struct Args {
     pub exact: bool,
     /// find: only nodes of this node type
     pub node_type: Option<String>,
+    /// edges: only edges of this V8 type (property, element, internal, ...)
+    pub edge_type: Option<String>,
     /// heapprofile: restrict contribution to frames from URLs containing this
     /// substring (analyze, calltree)
     pub url: Option<String>,
     /// whether --top was passed explicitly (flame does not cap by default)
     pub top_explicit: bool,
+    /// ui: HTTP port
+    pub port: u16,
+    /// ui: open the browser after starting
+    pub open: bool,
 }
 
 impl Default for Args {
@@ -343,8 +364,11 @@ impl Default for Args {
             depth: None,
             exact: false,
             node_type: None,
+            edge_type: None,
             url: None,
             top_explicit: false,
+            port: 3000,
+            open: false,
         }
     }
 }
@@ -419,12 +443,29 @@ fn parse_args(argv: &[String]) -> Args {
                     args.node_type = Some(v);
                 }
             }
+            "--edge-type" => {
+                if let Some(v) = next(&mut i) {
+                    args.edge_type = Some(v);
+                }
+            }
             "--url" => {
                 if let Some(v) = next(&mut i) {
                     args.url = Some(v);
                 }
             }
+            "--port" => {
+                if let Some(v) = next(&mut i) {
+                    args.port = v.parse().unwrap_or(args.port);
+                }
+            }
+            "--open" => args.open = true,
             "analyze" => args.command = Command::Analyze,
+            "detached" => args.command = Command::Detached,
+            "edges" => args.command = Command::Edges,
+            "sizes" => args.command = Command::Sizes,
+            "strings" => args.command = Command::Strings,
+            "session" | "repl" => args.command = Command::Session,
+            "trend" => args.command = Command::Trend,
             "diff" => args.command = Command::Diff,
             "dot" => args.command = Command::Dot,
             "list" => args.command = Command::List,
@@ -435,6 +476,7 @@ fn parse_args(argv: &[String]) -> Args {
             "owners" => args.command = Command::Owners,
             "calltree" => args.command = Command::Calltree,
             "flame" => args.command = Command::Flame,
+            "top" => args.command = Command::Top,
             "ui" => args.command = Command::Ui,
             "help" => args.command = Command::Help,
             "bench" => {
@@ -461,8 +503,15 @@ fn print_usage() {
 
  {b}Commands:{r}
     {c}analyze{r}   Analyze profile file and print summary to stdout (default)
+    {c}detached{r}  List detached V8 nodes and optional owner chains
+    {c}edges{r}     Search object properties and edge names
+    {c}sizes{r}     Show a power-of-two self-size histogram
+    {c}strings{r}   Show referenced string statistics and duplicate contents
+    {c}session{r}   Keep one snapshot loaded and query it interactively
+    {c}ui{r}        Launch the bundled web UI through Bun
+    {c}trend{r}     Track object identity growth across snapshots
     {c}diff{r}      Compare profiles of the same type; with 3+ files, pairwise
-    {c}dot{r}       Emit call graph as DOT for use with graphviz
+    {c}dot{r}       Emit a profile call graph or snapshot object subgraph as DOT
     {c}list{r}      List sampled locations grouped by file:line (heapprofile)
     {c}inspect{r}   Inspect a heap snapshot: instances by name, paths from root
     {c}find{r}      Heap snapshot: nodes by name (substring/exact), no dominator analysis
@@ -471,6 +520,7 @@ fn print_usage() {
     {c}owners{r}    Heap snapshot: group nodes by owner chain, diff across snapshots
     {c}calltree{r}  Inclusive call tree for a sampling profile (heapprofile)
     {c}flame{r}     Folded stacks (a;b;c <size>) for flamegraph.pl / speedscope
+    {c}top{r}       Largest individual heap nodes by retained size
     {c}help{r}      Show this help message
 
  {b}Options:{r}
@@ -484,13 +534,16 @@ fn print_usage() {
    {y}--url <substr>{r}   heapprofile: only frames from URLs containing this contribute
    {y}--name <name>{r}    find/inspect/owners: node name to match (regex for inspect,
                           plain substring/exact for find/owners)
-   {y}--exact{r}          find/owners: exact name match instead of substring
+    {y}--exact{r}          find/owners: exact name; top: force exact dominators
    {y}--min-self <bytes>{r} find/owners: only nodes with self_size >= N
-   {y}--type <t>{r}       find: only nodes of this node type (object, string, ...)
+     {y}--type <t>{r}       find/edges: filter node type (object, string, ...)
+    {y}--edge-type <t>{r}  edges: only V8 edges of this type (property, element, ...)
    {y}--id <n>{r}         inspect/props/retainers: address a node by DevTools id
    {y}--index <n>{r}      inspect/props/retainers: address a node by record index
    {y}--depth <n>{r}      retainers: switch to the owner-chain walk; owners: chain depth (default 8)
    {y}--json{r}          Output as JSON
+   {y}--port <n>{r}      ui: HTTP port (default: 3000)
+   {y}--open{r}          ui: open the browser automatically
 
  {b}Heap snapshot inspection:{r}
    hprof inspect file.heapsnapshot --name JSArrayBufferData
@@ -540,10 +593,11 @@ fn print_usage() {
    {gr}hprof calltree file.heapprofile{r} — inclusive (self + subtree) tree,
    prune with {y}--url <substr>{r} or {y}--focus <re>{r}.
 
- {b}Dot output:{r}
-   Pipe to graphviz to render a graph. Examples:
-     {gr}hprof dot file.heapprofile | dot -Tsvg -o graph.svg{r}
-     {gr}hprof dot file.heapprofile | dot -Tpng -o graph.png{r}
+  {b}Dot output:{r}
+    Pipe to graphviz to render a graph. Examples:
+      {gr}hprof dot file.heapprofile | dot -Tsvg -o graph.svg{r}
+      {gr}hprof dot file.heapprofile | dot -Tpng -o graph.png{r}
+      {gr}hprof dot file.heapsnapshot --index 7396246 --depth 3{r}
 
  {b}Supported formats:{r}
    {g}.heapsnapshot{r}   V8 heap snapshot
@@ -570,11 +624,13 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Command::Ui => {
-            eprintln!(
-                "  {} the web UI is not part of the Rust CLI yet — it will be re-added later",
-                red("Error:")
-            );
-            return ExitCode::FAILURE;
+            return match ui::run(&args) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("  {} {e}", red("Error:"));
+                    ExitCode::FAILURE
+                }
+            };
         }
         _ => {}
     }
@@ -604,6 +660,31 @@ fn main() -> ExitCode {
             }
         };
     }
+    if args.command == Command::Trend {
+        return match trend::run(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("  {} {e}", red("Error:"));
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if args.command == Command::Session {
+        if args.files.len() != 1 {
+            eprintln!(
+                "  {} session requires exactly one snapshot file",
+                red("Error:")
+            );
+            return ExitCode::FAILURE;
+        }
+        return match session::run(&args.files[0]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("  {} {e}", red("Error:"));
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     let mut code = ExitCode::SUCCESS;
     for file in &args.files {
@@ -618,6 +699,10 @@ fn main() -> ExitCode {
 
         let result = match args.command {
             Command::Analyze => analyze::run(file, type_name, &args),
+            Command::Detached => detached::run(file, type_name, &args),
+            Command::Edges => edges::run(file, type_name, &args),
+            Command::Sizes => sizes::run(file, type_name, &args),
+            Command::Strings => strings::run(file, type_name, &args),
             Command::Dot => dot::run(file, type_name, &args),
             Command::List => list::run(file, type_name, &args),
             Command::Inspect => inspect::run(file, type_name, &args),
@@ -626,6 +711,7 @@ fn main() -> ExitCode {
             Command::Retainers => retainers::run(file, type_name, &args),
             Command::Calltree => calltree::run(file, type_name, &args),
             Command::Flame => flame::run(file, type_name, &args),
+            Command::Top => top::run(file, type_name, &args),
             _ => unreachable!(),
         };
 

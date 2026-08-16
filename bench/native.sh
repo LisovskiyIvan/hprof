@@ -84,9 +84,15 @@ if [ -n "$HEAPSNAP" ]; then
   records+=","
   records+="$(bench_phase find-exact-type    "$BIN" find "$HEAPSNAP" --name RenderingGroup --exact --type object)"
   records+=","
-  records+="$(bench_phase props              "$BIN" props "$HEAPSNAP" --index 8225543)"
-  records+=","
-  records+="$(bench_phase inspect-id         "$BIN" inspect "$HEAPSNAP" --id 16451087)"
+    records+="$(bench_phase props              "$BIN" props "$HEAPSNAP" --index 8225543)"
+    records+=","
+    records+="$(bench_phase inspect-id         "$BIN" inspect "$HEAPSNAP" --id 16451087)"
+    records+=","
+    records+="$(bench_phase top                "$BIN" top "$HEAPSNAP" --top 30)"
+    records+=","
+    records+="$(bench_phase detached          "$BIN" detached "$HEAPSNAP" --top 30)"
+    records+=","
+    records+="$(bench_phase size-histogram     "$BIN" sizes "$HEAPSNAP")"
 fi
 if [ -n "$TIMELINE" ]; then
   echo "heaptimeline: $(basename "$TIMELINE")"

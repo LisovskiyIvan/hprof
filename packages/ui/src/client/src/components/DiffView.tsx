@@ -32,6 +32,17 @@ interface DiffResult {
   byFunction?: DiffEntry[]
   byNodeName?: DiffEntry[]
   byNodeType?: DiffEntry[]
+  objects?: {
+    matchedCount: number
+    newCount: number
+    deletedCount: number
+    newSize: number
+    deletedSize: number
+    deltaSize: number
+    newObjects: { id: number; index: number; name: string; type: string; selfSize: number }[]
+    deletedObjects: { id: number; index: number; name: string; type: string; selfSize: number }[]
+    grownObjects: { id: number; profileIndex: number; name: string; delta: number }[]
+  }
 }
 
 interface ProfileEntry {
@@ -129,6 +140,7 @@ export default function DiffView({
           {data.byNodeType && data.byNodeType.length > 0 && (
             <DiffTable title="Node Type Δ" entries={data.byNodeType} />
           )}
+          {data.objects && <ObjectDiff data={data.objects} />}
         </div>
       )}
 
@@ -137,6 +149,37 @@ export default function DiffView({
           No other {currentType} profiles loaded. Start the server with multiple files to compare.
         </p>
       )}
+    </div>
+  )
+}
+
+function ObjectDiff({ data }: { data: NonNullable<DiffResult['objects']> }) {
+  return (
+    <div className="space-y-4">
+      <h3 className="text-sm font-semibold text-gray-300">Object identity diff</h3>
+      <p className="text-xs text-gray-400">
+        {data.matchedCount.toLocaleString()} matched · {data.newCount.toLocaleString()} new ({formatBytes(data.newSize)}) · {data.deletedCount.toLocaleString()} deleted ({formatBytes(data.deletedSize)})
+      </p>
+      {data.grownObjects.length > 0 && (
+        <SimpleObjectTable title="Growing objects" entries={data.grownObjects.map((x) => ({ id: x.id, index: x.profileIndex, name: x.name, type: '', size: x.delta }))} />
+      )}
+      {data.newObjects.length > 0 && (
+        <SimpleObjectTable title="New objects" entries={data.newObjects.map((x) => ({ id: x.id, index: x.index, name: x.name, type: x.type, size: x.selfSize }))} />
+      )}
+    </div>
+  )
+}
+
+function SimpleObjectTable({ title, entries }: { title: string; entries: { id: number; index: number; name: string; type: string; size: number }[] }) {
+  return (
+    <div>
+      <h4 className="text-xs text-gray-400 mb-1">{title}</h4>
+      <div className="bg-gray-900 rounded-lg overflow-hidden">
+        <table className="w-full text-xs">
+          <thead><tr className="border-b border-gray-800 text-gray-400"><th className="text-left px-3 py-1">ID</th><th className="text-left">Index</th><th className="text-left">Name</th><th className="text-left">Type</th><th className="text-right px-3">Size/Δ</th></tr></thead>
+          <tbody>{entries.slice(0, 50).map((entry) => <tr key={`${entry.id}-${entry.index}`} className="border-b border-gray-800/50"><td className="px-3 py-1">{entry.id}</td><td>{entry.index}</td><td>{entry.name}</td><td>{entry.type}</td><td className={entry.size > 0 ? 'text-red-400 text-right px-3' : 'text-right px-3'}>{formatBytes(entry.size)}</td></tr>)}</tbody>
+        </table>
+      </div>
     </div>
   )
 }

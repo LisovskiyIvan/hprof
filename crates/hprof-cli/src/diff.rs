@@ -3,7 +3,7 @@
 //! With more than two files the comparison is pairwise:
 //!   hprof diff a b c   →  a vs b, then b vs c.
 
-use hprof_core::{DiffEntry, HeapProfile, HeapSnapshot};
+use hprof_core::{DiffEntry, HeapProfile, HeapSnapshot, SnapshotObjectDiff};
 use serde_json::json;
 
 use crate::{dim, format_bytes, format_delta, green, print_header, print_table, red, yellow, Args};
@@ -59,7 +59,7 @@ pub fn run(args: &Args) -> Result<(), String> {
                 }
             }
             "heapsnapshot" => {
-                let d = diff_heapsnapshot(baseline_path, profile_path)?;
+                let (d, objects) = diff_heapsnapshot(baseline_path, profile_path, args.top)?;
                 if args.json {
                     docs.push(json!({
                         "baseline": baseline_path,
@@ -70,6 +70,7 @@ pub fn run(args: &Args) -> Result<(), String> {
                         "deltaTotal": d.delta_total,
                         "byNodeName": d.by_node_name,
                         "byNodeType": d.by_node_type,
+                        "objects": objects,
                     }));
                 } else {
                     print_header(
@@ -83,6 +84,7 @@ pub fn run(args: &Args) -> Result<(), String> {
                     );
                     print_diff_table("NODE NAME DELTA", &d.by_node_name, args.top);
                     print_diff_table("NODE TYPE DELTA", &d.by_node_type, args.top);
+                    print_object_diff(&objects);
                 }
             }
             _ => {
@@ -119,10 +121,15 @@ fn diff_heapprofile(
 fn diff_heapsnapshot(
     baseline_path: &str,
     profile_path: &str,
-) -> Result<hprof_core::SnapshotDiff, String> {
+    limit: usize,
+) -> Result<(hprof_core::SnapshotDiff, SnapshotObjectDiff), String> {
     let mut baseline = HeapSnapshot::new(baseline_path.to_string());
     let mut profile = HeapSnapshot::new(profile_path.to_string());
-    profile.diff(&mut baseline).map_err(|e| e.to_string())
+    let summary = profile.diff(&mut baseline).map_err(|e| e.to_string())?;
+    let objects = profile
+        .object_diff(&mut baseline, limit)
+        .map_err(|e| e.to_string())?;
+    Ok((summary, objects))
 }
 
 fn print_diff_table(title: &str, entries: &[DiffEntry], top: usize) {
@@ -149,4 +156,86 @@ fn print_diff_table(title: &str, entries: &[DiffEntry], top: usize) {
         })
         .collect();
     print_table(&["BASELINE", "PROFILE", "DELTA", "%", "NAME"], &rows);
+}
+
+fn print_object_diff(diff: &SnapshotObjectDiff) {
+    print_header(
+        "OBJECT IDENTITY DELTA",
+        Some(&format!(
+            "matched: {} | new: {} ({}) | deleted: {} ({}) | self delta: {}",
+            diff.matched_count,
+            diff.new_count,
+            format_bytes(diff.new_size),
+            diff.deleted_count,
+            format_bytes(diff.deleted_size),
+            format_delta(diff.delta_size),
+        )),
+    );
+
+    if !diff.grown_objects.is_empty() {
+        print_header("GROWN OBJECTS", None);
+        let rows = diff
+            .grown_objects
+            .iter()
+            .map(|item| {
+                vec![
+                    item.id.to_string(),
+                    item.baseline_index.to_string(),
+                    item.profile_index.to_string(),
+                    format_bytes(item.baseline_size),
+                    format_bytes(item.profile_size),
+                    red(&format_delta(item.delta)),
+                    item.name.clone(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        print_table(
+            &[
+                "ID",
+                "BASE IDX",
+                "PROFILE IDX",
+                "BASELINE",
+                "PROFILE",
+                "DELTA",
+                "NAME",
+            ],
+            &rows,
+        );
+    }
+
+    if !diff.new_objects.is_empty() {
+        print_header("NEW OBJECTS", None);
+        let rows = diff
+            .new_objects
+            .iter()
+            .map(|item| {
+                vec![
+                    item.id.to_string(),
+                    item.index.to_string(),
+                    format_bytes(item.self_size),
+                    item.type_.clone(),
+                    item.name.clone(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        print_table(&["ID", "INDEX", "SELF", "TYPE", "NAME"], &rows);
+    }
+
+    if !diff.deleted_objects.is_empty() {
+        print_header("DELETED OBJECTS", None);
+        let rows = diff
+            .deleted_objects
+            .iter()
+            .map(|item| {
+                vec![
+                    item.id.to_string(),
+                    item.index.to_string(),
+                    format_bytes(item.self_size),
+                    item.type_.clone(),
+                    item.name.clone(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        print_table(&["ID", "INDEX", "SELF", "TYPE", "NAME"], &rows);
+    }
 }

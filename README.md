@@ -105,6 +105,34 @@ hprof owners a.heapsnapshot b.heapsnapshot --name '(object elements)' --exact \
 
 `diff` accepts more than two files and compares them pairwise.
 
+### Leak-hunting helpers
+
+```bash
+# largest individual nodes; add --exact to force a dominator calculation
+hprof top Heap.heapsnapshot --top 30
+hprof top Heap.heapsnapshot --top 30 --exact
+
+# V8 detached nodes, optionally with their owner chain
+hprof detached Heap.heapsnapshot --depth 8
+
+# find objects that have a property/edge with a given name
+hprof edges Heap.heapsnapshot --name cache --exact --edge-type property
+
+# power-of-two self-size distribution and repeated string contents
+hprof sizes Heap.heapsnapshot
+hprof strings Heap.heapsnapshot --top 50
+
+# object-identity growth across every adjacent pair of snapshots
+hprof trend before.heapsnapshot after.heapsnapshot later.heapsnapshot
+```
+
+`diff` now includes object-identity counts and bounded lists of new, deleted,
+and growing nodes. Object ids are stable across V8 snapshots, so the reported
+profile indexes can be passed directly to `props`, `retainers`, or `inspect`.
+For snapshots above five million nodes, `top` is approximate by default and
+labels the result; `--exact` explicitly opts into the high-memory dominator
+calculation.
+
 ## Heap Timeline Analysis
 
 `analyze` on a `.heaptimeline` prints, in addition to the by-type summary:
@@ -125,9 +153,15 @@ hprof analyze snapshots/Heap-20260508T151658.heaptimeline --filter 'Vector3' --j
 
 - `diff <baseline> <profile> [<more>...]` — compare profiles of the same
   type; with 3+ files the comparison is pairwise
+- `trend <before> <after> [<more>...]` — object-identity growth between
+  adjacent heap snapshots
 - `find` / `props` / `retainers` / `owners` — heap snapshot queries, see above
+- `top` / `detached` / `edges` / `sizes` / `strings` — leak-hunting reports
+- `session <file.heapsnapshot>` — persistent REPL; parsed columns, edges,
+  parent map, and dominators are reused between commands
 - `list <file.heapprofile>` — sampled locations grouped by file:line
 - `dot <file.heapprofile>` — emit a call graph as DOT for graphviz
+- `dot <file.heapsnapshot> --index <n> --depth 3` — bounded object subgraph
 
 ## Large Profiles
 
@@ -148,12 +182,15 @@ Run core tests:
 cargo test --workspace
 ```
 
-## Web UI (deferred)
+## Web UI
 
-The web UI (packages/ui + packages/core) is kept but not wired into the CLI
-yet. To start the server manually once the FFI library is built:
+The web UI is available through the CLI when Bun and the workspace packages are
+installed:
 
 ```bash
 cargo build --release -p hprof-c
-bun -e 'import { startServer } from "@hprof/ui"; await startServer({ files: ["snapshots/Heap-20260508T151623.heapsnapshot"], port: 3000 })'
+hprof ui snapshots/Heap-20260508T151623.heapsnapshot --open
 ```
+
+It includes snapshot insights for detached nodes, size histograms, repeated
+strings, property search, retained-size exact mode, and object diff tables.

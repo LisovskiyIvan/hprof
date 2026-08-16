@@ -1,18 +1,19 @@
-import {
-  detectProfileType,
-  formatBytes,
-  HeapProfile,
-  HeapSnapshot,
-  HeapTimeline,
-} from '@hprof/core'
-import type {
-  ProfileType,
-  HeapProfileResult,
-  HeapSnapshotSummary,
-  HeapTimelineSummary,
-  HeapProfileSummary,
-  HeapSnapshotMeta,
-} from '@hprof/core'
+// Prefer the workspace package, but keep the CLI `hprof ui` command usable
+// from a source checkout before `bun install` has created workspace links.
+const core = await (async () => {
+  try {
+    return await import('@hprof/core')
+  } catch {
+    return await import('../../../core/src/index.ts')
+  }
+})()
+const { detectProfileType, formatBytes, HeapProfile, HeapSnapshot, HeapTimeline } = core
+type ProfileType = 'heapsnapshot' | 'heapprofile' | 'heaptimeline'
+type HeapProfileResult = any
+type HeapSnapshotSummary = any
+type HeapTimelineSummary = any
+type HeapProfileSummary = any
+type HeapSnapshotMeta = any
 import path from 'path'
 import { fileURLToPath } from 'url'
 
@@ -412,7 +413,63 @@ async function handleApiRequest(url: URL): Promise<Response> {
         return errorResponse('Retained size only available for heapsnapshot')
       }
       const topN = Number(url.searchParams.get('top') ?? '30')
-      return jsonResponse(await data.snapshot!.getRetainedEntries(topN))
+      const exact = url.searchParams.get('exact') === '1'
+      return jsonResponse(await data.snapshot!.getRetainedEntries(topN, exact))
+    }
+
+    case 'detached': {
+      if (data.type !== 'heapsnapshot') {
+        return errorResponse('Detached nodes only available for heapsnapshot')
+      }
+      const top = Number(url.searchParams.get('top') ?? '30')
+      const depth = Number(url.searchParams.get('depth') ?? '0')
+      return jsonResponse(await data.snapshot!.detached(top, depth))
+    }
+
+    case 'histogram': {
+      if (data.type !== 'heapsnapshot') {
+        return errorResponse('Size histogram only available for heapsnapshot')
+      }
+      return jsonResponse(await data.snapshot!.sizeHistogram())
+    }
+
+    case 'strings': {
+      if (data.type !== 'heapsnapshot') {
+        return errorResponse('String statistics only available for heapsnapshot')
+      }
+      const top = Number(url.searchParams.get('top') ?? '30')
+      return jsonResponse(await data.snapshot!.stringStats(top))
+    }
+
+    case 'edge-search': {
+      if (data.type !== 'heapsnapshot') {
+        return errorResponse('Edge search only available for heapsnapshot')
+      }
+      const name = url.searchParams.get('name')
+      if (!name) return errorResponse('name query parameter required')
+      return jsonResponse(
+        data.snapshot!.findEdges({
+          name,
+          exact: url.searchParams.get('exact') === '1',
+          type: url.searchParams.get('type') ?? undefined,
+          edgeType: url.searchParams.get('edgeType') ?? undefined,
+          limit: Number(url.searchParams.get('top') ?? '30'),
+        }),
+      )
+    }
+
+    case 'dot': {
+      if (data.type !== 'heapsnapshot') {
+        return errorResponse('Snapshot DOT only available for heapsnapshot')
+      }
+      const index = Number(url.searchParams.get('index'))
+      if (!Number.isFinite(index) || index < 0) return errorResponse('index query parameter required')
+      const dot = data.snapshot!.dot(
+        index,
+        Number(url.searchParams.get('depth') ?? '2'),
+        Number(url.searchParams.get('maxNodes') ?? '1000'),
+      )
+      return new Response(dot, { headers: { 'Content-Type': 'text/vnd.graphviz' } })
     }
 
     case 'flamegraph': {

@@ -68,6 +68,7 @@ pub struct NodeFieldOffsets {
     pub self_size: usize,
     pub id: usize,
     pub edge_count: usize,
+    pub detachedness: Option<usize>,
 }
 
 impl NodeFieldOffsets {
@@ -98,6 +99,7 @@ impl NodeFieldOffsets {
             self_size,
             id,
             edge_count,
+            detachedness: fields.iter().position(|f| f == "detachedness"),
         })
     }
 }
@@ -220,7 +222,8 @@ pub struct SearchMatch {
     pub value: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RetainedEntry {
     pub node_index: usize,
     pub name: String,
@@ -230,7 +233,8 @@ pub struct RetainedEntry {
     pub approximate: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RetainedResult {
     pub approximate: bool,
     pub retained: Vec<RetainedEntry>,
@@ -499,6 +503,134 @@ pub struct SnapshotDiff {
     pub delta_total: i64,
     pub by_node_name: Vec<DiffEntry>,
     pub by_node_type: Vec<DiffEntry>,
+}
+
+/// One object present in one heap snapshot. Object ids are stable across
+/// snapshots and can be passed back to `inspect --id`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotObject {
+    pub index: usize,
+    pub id: usize,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub self_size: usize,
+    pub edge_count: usize,
+}
+
+/// Size change for an object that exists in both snapshots.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotObjectChange {
+    pub id: usize,
+    pub baseline_index: usize,
+    pub profile_index: usize,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub baseline_size: usize,
+    pub profile_size: usize,
+    pub delta: i64,
+}
+
+/// Object-identity diff for two heap snapshots. The vectors are bounded by
+/// the requested top limit; counts and byte totals cover all objects.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotObjectDiff {
+    pub matched_count: usize,
+    pub new_count: usize,
+    pub deleted_count: usize,
+    pub new_size: usize,
+    pub deleted_size: usize,
+    pub delta_size: i64,
+    pub new_objects: Vec<SnapshotObject>,
+    pub deleted_objects: Vec<SnapshotObject>,
+    pub grown_objects: Vec<SnapshotObjectChange>,
+}
+
+/// A detached node and the owner chain that keeps it reachable, when
+/// available. The detachedness value is kept because V8 can emit more than
+/// one non-zero marker depending on the producer.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetachedNode {
+    pub node: SnapshotObject,
+    pub detachedness: u8,
+    pub owner_chain: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetachedSummary {
+    pub total_count: usize,
+    pub total_size: usize,
+    pub entries: Vec<DetachedNode>,
+}
+
+/// Query for a property/edge name. `type_filter` applies to the retaining
+/// source node; `edge_type` applies to the V8 edge kind.
+#[derive(Debug, Clone)]
+pub struct EdgeQuery {
+    pub name: String,
+    pub exact: bool,
+    pub type_filter: Option<String>,
+    pub edge_type: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgeMatch {
+    pub source_index: usize,
+    pub source_id: usize,
+    pub source_name: String,
+    #[serde(rename = "sourceType")]
+    pub source_type: String,
+    pub edge_type: String,
+    pub name: String,
+    pub target_index: usize,
+    pub target_id: usize,
+    pub target_name: String,
+    #[serde(rename = "targetType")]
+    pub target_type: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SizeBucket {
+    pub min_size: usize,
+    pub max_size: usize,
+    pub count: usize,
+    pub total_size: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SizeHistogram {
+    pub total_count: usize,
+    pub total_size: usize,
+    pub buckets: Vec<SizeBucket>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StringStatEntry {
+    pub value: String,
+    pub references: usize,
+    pub byte_length: usize,
+    pub referenced_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StringStats {
+    pub total_strings: usize,
+    pub total_bytes: usize,
+    pub referenced_strings: usize,
+    pub referenced_bytes: usize,
+    pub entries: Vec<StringStatEntry>,
 }
 
 // ============================================================================

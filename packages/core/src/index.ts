@@ -38,6 +38,14 @@ export type {
   HeapSnapshotOwnerGroup,
   HeapSnapshotOwnerAnalysis,
   SnapshotDiff,
+  SnapshotObject,
+  SnapshotObjectChange,
+  SnapshotObjectDiff,
+  DetachedNode,
+  DetachedSummary,
+  SizeHistogram,
+  StringStats,
+  HeapSnapshotEdgeMatch,
 } from './heapsnapshot.ts'
 
 export { HeapTimeline } from './heaptimeline.ts'

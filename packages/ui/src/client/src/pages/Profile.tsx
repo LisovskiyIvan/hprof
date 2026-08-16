@@ -11,6 +11,7 @@ import CallGraph from '../components/CallGraph'
 import Treemap from '../components/Treemap'
 import DiffView from '../components/DiffView'
 import SourceListing from '../components/SourceListing'
+import SnapshotInsights from '../components/SnapshotInsights'
 import { fetchJson } from '../lib/api'
 
 type Tab =
@@ -25,6 +26,7 @@ type Tab =
   | 'retained'
   | 'diff'
   | 'search'
+  | 'insights'
 
 interface Meta {
   fileName: string
@@ -106,6 +108,7 @@ export default function Profile() {
       show: meta?.type === 'heapprofile' || meta?.type === 'heapsnapshot',
     },
     { key: 'search', label: 'Search', show: true },
+    { key: 'insights', label: 'Insights', show: meta?.type === 'heapsnapshot' },
   ]
 
   if (error) {
@@ -174,6 +177,7 @@ export default function Profile() {
         {tab === 'retained' && <RetainedSize base={base} />}
         {tab === 'diff' && <DiffView base={base} currentPath={filePath} currentType={meta.type} />}
         {tab === 'search' && <Search base={base} type={meta.type} />}
+        {tab === 'insights' && <SnapshotInsights base={base} />}
       </main>
     </div>
   )

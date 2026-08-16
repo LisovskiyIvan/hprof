@@ -149,6 +149,78 @@ export interface SnapshotDiff {
   deltaTotal: number
   byNodeName: DiffEntry[]
   byNodeType: DiffEntry[]
+  objects?: SnapshotObjectDiff
+}
+
+export interface SnapshotObject {
+  index: number
+  id: number
+  name: string
+  type: string
+  selfSize: number
+  edgeCount: number
+}
+
+export interface SnapshotObjectChange {
+  id: number
+  baselineIndex: number
+  profileIndex: number
+  name: string
+  type: string
+  baselineSize: number
+  profileSize: number
+  delta: number
+}
+
+export interface SnapshotObjectDiff {
+  matchedCount: number
+  newCount: number
+  deletedCount: number
+  newSize: number
+  deletedSize: number
+  deltaSize: number
+  newObjects: SnapshotObject[]
+  deletedObjects: SnapshotObject[]
+  grownObjects: SnapshotObjectChange[]
+}
+
+export interface DetachedNode {
+  node: SnapshotObject
+  detachedness: number
+  ownerChain: string
+}
+
+export interface DetachedSummary {
+  totalCount: number
+  totalSize: number
+  entries: DetachedNode[]
+}
+
+export interface SizeHistogram {
+  totalCount: number
+  totalSize: number
+  buckets: { minSize: number; maxSize: number; count: number; totalSize: number }[]
+}
+
+export interface StringStats {
+  totalStrings: number
+  totalBytes: number
+  referencedStrings: number
+  referencedBytes: number
+  entries: { value: string; references: number; byteLength: number; referencedBytes: number }[]
+}
+
+export interface HeapSnapshotEdgeMatch {
+  sourceIndex: number
+  sourceId: number
+  sourceName: string
+  sourceType: string
+  edgeType: string
+  name: string
+  targetIndex: number
+  targetId: number
+  targetName: string
+  targetType: string
 }
 
 export class HeapSnapshot {
@@ -301,8 +373,9 @@ export class HeapSnapshot {
 
   async getRetainedEntries(
     topN = 30,
+    exact = false,
   ): Promise<{ approximate: boolean; retained: HeapSnapshotRetainedEntry[] }> {
-    const raw = ffi.snapshotRetained(this.handle, topN)
+    const raw = ffi.snapshotRetainedMode(this.handle, topN, exact)
     return {
       approximate: raw.approximate,
       retained: raw.retained.map((e: any) => ({
@@ -314,6 +387,32 @@ export class HeapSnapshot {
         approximate: e.approximate,
       })),
     }
+  }
+
+  async detached(limit = 30, depth = 0): Promise<DetachedSummary> {
+    return ffi.snapshotDetached(this.handle, limit, depth) as DetachedSummary
+  }
+
+  async sizeHistogram(): Promise<SizeHistogram> {
+    return ffi.snapshotSizeHistogram(this.handle) as SizeHistogram
+  }
+
+  async stringStats(limit = 30): Promise<StringStats> {
+    return ffi.snapshotStringStats(this.handle, limit) as StringStats
+  }
+
+  findEdges(options: {
+    exact?: boolean
+    name: string
+    type?: string
+    edgeType?: string
+    limit?: number
+  }): HeapSnapshotEdgeMatch[] {
+    return ffi.snapshotFindEdges(this.handle, options) as HeapSnapshotEdgeMatch[]
+  }
+
+  dot(nodeIndex: number, depth = 2, maxNodes = 1000): string {
+    return ffi.snapshotDot(this.handle, nodeIndex, depth, maxNodes)
   }
 
   async flamegraph(options?: { top?: number; filter?: string }): Promise<FlamegraphFrame> {
@@ -332,6 +431,7 @@ export class HeapSnapshot {
       deltaTotal: raw.deltaTotal,
       byNodeName: raw.byNodeName,
       byNodeType: raw.byNodeType,
+      objects: raw.objects,
     }
   }
 
