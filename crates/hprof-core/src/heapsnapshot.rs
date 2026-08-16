@@ -69,15 +69,30 @@ pub struct ParentMap {
     pub edge_name_or_index: Vec<u32>,
 }
 
+/// Node records in struct-of-arrays layout, one entry per node. The fields
+/// V8 writes per record are split into typed columns; fields we never read
+/// (`detachedness`, `trace_node_id`) are dropped entirely. For a 26M-node
+/// snapshot this is ~470MB instead of ~625MB interleaved, and the column
+/// scans (summary aggregation, find) read contiguous memory instead of
+/// striding through interleaved records.
+pub struct NodeColumns {
+    /// index into `node_types` (V8 has a small fixed set; u16 is ample)
+    pub types: Vec<u16>,
+    /// index into the string table
+    pub names: Vec<u32>,
+    pub ids: Vec<u32>,
+    pub self_sizes: Vec<u32>,
+    pub edge_counts: Vec<u32>,
+}
+
 pub struct RawData {
     pub meta: SnapshotMeta,
     pub mmap: Mmap,
-    pub nodes: Vec<u32>,
+    pub nodes: NodeColumns,
     /// byte range of the `edges` array content (start..=end), parsed on demand
     edges_range: Option<(usize, usize)>,
     pub edges: Option<Vec<u32>>,
     pub strings: StringTable,
-    pub node_offsets: NodeFieldOffsets,
     pub edge_offsets: EdgeFieldOffsets,
     pub node_types: Vec<String>,
     pub edge_types: Vec<String>,
@@ -370,6 +385,41 @@ impl HeapSnapshot {
         let node_field_count = meta.meta.node_fields.len();
         let edge_field_count = meta.meta.edge_fields.len();
 
+        // split the flat node records into typed columns, dropping the fields
+        // nothing reads. The flat vector is a transient (~625MB for 26M
+        // nodes); the columns it becomes are ~470MB.
+        let nodes = {
+            let flat = nodes;
+            let types: Vec<u16> = flat
+                .par_chunks(node_field_count)
+                .map(|r| r[node_offsets.type_] as u16)
+                .collect();
+            let names: Vec<u32> = flat
+                .par_chunks(node_field_count)
+                .map(|r| r[node_offsets.name])
+                .collect();
+            let ids: Vec<u32> = flat
+                .par_chunks(node_field_count)
+                .map(|r| r[node_offsets.id])
+                .collect();
+            let self_sizes: Vec<u32> = flat
+                .par_chunks(node_field_count)
+                .map(|r| r[node_offsets.self_size])
+                .collect();
+            let edge_counts: Vec<u32> = flat
+                .par_chunks(node_field_count)
+                .map(|r| r[node_offsets.edge_count])
+                .collect();
+            drop(flat);
+            NodeColumns {
+                types,
+                names,
+                ids,
+                self_sizes,
+                edge_counts,
+            }
+        };
+
         // the edges array is located lazily in ensure_edges — locating it
         // here would scan the whole (often ~700MB) edges array even for
         // queries that never touch edges
@@ -384,7 +434,6 @@ impl HeapSnapshot {
             edges_range: None,
             edges: None,
             strings: strings_table,
-            node_offsets,
             edge_offsets,
             node_types,
             edge_types,
@@ -436,12 +485,12 @@ impl HeapSnapshot {
     }
 
     fn create_node(raw: &RawData, node_index: usize) -> HeapSnapshotNode {
-        let base = node_index * raw.node_field_count;
-        let type_idx = raw.nodes[base + raw.node_offsets.type_] as usize;
-        let name_idx = raw.nodes[base + raw.node_offsets.name] as usize;
-        let self_size = raw.nodes[base + raw.node_offsets.self_size] as usize;
-        let id = raw.nodes[base + raw.node_offsets.id] as usize;
-        let edge_count = raw.nodes[base + raw.node_offsets.edge_count] as usize;
+        let col = &raw.nodes;
+        let type_idx = col.types[node_index] as usize;
+        let name_idx = col.names[node_index] as usize;
+        let self_size = col.self_sizes[node_index] as usize;
+        let id = col.ids[node_index] as usize;
+        let edge_count = col.edge_counts[node_index] as usize;
 
         let type_ = raw
             .node_types
@@ -486,15 +535,11 @@ impl HeapSnapshot {
         // array would otherwise be parsed twice (~350MB of scanning).
         self.ensure_raw()?;
         let raw = self.raw.as_ref().unwrap();
-        let nodes = &raw.nodes;
-        let node_field_count = raw.node_field_count;
-        let type_offset = raw.node_offsets.type_;
-        let name_offset = raw.node_offsets.name;
-        let self_size_offset = raw.node_offsets.self_size;
+        let col = &raw.nodes;
         let node_types = raw.node_types.as_slice();
         let strings = &raw.strings;
 
-        let total_node_count = nodes.len() / node_field_count;
+        let total_node_count = col.ids.len();
 
         let chunks_per_thread = (total_node_count / rayon::current_num_threads().max(1)).max(1);
         let partials: Vec<(
@@ -502,21 +547,19 @@ impl HeapSnapshot {
             usize,
             AHashMap<u32, (usize, usize, u32)>,
             AHashMap<u32, (usize, usize)>,
-        )> = nodes
-            .par_chunks(chunks_per_thread * node_field_count)
+        )> = (0..total_node_count)
+            .into_par_iter()
+            .chunks(chunks_per_thread)
             .map(|chunk| {
                 let mut local_size = 0usize;
                 let mut local_count = 0usize;
                 let mut local_by_name: AHashMap<u32, (usize, usize, u32)> = AHashMap::new();
                 let mut local_by_type: AHashMap<u32, (usize, usize)> = AHashMap::new();
 
-                for c in chunk.chunks(node_field_count) {
-                    if c.len() < node_field_count {
-                        break;
-                    }
-                    let type_idx = c[type_offset];
-                    let name_idx = c[name_offset];
-                    let self_size = c[self_size_offset] as usize;
+                for n in chunk {
+                    let type_idx = col.types[n] as u32;
+                    let name_idx = col.names[n];
+                    let self_size = col.self_sizes[n] as usize;
                     local_count += 1;
                     local_size += self_size;
 
@@ -636,12 +679,12 @@ impl HeapSnapshot {
 
         if numeric_sort {
             // keep the top-`wanted` by the numeric key
+            let col = &raw.nodes;
             let key_of = |node_index: usize| -> u64 {
-                let base = node_index * raw.node_field_count;
                 match options.sort {
-                    SortField::SelfSize => raw.nodes[base + raw.node_offsets.self_size] as u64,
-                    SortField::Id => raw.nodes[base + raw.node_offsets.id] as u64,
-                    SortField::EdgeCount => raw.nodes[base + raw.node_offsets.edge_count] as u64,
+                    SortField::SelfSize => col.self_sizes[node_index] as u64,
+                    SortField::Id => col.ids[node_index] as u64,
+                    SortField::EdgeCount => col.edge_counts[node_index] as u64,
                     _ => unreachable!(),
                 }
             };
@@ -651,9 +694,8 @@ impl HeapSnapshot {
                 std::collections::BinaryHeap::with_capacity(wanted + 1);
 
             for node_index in 0..raw.meta.node_count {
-                let base = node_index * raw.node_field_count;
                 if let Some(ft) = options.type_filter {
-                    let type_idx = raw.nodes[base + raw.node_offsets.type_] as usize;
+                    let type_idx = col.types[node_index] as usize;
                     let type_ = raw
                         .node_types
                         .get(type_idx)
@@ -701,9 +743,9 @@ impl HeapSnapshot {
             });
         }
 
+        let col = &raw.nodes;
         for node_index in 0..raw.meta.node_count {
-            let base = node_index * raw.node_field_count;
-            let type_idx = raw.nodes[base + raw.node_offsets.type_] as usize;
+            let type_idx = col.types[node_index] as usize;
             let type_ = raw
                 .node_types
                 .get(type_idx)
@@ -716,7 +758,7 @@ impl HeapSnapshot {
                 }
             }
 
-            let name_idx = raw.nodes[base + raw.node_offsets.name] as usize;
+            let name_idx = col.names[node_index] as usize;
             let name = if need_name {
                 raw.strings
                     .resolve(&raw.mmap, name_idx)
@@ -731,9 +773,9 @@ impl HeapSnapshot {
                 }
             }
 
-            let self_size = raw.nodes[base + raw.node_offsets.self_size] as usize;
-            let id = raw.nodes[base + raw.node_offsets.id] as usize;
-            let edge_count = raw.nodes[base + raw.node_offsets.edge_count] as usize;
+            let self_size = col.self_sizes[node_index] as usize;
+            let id = col.ids[node_index] as usize;
+            let edge_count = col.edge_counts[node_index] as usize;
 
             let node = HeapSnapshotNode {
                 type_,
@@ -783,12 +825,12 @@ impl HeapSnapshot {
     /// Build a node from a record index, resolving the name (used by the fast
     /// numeric-sort page path after selection).
     fn create_node_raw(raw: &RawData, node_index: usize, with_name: bool) -> HeapSnapshotNode {
-        let base = node_index * raw.node_field_count;
-        let type_idx = raw.nodes[base + raw.node_offsets.type_] as usize;
-        let name_idx = raw.nodes[base + raw.node_offsets.name] as usize;
-        let self_size = raw.nodes[base + raw.node_offsets.self_size] as usize;
-        let id = raw.nodes[base + raw.node_offsets.id] as usize;
-        let edge_count = raw.nodes[base + raw.node_offsets.edge_count] as usize;
+        let col = &raw.nodes;
+        let type_idx = col.types[node_index] as usize;
+        let name_idx = col.names[node_index] as usize;
+        let self_size = col.self_sizes[node_index] as usize;
+        let id = col.ids[node_index] as usize;
+        let edge_count = col.edge_counts[node_index] as usize;
 
         let type_ = raw
             .node_types
@@ -885,8 +927,7 @@ impl HeapSnapshot {
         let mut offset = 0u32;
         for i in 0..node_count {
             starts.push(offset);
-            let base = i * raw.node_field_count;
-            offset += raw.nodes[base + raw.node_offsets.edge_count];
+            offset += raw.nodes.edge_counts[i];
         }
         starts.push(offset);
         self.edge_starts = Some(starts);
@@ -1111,8 +1152,7 @@ impl HeapSnapshot {
         // the reverse-preorder walk visits them first.
         let mut retained = vec![0.0f64; node_count];
         for &node in &vertex {
-            let base = node as usize * raw.node_field_count;
-            retained[node as usize] = raw.nodes[base + raw.node_offsets.self_size] as f64;
+            retained[node as usize] = raw.nodes.self_sizes[node as usize] as f64;
         }
         for w in (1..vertex.len()).rev() {
             let child = vertex[w] as usize;
@@ -1247,10 +1287,7 @@ impl HeapSnapshot {
         let mut by_name: AHashMap<u32, (usize, usize)> = AHashMap::new();
         let mut by_type: AHashMap<u32, (usize, usize)> = AHashMap::new();
         // capture only Sync fields — RawData contains a RefCell string memo
-        let nodes = &raw.nodes;
-        let nfc = raw.node_field_count;
-        let name_off = raw.node_offsets.name;
-        let type_off = raw.node_offsets.type_;
+        let col = &raw.nodes;
         let retained = &rd.retained;
         let idoms = &rd.idoms;
         let chunks_per_thread = (node_count / rayon::current_num_threads().max(1)).max(1);
@@ -1266,13 +1303,11 @@ impl HeapSnapshot {
                     if retained == 0 {
                         continue;
                     }
-                    let base = n * nfc;
-                    let name_idx = nodes[base + name_off];
-                    let type_idx = nodes[base + type_off];
+                    let name_idx = col.names[n];
+                    let type_idx = col.types[n] as u32;
                     let dom = idoms[n] as usize;
                     let (dom_name, dom_type) = if dom < node_count && dom != n {
-                        let dbase = dom * nfc;
-                        (nodes[dbase + name_off], nodes[dbase + type_off])
+                        (col.names[dom], col.types[dom] as u32)
                     } else {
                         (u32::MAX, u32::MAX)
                     };
@@ -1374,14 +1409,12 @@ impl HeapSnapshot {
         // (`contains_ci`) without allocating a lowercased copy per name — the
         // snapshots contain multi-megabyte inline strings that make that
         // allocation dominant.
-        let nodes = &raw.nodes;
-        let nfc = raw.node_field_count;
-        let name_off = raw.node_offsets.name;
+        let col = &raw.nodes;
         let mut distinct: Vec<u32> = {
             let mut set: std::collections::HashSet<u32> = std::collections::HashSet::new();
             set.reserve(raw.meta.node_count / 16);
             for n in 0..raw.meta.node_count {
-                set.insert(nodes[n * nfc + name_off]);
+                set.insert(col.names[n]);
             }
             set.into_iter().collect()
         };
@@ -1411,8 +1444,7 @@ impl HeapSnapshot {
             .map(|chunk| {
                 let mut found: Vec<(usize, usize)> = Vec::new();
                 for n in chunk {
-                    let base = n * nfc;
-                    let name_idx = nodes[base + name_off];
+                    let name_idx = col.names[n];
                     if !contains_ci(&name_cache[&name_idx], query) {
                         continue;
                     }
@@ -1450,10 +1482,9 @@ impl HeapSnapshot {
     pub fn find_by_id(&mut self, id: usize) -> crate::Result<Option<usize>> {
         self.ensure_raw()?;
         let raw = self.raw.as_ref().unwrap();
-        let id_offset = raw.node_offsets.id;
+        let ids = &raw.nodes.ids;
         for n in 0..raw.meta.node_count {
-            let base = n * raw.node_field_count;
-            if raw.nodes[base + id_offset] as usize == id {
+            if ids[n] as usize == id {
                 return Ok(Some(n));
             }
         }
@@ -1665,13 +1696,7 @@ impl HeapSnapshot {
         if query.name.is_empty() {
             return Ok(Vec::new());
         }
-        let nodes = &raw.nodes;
-        let nfc = raw.node_field_count;
-        let name_off = raw.node_offsets.name;
-        let type_off = raw.node_offsets.type_;
-        let self_off = raw.node_offsets.self_size;
-        let id_off = raw.node_offsets.id;
-        let edge_count_off = raw.node_offsets.edge_count;
+        let col = &raw.nodes;
 
         // Pre-resolve every distinct node name once, in parallel (the string
         // memo is a RefCell / not Sync, so decode off the raw byte spans).
@@ -1679,7 +1704,7 @@ impl HeapSnapshot {
             let mut set: std::collections::HashSet<u32> = std::collections::HashSet::new();
             set.reserve(raw.meta.node_count / 16);
             for n in 0..raw.meta.node_count {
-                set.insert(nodes[n * nfc + name_off]);
+                set.insert(col.names[n]);
             }
             set.into_iter().collect()
         };
@@ -1722,8 +1747,7 @@ impl HeapSnapshot {
             .map(|chunk| {
                 let mut found: Vec<(usize, usize)> = Vec::new();
                 for n in chunk {
-                    let base = n * nfc;
-                    let name = &name_cache[&nodes[base + name_off]];
+                    let name = &name_cache[&col.names[n]];
                     let matches = if exact {
                         eq_ci(name, query_name)
                     } else {
@@ -1732,13 +1756,13 @@ impl HeapSnapshot {
                     if !matches {
                         continue;
                     }
-                    let self_size = nodes[base + self_off] as usize;
+                    let self_size = col.self_sizes[n] as usize;
                     if self_size < min_self {
                         continue;
                     }
                     if let Some(tf) = type_filter {
                         let t = node_types
-                            .get(nodes[base + type_off] as usize)
+                            .get(col.types[n] as usize)
                             .map(|s| s.as_str())
                             .unwrap_or("");
                         if !eq_ci(t, tf) {
@@ -1759,20 +1783,19 @@ impl HeapSnapshot {
         Ok(found
             .into_iter()
             .map(|(idx, _)| {
-                let base = idx * nfc;
-                let type_idx = nodes[base + type_off] as usize;
-                let name_idx = nodes[base + name_off] as usize;
+                let type_idx = col.types[idx] as usize;
+                let name_idx = col.names[idx] as usize;
                 NameMatch {
                     node_index: idx,
-                    id: nodes[base + id_off] as usize,
+                    id: col.ids[idx] as usize,
                     name: raw.strings.resolve(&raw.mmap, name_idx).unwrap_or_default(),
                     type_: raw
                         .node_types
                         .get(type_idx)
                         .cloned()
                         .unwrap_or_else(|| type_idx.to_string()),
-                    self_size: nodes[base + self_off] as usize,
-                    edge_count: nodes[base + edge_count_off] as usize,
+                    self_size: col.self_sizes[idx] as usize,
+                    edge_count: col.edge_counts[idx] as usize,
                 }
             })
             .collect())
@@ -1799,8 +1822,7 @@ impl HeapSnapshot {
         let start = edge_starts[node_index] as usize;
         let end = edge_starts[node_index + 1] as usize;
         let edges = raw.edges.as_ref().unwrap();
-        let nodes = &raw.nodes;
-        let nfc = raw.node_field_count;
+        let col = &raw.nodes;
 
         let mut props = Vec::with_capacity(end - start);
         for edge_index in start..end {
@@ -1829,8 +1851,7 @@ impl HeapSnapshot {
                     name: format!("<out of range #{to_node}>"),
                 }
             } else {
-                let tbase = to_node * nfc;
-                let ttype_idx = nodes[tbase + raw.node_offsets.type_] as usize;
+                let ttype_idx = col.types[to_node] as usize;
                 let ttype = raw
                     .node_types
                     .get(ttype_idx)
@@ -1838,7 +1859,7 @@ impl HeapSnapshot {
                     .unwrap_or_else(|| ttype_idx.to_string());
                 let tname = raw
                     .strings
-                    .resolve(&raw.mmap, nodes[tbase + raw.node_offsets.name] as usize)
+                    .resolve(&raw.mmap, col.names[to_node] as usize)
                     .unwrap_or_default();
                 if ttype == "number" || ttype == "bigint" {
                     match tname.parse::<f64>() {
@@ -1850,7 +1871,7 @@ impl HeapSnapshot {
                 } else {
                     PropertyValue::Ref {
                         index: to_node,
-                        id: nodes[tbase + raw.node_offsets.id] as usize,
+                        id: col.ids[to_node] as usize,
                         node_type: ttype,
                         name: tname,
                     }
@@ -1933,8 +1954,7 @@ impl HeapSnapshot {
         }
 
         let pm = self.parents.as_ref().unwrap();
-        let nodes = &raw.nodes;
-        let nfc = raw.node_field_count;
+        let col = &raw.nodes;
         let mut chain: Vec<RetainerChainNode> = Vec::with_capacity(max_depth.min(64) + 1);
         let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut cur = node_index;
@@ -1947,9 +1967,8 @@ impl HeapSnapshot {
                 }
                 break;
             }
-            let base = cur * nfc;
-            let type_idx = nodes[base + raw.node_offsets.type_] as usize;
-            let name_idx = nodes[base + raw.node_offsets.name] as usize;
+            let type_idx = col.types[cur] as usize;
+            let name_idx = col.names[cur] as usize;
             let parent = pm.index[cur];
             let edge_type = if parent == u32::MAX {
                 String::new()
@@ -1970,15 +1989,15 @@ impl HeapSnapshot {
             };
             chain.push(RetainerChainNode {
                 node_index: cur,
-                id: nodes[base + raw.node_offsets.id] as usize,
+                id: col.ids[cur] as usize,
                 name: raw.strings.resolve(&raw.mmap, name_idx).unwrap_or_default(),
                 type_: raw
                     .node_types
                     .get(type_idx)
                     .cloned()
                     .unwrap_or_else(|| type_idx.to_string()),
-                self_size: nodes[base + raw.node_offsets.self_size] as usize,
-                edge_count: nodes[base + raw.node_offsets.edge_count] as usize,
+                self_size: col.self_sizes[cur] as usize,
+                edge_count: col.edge_counts[cur] as usize,
                 edge_type,
                 edge_name,
                 cycle: false,
@@ -2316,12 +2335,12 @@ fn compare_node_indices(
     sort: SortField,
     dir: SortDir,
 ) -> std::cmp::Ordering {
+    let col = &raw.nodes;
     let num = |idx: usize| -> u64 {
-        let base = idx * raw.node_field_count;
         match sort {
-            SortField::SelfSize => raw.nodes[base + raw.node_offsets.self_size] as u64,
-            SortField::Id => raw.nodes[base + raw.node_offsets.id] as u64,
-            SortField::EdgeCount => raw.nodes[base + raw.node_offsets.edge_count] as u64,
+            SortField::SelfSize => col.self_sizes[idx] as u64,
+            SortField::Id => col.ids[idx] as u64,
+            SortField::EdgeCount => col.edge_counts[idx] as u64,
             _ => 0,
         }
     };
