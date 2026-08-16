@@ -67,18 +67,19 @@ pub fn gray(s: &str) -> String {
 
 const ANSI_RE: &str = r"\x1b\[[0-9;]*m";
 
+fn ansi_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(ANSI_RE).expect("static ANSI regex"))
+}
+
 fn strip_ansi(s: &str) -> String {
-    regex::Regex::new(ANSI_RE)
-        .unwrap()
-        .replace_all(s, "")
-        .into_owned()
+    ansi_re().replace_all(s, "").into_owned()
 }
 
 /// Collapse ANSI codes + control characters + whitespace (for column width
 /// measurement).
 fn normalize_cell(s: &str) -> String {
-    let re = regex::Regex::new(ANSI_RE).unwrap();
-    let plain = re.replace_all(s, "");
+    let plain = ansi_re().replace_all(s, "");
     let plain = plain
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -112,7 +113,10 @@ fn pad_visible(s: &str, width: usize) -> String {
 /// Re-apply the leading color code of `source` to `text` (used for the
 /// truncated last column so the colour survives truncation).
 fn apply_cell_style(source: &str, text: &str) -> String {
-    let re = regex::Regex::new(&format!(r"(?s)^({ANSI_RE})(.*?)({ANSI_RE})?$")).unwrap();
+    static STYLE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = STYLE_RE.get_or_init(|| {
+        regex::Regex::new(&format!(r"(?s)^({ANSI_RE})(.*?)({ANSI_RE})?$")).unwrap()
+    });
     if let Some(caps) = re.captures(source) {
         if caps.get(1).is_some() {
             let lead = caps.get(1).unwrap().as_str();

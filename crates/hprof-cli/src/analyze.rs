@@ -510,7 +510,7 @@ fn analyze_heaptimeline(file: &str, args: &Args) -> Result<(), String> {
             "Objects allocated over time",
             Some(&format!(
                 "+{} objects in {}",
-                (growth.objects_end - growth.objects_start).to_string(),
+                (growth.objects_end - growth.objects_start),
                 format_duration(growth.span_us as f64 / 1000.0)
             )),
         );

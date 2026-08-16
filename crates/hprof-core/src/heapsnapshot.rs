@@ -887,9 +887,14 @@ impl HeapSnapshot {
         // flat reverse CSR in pre space: node with pre `w` is referenced by
         // sources rev_sources[rev_starts[w]..rev_starts[w+1]] (pre numbers).
         // Sources unreachable from root cannot dominate anything and are
-        // skipped.
-        let mut counts = vec![0u32; node_count];
+        // skipped. Sized to the reachable set (vertex.len()), not node_count —
+        // preorder numbers only ever index the reachable nodes.
+        let reachable = vertex.len();
+        let mut counts = vec![0u32; reachable];
         for n in 0..node_count {
+            if preorder[n] == u32::MAX {
+                continue;
+            }
             let start = edge_starts[n] as usize;
             let end = edge_starts[n + 1] as usize;
             for edge_index in start..end {
@@ -901,13 +906,22 @@ impl HeapSnapshot {
                 }
             }
         }
-        let mut rev_starts = vec![0u32; node_count + 1];
-        for n in 0..node_count {
-            rev_starts[n + 1] = rev_starts[n] + counts[n];
+        // reuse `counts` as the write cursor so no second 105MB scratch vec
+        // is needed: prefix-sum it in place into `rev_starts` afterwards.
+        let mut rev_starts = counts.clone();
+        let mut prefix = 0u32;
+        for n in 0..reachable {
+            let c = rev_starts[n];
+            rev_starts[n] = prefix;
+            prefix += c;
         }
-        let mut cursor = rev_starts.clone();
-        let mut rev_sources = vec![0u32; rev_starts[node_count] as usize];
+        rev_starts[reachable] = prefix;
+        let mut cursor = counts;
+        let mut rev_sources = vec![0u32; rev_starts[reachable] as usize];
         for n in 0..node_count {
+            if preorder[n] == u32::MAX {
+                continue;
+            }
             let start = edge_starts[n] as usize;
             let end = edge_starts[n + 1] as usize;
             for edge_index in start..end {
@@ -969,7 +983,11 @@ impl HeapSnapshot {
             }
         }
 
-        let n = node_count;
+        // Lengauer–Tarjan works in preorder space, which only covers the nodes
+        // reachable from the root (`vertex`). Using `node_count` here would
+        // index `dfs_parent` (length == vertex.len()) out of bounds for any
+        // node unreachable from the root — and waste memory on the arrays.
+        let n = vertex.len();
         let mut semi: Vec<u32> = (0..n as u32).collect();
         let mut label: Vec<u32> = (0..n as u32).collect();
         let mut ancestor = vec![0u32; n];
@@ -1013,20 +1031,19 @@ impl HeapSnapshot {
             }
         }
 
-        // retained = self + dominated subtree, accumulated in pre space, then
-        // mapped back to node space. Process in REVERSE preorder so children
-        // (higher pre) are final before they are folded into their idom.
-        let mut retained_pre = vec![0.0f64; n];
-        for (w, &node) in vertex.iter().enumerate() {
+        // retained = self + dominated subtree, accumulated in NODE space (one
+        // array instead of a pre-space buffer + a remap copy). Children (higher
+        // preorder) are final before they are folded into their idom because
+        // the reverse-preorder walk visits them first.
+        let mut retained = vec![0.0f64; node_count];
+        for &node in &vertex {
             let base = node as usize * raw.node_field_count;
-            retained_pre[w] = raw.nodes[base + raw.node_offsets.self_size] as f64;
+            retained[node as usize] = raw.nodes[base + raw.node_offsets.self_size] as f64;
         }
         for w in (1..vertex.len()).rev() {
-            retained_pre[idom_pre[w] as usize] += retained_pre[w];
-        }
-        let mut retained = vec![0.0f64; node_count];
-        for (w, &node) in vertex.iter().enumerate() {
-            retained[node as usize] = retained_pre[w];
+            let child = vertex[w] as usize;
+            let dom = vertex[idom_pre[w] as usize] as usize;
+            retained[dom] += retained[child];
         }
 
         let mut idoms = vec![u32::MAX; node_count];
@@ -1276,10 +1293,11 @@ impl HeapSnapshot {
         let rd = self.retained_data.as_ref().unwrap();
         let q = query.to_lowercase();
 
-        // Pre-resolve every distinct node name once (the shared string memo
-        // is a RefCell, so parallel chunks decode through their own cache —
-        // which would re-copy 3.6MB source maps per chunk). Then scan in
-        // parallel, reading only the Sync cache.
+        // Pre-resolve every distinct node name once, in parallel. The string
+        // memo is a RefCell (not Sync), so parallel chunks decode through the
+        // raw byte spans instead. Serial decode+lowercase through the memo was
+        // the dominant cost of find/search on multi-GB snapshots (measurably
+        // slower than a full `analyze`).
         let nodes = &raw.nodes;
         let nfc = raw.node_field_count;
         let name_off = raw.node_offsets.name;
@@ -1291,15 +1309,23 @@ impl HeapSnapshot {
             }
             set.into_iter().collect()
         };
-        let mut name_cache: HashMap<u32, String> = HashMap::with_capacity(distinct.len());
-        for idx in distinct.drain(..) {
-            let lower = raw
-                .strings
-                .resolve(&raw.mmap, idx as usize)
-                .unwrap_or_default()
-                .to_lowercase();
-            name_cache.insert(idx, lower);
-        }
+        let name_cache: HashMap<u32, String> = {
+            // capture only Sync pieces (StringTable itself holds a RefCell)
+            let spans: &[(u32, u32)] = &raw.strings.spans;
+            let sbase = raw.strings.start;
+            let mmap_bytes: &[u8] = &raw.mmap[..];
+            let pairs: Vec<(u32, String)> = distinct
+                .par_drain(..)
+                .map(|idx| {
+                    let decoded = spans
+                        .get(idx as usize)
+                        .map(|&(s, e)| decode_json_string(&mmap_bytes[sbase + s as usize..sbase + e as usize]))
+                        .unwrap_or_default();
+                    (idx, decoded.to_lowercase())
+                })
+                .collect();
+            pairs.into_iter().collect()
+        };
 
         let retained = &rd.retained;
         let chunks_per_thread = (raw.meta.node_count / rayon::current_num_threads().max(1)).max(1);
@@ -1575,24 +1601,35 @@ impl HeapSnapshot {
         let id_off = raw.node_offsets.id;
         let edge_count_off = raw.node_offsets.edge_count;
 
-        // Pre-resolve every distinct node name once (the shared string memo
-        // is a RefCell, so parallel chunks decode through their own cache).
-        let mut distinct: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        distinct.reserve(raw.meta.node_count / 16);
-        for n in 0..raw.meta.node_count {
-            distinct.insert(nodes[n * nfc + name_off]);
-        }
+        // Pre-resolve every distinct node name once, in parallel (the string
+        // memo is a RefCell / not Sync, so decode off the raw byte spans).
+        let mut distinct: Vec<u32> = {
+            let mut set: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            set.reserve(raw.meta.node_count / 16);
+            for n in 0..raw.meta.node_count {
+                set.insert(nodes[n * nfc + name_off]);
+            }
+            set.into_iter().collect()
+        };
         // store lowercased names so exact/substring comparisons against the
         // lowercased query are case-insensitive (search_nodes does the same)
-        let mut name_cache: HashMap<u32, String> = HashMap::with_capacity(distinct.len());
-        for idx in distinct.drain() {
-            let lower = raw
-                .strings
-                .resolve(&raw.mmap, idx as usize)
-                .unwrap_or_default()
-                .to_lowercase();
-            name_cache.insert(idx, lower);
-        }
+        let name_cache: HashMap<u32, String> = {
+            // capture only Sync pieces (StringTable itself holds a RefCell)
+            let spans: &[(u32, u32)] = &raw.strings.spans;
+            let sbase = raw.strings.start;
+            let mmap_bytes: &[u8] = &raw.mmap[..];
+            let pairs: Vec<(u32, String)> = distinct
+                .par_drain(..)
+                .map(|idx| {
+                    let decoded = spans
+                        .get(idx as usize)
+                        .map(|&(s, e)| decode_json_string(&mmap_bytes[sbase + s as usize..sbase + e as usize]))
+                        .unwrap_or_default();
+                    (idx, decoded.to_lowercase())
+                })
+                .collect();
+            pairs.into_iter().collect()
+        };
 
         let exact = query.exact;
         let min_self = query.min_self;
@@ -2144,9 +2181,20 @@ fn slice_summary(
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    names.sort_by(|a, b| b.1.size.cmp(&a.1.size));
-    if top != usize::MAX {
+    if top != usize::MAX && top < names.len() {
+        // partial selection: isolate the top-k (O(N)) and sort only those,
+        // instead of a full O(N log N) sort of every distinct name
+        let cmp = |a: &(String, TypeSummary), b: &(String, TypeSummary)| {
+            b.1.size.cmp(&a.1.size).then_with(|| a.0.cmp(&b.0))
+        };
+        names.select_nth_unstable_by(top, cmp);
+        names[..top].sort_unstable_by(cmp);
         names.truncate(top);
+    } else {
+        names.sort_by(|a, b| b.1.size.cmp(&a.1.size));
+        if top != usize::MAX {
+            names.truncate(top);
+        }
     }
 
     HeapSnapshotSummary {
