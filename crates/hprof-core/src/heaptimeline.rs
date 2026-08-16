@@ -138,6 +138,67 @@ fn parse_children(data: &[u8], pos: &mut usize, parent: Option<usize>, out: &mut
 // TimelineData construction
 // ---------------------------------------------------------------------------
 
+/// Stream the flat timeline `nodes` array into the four column vectors plus
+/// the running total, without materializing the whole interleaved number
+/// vector (that transient was ~400MB for a 17M-node timeline). Returns `None`
+/// when the record-alignment validation fails (non-canonical layout) so the
+/// caller can fall back to the whole-array path. See
+/// `heapsnapshot::record_aligned_chunks` for the boundary logic.
+fn timeline_columns_streaming(
+    data: &[u8],
+    nfc: usize,
+    type_off: usize,
+    name_off: usize,
+    size_off: usize,
+    tid_off: usize,
+) -> Option<(Vec<u8>, Vec<u32>, Vec<u32>, Vec<u32>, usize, usize)> {
+    if nfc == 0 {
+        return None;
+    }
+    let threads = rayon::current_num_threads().max(1);
+    let ranges = crate::heapsnapshot::record_aligned_chunks(data, nfc, threads * 8);
+    let parts: Vec<Option<(Vec<u8>, Vec<u32>, Vec<u32>, Vec<u32>, usize)>> = ranges
+        .par_iter()
+        .map(|&(s, e)| {
+            let nums = crate::heapsnapshot::parse_numbers_fast(&data[s..e]);
+            if !nums.len().is_multiple_of(nfc) {
+                return None;
+            }
+            let recs = nums.len() / nfc;
+            let mut types = Vec::with_capacity(recs);
+            let mut names = Vec::with_capacity(recs);
+            let mut sizes = Vec::with_capacity(recs);
+            let mut tids = Vec::with_capacity(recs);
+            let mut total = 0usize;
+            for rec in nums.chunks(nfc) {
+                types.push(rec[type_off] as u8);
+                names.push(rec[name_off]);
+                sizes.push(rec[size_off]);
+                tids.push(rec[tid_off]);
+                total += rec[size_off] as usize;
+            }
+            drop(nums); // free this chunk's numbers before the next chunk
+            Some((types, names, sizes, tids, total))
+        })
+        .collect();
+    let parts: Vec<_> = parts.into_iter().collect::<Option<_>>()?;
+    let cap: usize = parts.iter().map(|p| p.0.len()).sum();
+    let mut types = Vec::with_capacity(cap);
+    let mut names = Vec::with_capacity(cap);
+    let mut sizes = Vec::with_capacity(cap);
+    let mut tids = Vec::with_capacity(cap);
+    let mut total_allocated = 0usize;
+    for (t, n, s, d, total) in parts {
+        types.extend_from_slice(&t);
+        names.extend_from_slice(&n);
+        sizes.extend_from_slice(&s);
+        tids.extend_from_slice(&d);
+        total_allocated += total;
+    }
+    let node_count = types.len();
+    Some((types, names, sizes, tids, total_allocated, node_count))
+}
+
 fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<TimelineData> {
     let node_fields = &meta.meta.node_fields;
     let node_types = meta
@@ -174,32 +235,46 @@ fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<Timelin
     let nodes_end = find_array_end(data, nodes_open);
     let nodes_data = &data[nodes_open + 1..=nodes_end];
 
-    // Parse all node fields in parallel (flat comma-separated integers), then
-    // extract the four fields per record with rayon. The transient nums vec
-    // (~400MB for 17M nodes) is dropped before the trace tree parse.
-    let nums = crate::heapsnapshot::parse_numbers_par(nodes_data);
-    let node_count = nums.len() / node_field_count;
-    let types: Vec<u8> = nums
-        .par_chunks(node_field_count)
-        .map(|r| r[type_offset] as u8)
-        .collect();
-    let names: Vec<u32> = nums
-        .par_chunks(node_field_count)
-        .map(|r| r[name_offset])
-        .collect();
-    let sizes: Vec<u32> = nums
-        .par_chunks(node_field_count)
-        .map(|r| r[self_size_offset])
-        .collect();
-    let total_allocated: usize = nums
-        .par_chunks(node_field_count)
-        .map(|r| r[self_size_offset] as usize)
-        .sum();
-    let tids: Vec<u32> = nums
-        .par_chunks(node_field_count)
-        .map(|r| r[trace_node_offset])
-        .collect();
-    drop(nums);
+    // Preferred path streams record-aligned chunks straight into the four
+    // column vectors — no interleaved transient (that vec was ~400MB for 17M
+    // nodes). The sweep path is the fallback for inputs whose layout breaks
+    // the comma-counted record alignment.
+    let (types, names, sizes, tids, total_allocated, node_count) = match timeline_columns_streaming(
+        nodes_data,
+        node_field_count,
+        type_offset,
+        name_offset,
+        self_size_offset,
+        trace_node_offset,
+    ) {
+        Some(cols) => cols,
+        None => {
+            let nums = crate::heapsnapshot::parse_numbers_par(nodes_data);
+            let node_count = nums.len() / node_field_count;
+            let types: Vec<u8> = nums
+                .par_chunks(node_field_count)
+                .map(|r| r[type_offset] as u8)
+                .collect();
+            let names: Vec<u32> = nums
+                .par_chunks(node_field_count)
+                .map(|r| r[name_offset])
+                .collect();
+            let sizes: Vec<u32> = nums
+                .par_chunks(node_field_count)
+                .map(|r| r[self_size_offset])
+                .collect();
+            let total_allocated: usize = nums
+                .par_chunks(node_field_count)
+                .map(|r| r[self_size_offset] as usize)
+                .sum();
+            let tids: Vec<u32> = nums
+                .par_chunks(node_field_count)
+                .map(|r| r[trace_node_offset])
+                .collect();
+            drop(nums);
+            (types, names, sizes, tids, total_allocated, node_count)
+        }
+    };
 
     // ---- strings table ----
     let strings_marker = b"\"strings\":[";

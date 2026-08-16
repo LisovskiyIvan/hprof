@@ -376,7 +376,7 @@ impl HeapSnapshot {
         // parallel parser can split it at commas.
         let nodes_open = nodes_start + nodes_marker.len() - 1; // position of '['
         let nodes_end = find_array_end(data, nodes_open);
-        let nodes = parse_numbers_par(&data[nodes_open + 1..=nodes_end]);
+        let nodes_bytes = &data[nodes_open + 1..=nodes_end];
 
         let node_offsets = NodeFieldOffsets::from_fields(&meta.meta.node_fields)?;
         let edge_offsets = EdgeFieldOffsets::from_fields(&meta.meta.edge_fields)?;
@@ -385,38 +385,43 @@ impl HeapSnapshot {
         let node_field_count = meta.meta.node_fields.len();
         let edge_field_count = meta.meta.edge_fields.len();
 
-        // split the flat node records into typed columns, dropping the fields
-        // nothing reads. The flat vector is a transient (~625MB for 26M
-        // nodes); the columns it becomes are ~470MB.
-        let nodes = {
-            let flat = nodes;
-            let types: Vec<u16> = flat
-                .par_chunks(node_field_count)
-                .map(|r| r[node_offsets.type_] as u16)
-                .collect();
-            let names: Vec<u32> = flat
-                .par_chunks(node_field_count)
-                .map(|r| r[node_offsets.name])
-                .collect();
-            let ids: Vec<u32> = flat
-                .par_chunks(node_field_count)
-                .map(|r| r[node_offsets.id])
-                .collect();
-            let self_sizes: Vec<u32> = flat
-                .par_chunks(node_field_count)
-                .map(|r| r[node_offsets.self_size])
-                .collect();
-            let edge_counts: Vec<u32> = flat
-                .par_chunks(node_field_count)
-                .map(|r| r[node_offsets.edge_count])
-                .collect();
-            drop(flat);
-            NodeColumns {
-                types,
-                names,
-                ids,
-                self_sizes,
-                edge_counts,
+        // Split the flat node records into typed columns, dropping the fields
+        // nothing reads. Preferred path streams record-aligned chunks straight
+        // into the columns (no interleaved transient, which was ~625MB for a
+        // 26M-node snapshot); the sweep path is the fallback for inputs whose
+        // layout breaks the comma-counted record alignment.
+        let nodes = match node_columns_streaming(nodes_bytes, node_field_count, &node_offsets) {
+            Some(cols) => cols,
+            None => {
+                let flat = parse_numbers_par(nodes_bytes);
+                let types: Vec<u16> = flat
+                    .par_chunks(node_field_count)
+                    .map(|r| r[node_offsets.type_] as u16)
+                    .collect();
+                let names: Vec<u32> = flat
+                    .par_chunks(node_field_count)
+                    .map(|r| r[node_offsets.name])
+                    .collect();
+                let ids: Vec<u32> = flat
+                    .par_chunks(node_field_count)
+                    .map(|r| r[node_offsets.id])
+                    .collect();
+                let self_sizes: Vec<u32> = flat
+                    .par_chunks(node_field_count)
+                    .map(|r| r[node_offsets.self_size])
+                    .collect();
+                let edge_counts: Vec<u32> = flat
+                    .par_chunks(node_field_count)
+                    .map(|r| r[node_offsets.edge_count])
+                    .collect();
+                drop(flat);
+                NodeColumns {
+                    types,
+                    names,
+                    ids,
+                    self_sizes,
+                    edge_counts,
+                }
             }
         };
 
@@ -2605,6 +2610,151 @@ pub fn parse_numbers_par(data: &[u8]) -> Vec<u32> {
     out
 }
 
+/// Split a flat comma-separated integer array into byte ranges that each
+/// START at a record boundary (every `field_count` numbers), so chunks can be
+/// parsed independently into complete records and streamed into columns
+/// without materializing the whole interleaved number vector.
+///
+/// Boundaries are found by counting commas, which assumes the canonical V8
+/// layout (numbers separated by single commas, no whitespace between them).
+/// That assumption is validated exactly by the caller: a chunk parses into
+/// complete records iff its parsed count divides by `field_count` — if any
+/// chunk fails that check, the caller must fall back to a whole-array parse.
+pub(crate) fn record_aligned_chunks(
+    data: &[u8],
+    field_count: usize,
+    chunks: usize,
+) -> Vec<(usize, usize)> {
+    use memchr::memchr;
+
+    let mut bounds: Vec<usize> = Vec::with_capacity(chunks + 2);
+    bounds.push(0);
+    if field_count > 0 && !data.is_empty() {
+        // A boundary after the k-th comma starts number #k (0-indexed); it
+        // opens a fresh record iff k % field_count == 0. Boundaries are found
+        // left-to-right: commas in the span up to the next target are counted
+        // with a vectorizable filter-count, then at most field_count-1
+        // memchr hops reach the next aligned comma. Total scan cost is one
+        // pass over the array (a naive per-comma iterator here was measured
+        // ~0.5s slower on a 625MB array).
+        let target = (data.len() / chunks.max(1)).max(1);
+        let data_len = data.len();
+        let mut pos = 0usize; // current boundary (a number start)
+        let mut commas_total = 0usize; // commas strictly before `pos`
+        let mut next_at = target;
+        while pos < data_len && bounds.len() <= chunks {
+            let span_end = next_at.min(data_len);
+            if span_end > pos {
+                commas_total += data[pos..span_end].iter().filter(|&&b| b == b',').count();
+                pos = span_end;
+            }
+            // advance to the first comma at/after `pos` (a boundary must sit
+            // right after a comma — `next_at` itself may be mid-number)
+            match memchr(b',', &data[pos..]) {
+                Some(c) => {
+                    pos += c + 1;
+                    commas_total += 1;
+                }
+                None => break,
+            }
+            // then hop (bounded by field_count-1) until the running comma
+            // count is a multiple of field_count
+            while !commas_total.is_multiple_of(field_count) {
+                match memchr(b',', &data[pos..]) {
+                    Some(c) => {
+                        pos += c + 1;
+                        commas_total += 1;
+                    }
+                    None => {
+                        pos = data_len;
+                        break;
+                    }
+                }
+            }
+            if pos < data_len {
+                bounds.push(pos);
+            } else {
+                break;
+            }
+            next_at = next_at.saturating_add(target).max(pos);
+        }
+    }
+    bounds.push(data.len());
+    bounds
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .filter(|&(s, e)| e > s)
+        .collect()
+}
+
+/// Stream the flat node array into `NodeColumns` without building the full
+/// interleaved `Vec<u32>` first (that transient is ~625MB for a 26M-node
+/// snapshot; here only one chunk's numbers are live per worker). Returns
+/// `None` when the record-alignment validation fails (non-canonical layout),
+/// in which case the caller falls back to `parse_numbers_par` + column sweeps.
+fn node_columns_streaming(
+    data: &[u8],
+    nfc: usize,
+    offsets: &NodeFieldOffsets,
+) -> Option<NodeColumns> {
+    if nfc == 0 {
+        return None;
+    }
+    let threads = rayon::current_num_threads().max(1);
+    let ranges = record_aligned_chunks(data, nfc, threads * 8);
+    let parts: Vec<Option<NodeColumns>> = ranges
+        .par_iter()
+        .map(|&(s, e)| {
+            let nums = parse_numbers_fast(&data[s..e]);
+            if !nums.len().is_multiple_of(nfc) {
+                return None;
+            }
+            let recs = nums.len() / nfc;
+            let mut types = Vec::with_capacity(recs);
+            let mut names = Vec::with_capacity(recs);
+            let mut ids = Vec::with_capacity(recs);
+            let mut self_sizes = Vec::with_capacity(recs);
+            let mut edge_counts = Vec::with_capacity(recs);
+            for rec in nums.chunks(nfc) {
+                types.push(rec[offsets.type_] as u16);
+                names.push(rec[offsets.name]);
+                ids.push(rec[offsets.id]);
+                self_sizes.push(rec[offsets.self_size]);
+                edge_counts.push(rec[offsets.edge_count]);
+            }
+            drop(nums); // free this chunk's numbers before the next chunk
+            Some(NodeColumns {
+                types,
+                names,
+                ids,
+                self_sizes,
+                edge_counts,
+            })
+        })
+        .collect();
+    let parts: Vec<NodeColumns> = parts.into_iter().collect::<Option<_>>()?;
+    let cap: usize = parts.iter().map(|p| p.types.len()).sum();
+    let mut types = Vec::with_capacity(cap);
+    let mut names = Vec::with_capacity(cap);
+    let mut ids = Vec::with_capacity(cap);
+    let mut self_sizes = Vec::with_capacity(cap);
+    let mut edge_counts = Vec::with_capacity(cap);
+    for p in parts {
+        types.extend_from_slice(&p.types);
+        names.extend_from_slice(&p.names);
+        ids.extend_from_slice(&p.ids);
+        self_sizes.extend_from_slice(&p.self_sizes);
+        edge_counts.extend_from_slice(&p.edge_counts);
+    }
+    Some(NodeColumns {
+        types,
+        names,
+        ids,
+        self_sizes,
+        edge_counts,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2642,6 +2792,113 @@ mod tests {
         let par = parse_numbers_par(data);
         assert_eq!(par, fast);
         assert_eq!(par.len(), 250_000);
+    }
+
+    #[test]
+    fn record_aligned_chunks_partition_at_record_boundaries() {
+        // property test over several layouts: ranges are ordered, disjoint,
+        // cover the whole array, and every range parses into complete records
+        for nfc in [1usize, 3, 6, 7] {
+            let mut s = String::from("[");
+            let records = 5000;
+            for r in 0..records {
+                for f in 0..nfc {
+                    if !(r == 0 && f == 0) {
+                        s.push(',');
+                    }
+                    s.push_str(&((r * 31 + f * 7 + 1) % 100000).to_string());
+                }
+            }
+            s.push(']');
+            let data = s.as_bytes();
+            for chunks in [1usize, 4, 17, 64] {
+                let ranges = record_aligned_chunks(data, nfc, chunks);
+                assert!(!ranges.is_empty(), "nfc={nfc} chunks={chunks}");
+                assert_eq!(ranges[0].0, 0, "must start at 0");
+                // cover everything, ordered and disjoint
+                for w in ranges.windows(2) {
+                    assert_eq!(w[0].1, w[1].0, "ranges must be contiguous");
+                }
+                assert_eq!(ranges.last().unwrap().1, data.len());
+                for &(s, e) in &ranges {
+                    let nums = parse_numbers_fast(&data[s..e]);
+                    assert!(
+                        nums.len().is_multiple_of(nfc),
+                        "chunk not record-aligned: nfc={nfc} chunks={chunks} len={}",
+                        nums.len()
+                    );
+                }
+                let total: usize = ranges
+                    .iter()
+                    .map(|&(s, e)| parse_numbers_fast(&data[s..e]).len())
+                    .sum();
+                assert_eq!(total, records * nfc, "no number may be lost or duplicated");
+            }
+        }
+    }
+
+    #[test]
+    fn record_aligned_chunks_rejects_none_on_misaligned_input() {
+        // the helper itself just returns ranges; the *validation* happens in
+        // the streaming extractors. Simulate a non-canonical layout (space
+        // instead of a comma) and check the chunks no longer divide into
+        // complete records, i.e. the extractor would return None and the
+        // caller falls back to the whole-array path.
+        let s = "1,2,3 4,5,6,7,8,9,10,11,12";
+        let data = s.as_bytes();
+        let ranges = record_aligned_chunks(data, 3, 2);
+        let all_aligned = ranges
+            .iter()
+            .all(|&(s, e)| parse_numbers_fast(&data[s..e]).len().is_multiple_of(3));
+        assert!(
+            !all_aligned,
+            "space-separated numbers must break comma-counted alignment"
+        );
+    }
+
+    #[test]
+    fn node_columns_streaming_matches_reference() {
+        // reference: the fallback interleaved parse + column sweeps
+        let offsets = NodeFieldOffsets {
+            type_: 0,
+            name: 1,
+            id: 2,
+            self_size: 3,
+            edge_count: 4,
+        };
+        let nfc = 6usize; // incl. an unread field (detachedness at index 5)
+        let mut s = String::new();
+        for r in 0..50_000u32 {
+            for f in 0..nfc {
+                if !(r == 0 && f == 0) {
+                    s.push(',');
+                }
+                s.push_str(&match f {
+                    0 => (r % 15).to_string(),          // type
+                    1 => (r % 70000).to_string(),       // name idx
+                    2 => (r * 13).to_string(),          // id
+                    3 => ((r * 37) % 4096).to_string(), // self size
+                    4 => (r % 30).to_string(),          // edge count
+                    _ => "0".to_string(),               // detachedness (dropped)
+                });
+            }
+        }
+        let data = s.as_bytes();
+        let streamed = node_columns_streaming(data, nfc, &offsets).expect("canonical input");
+        let flat = parse_numbers_par(data);
+        let reference = NodeColumns {
+            types: flat.par_chunks(nfc).map(|r| r[0] as u16).collect(),
+            names: flat.par_chunks(nfc).map(|r| r[1]).collect(),
+            ids: flat.par_chunks(nfc).map(|r| r[2]).collect(),
+            self_sizes: flat.par_chunks(nfc).map(|r| r[3]).collect(),
+            edge_counts: flat.par_chunks(nfc).map(|r| r[4]).collect(),
+        };
+        assert_eq!(streamed.types, reference.types);
+        assert_eq!(streamed.names, reference.names);
+        assert_eq!(streamed.ids, reference.ids);
+        assert_eq!(streamed.self_sizes, reference.self_sizes);
+        assert_eq!(streamed.edge_counts, reference.edge_counts);
+        assert_eq!(streamed.types.len(), 50_000);
     }
 
     #[test]
@@ -2818,4 +3075,3 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
-
