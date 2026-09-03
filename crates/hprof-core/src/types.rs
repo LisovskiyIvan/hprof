@@ -813,3 +813,79 @@ pub struct OwnerAnalysis {
     pub total_self: usize,
     pub groups: Vec<OwnerGroup>,
 }
+
+// ============================================================================
+// Leak Suspects Report
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuspectEntry {
+    pub category: String,
+    pub description: String,
+    pub node_index: Option<usize>,
+    pub node_id: Option<usize>,
+    pub node_name: String,
+    pub size_bytes: usize,
+    pub pct_of_heap: f64,
+    pub recommendation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeakSuspectsReport {
+    pub total_heap_size: usize,
+    pub total_nodes: usize,
+    pub suspects: Vec<SuspectEntry>,
+}
+
+// ============================================================================
+// Buffer Analysis (ArrayBuffer, TypedArray, DataView)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BufferEntry {
+    pub node_index: usize,
+    pub node_id: usize,
+    pub name: String,
+    pub buffer_type: String,
+    pub self_size: usize,
+    pub retained_size: usize,
+    pub owner_name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BufferAnalysis {
+    pub total_count: usize,
+    pub total_self_size: usize,
+    pub total_retained_size: usize,
+    pub entries: Vec<BufferEntry>,
+}
+
+// ============================================================================
+// Closure Analysis (Closures, Contexts, Captured Variables)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosureEntry {
+    pub node_index: usize,
+    pub node_id: usize,
+    pub name: String,
+    pub context_id: Option<usize>,
+    pub context_name: String,
+    pub self_size: usize,
+    pub retained_size: usize,
+    pub captured_vars: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosureAnalysis {
+    pub total_closures: usize,
+    pub total_retained: usize,
+    pub entries: Vec<ClosureEntry>,
+}
+

@@ -14,8 +14,8 @@ pub fn run(file: &str, type_name: &str, args: &Args) -> Result<(), String> {
     if type_name != "heapsnapshot" {
         return Err("retainers is only supported for .heapsnapshot files".to_string());
     }
-    let target = crate::props::resolve_target(file, args)?;
     let mut snapshot = HeapSnapshot::new(file.to_string());
+    let target = crate::props::resolve_target(&mut snapshot, args)?;
     let node = snapshot.get_node(target).map_err(|e| e.to_string())?;
 
     if let Some(depth) = args.depth {

@@ -16,16 +16,13 @@ use crate::{
 
 /// Resolve `--index <n>` or `--id <n>` to a record index (shared with the
 /// `retainers` command).
-pub fn resolve_target(file: &str, args: &Args) -> Result<usize, String> {
+pub fn resolve_target(snapshot: &mut HeapSnapshot, args: &Args) -> Result<usize, String> {
     match (args.index, args.id) {
         (Some(idx), _) => Ok(idx),
-        (None, Some(id)) => {
-            let mut snapshot = HeapSnapshot::new(file.to_string());
-            snapshot
-                .find_by_id(id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("no node with id {id} found in this snapshot"))
-        }
+        (None, Some(id)) => snapshot
+            .find_by_id(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no node with id {id} found in this snapshot")),
         (None, None) => Err("requires --index <n> or --id <n>".to_string()),
     }
 }
@@ -50,8 +47,8 @@ pub fn run(file: &str, type_name: &str, args: &Args) -> Result<(), String> {
     if type_name != "heapsnapshot" {
         return Err("props is only supported for .heapsnapshot files".to_string());
     }
-    let target = resolve_target(file, args)?;
     let mut snapshot = HeapSnapshot::new(file.to_string());
+    let target = resolve_target(&mut snapshot, args)?;
     let (node, props) = snapshot
         .get_node_properties(target)
         .map_err(|e| e.to_string())?;

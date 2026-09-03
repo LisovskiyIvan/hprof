@@ -482,84 +482,94 @@ fn compute_cumulative_summary(
     // We need to push the paths onto the stack to track them per node — for
     // very deep trees this is O(n*depth) memory which is acceptable for V8
     // profiles (typical depth <50).
-    enum Frame<'a> {
+    enum Action<'a> {
         Enter {
             node: &'a HeapProfileNode,
-            path_frames: Vec<String>,
-            path_urls: Vec<String>,
-            path_fns: Vec<String>,
             has_focus_match_in_path: bool,
         },
+        Exit,
     }
 
-    let mut stack: Vec<Frame> = vec![Frame::Enter {
+    let mut path_frames: Vec<String> = Vec::with_capacity(64);
+    let mut path_urls: Vec<String> = Vec::with_capacity(64);
+    let mut path_fns: Vec<String> = Vec::with_capacity(64);
+
+    let mut stack: Vec<Action> = vec![Action::Enter {
         node: &data.head,
-        path_frames: Vec::with_capacity(32),
-        path_urls: Vec::with_capacity(32),
-        path_fns: Vec::with_capacity(32),
         has_focus_match_in_path: false,
     }];
 
-    while let Some(frame) = stack.pop() {
-        let Frame::Enter {
-            node,
-            mut path_frames,
-            mut path_urls,
-            mut path_fns,
-            has_focus_match_in_path,
-        } = frame;
-
-        let fn_name = fn_name_of(node);
-        let url = url_of(node);
-        let frame_label = format!("{} @ {}:{}", fn_name, url, node.call_frame.line_number + 1);
-
-        // Determine focus match for this node + path.
-        let node_matches_focus = match &focus_re {
-            None => true,
-            Some(re) => re.is_match(&frame_label) || re.is_match(&url) || re.is_match(&fn_name),
-        };
-        let path_has_match = has_focus_match_in_path || node_matches_focus;
-
-        path_frames.push(frame_label.clone());
-        path_urls.push(url.clone());
-        path_fns.push(fn_name.clone());
-
-        let self_size = node.self_size;
-        if self_size > 0 && (focus_re.is_none() || path_has_match) {
-            let leaf_ignored = ignore_re
-                .as_ref()
-                .map(|re| re.is_match(&frame_label) || re.is_match(&url) || re.is_match(&fn_name))
-                .unwrap_or(false);
-
-            total_size += self_size;
-            if !leaf_ignored {
-                *self_frame.entry(frame_label.clone()).or_insert(0) += self_size;
-                *self_url.entry(url.clone()).or_insert(0) += self_size;
-                *self_fn.entry(fn_name.clone()).or_insert(0) += self_size;
-                *count_frame.entry(frame_label.clone()).or_insert(0) += 1;
+    while let Some(action) = stack.pop() {
+        match action {
+            Action::Exit => {
+                path_frames.pop();
+                path_urls.pop();
+                path_fns.pop();
             }
+            Action::Enter {
+                node,
+                has_focus_match_in_path,
+            } => {
+                let fn_name = fn_name_of(node);
+                let url = url_of(node);
+                let frame_label = format!("{} @ {}:{}", fn_name, url, node.call_frame.line_number + 1);
 
-            // Cumulative: every frame on the path gets self_size.
-            for f in path_frames.iter() {
-                *cum_frame.entry(f.clone()).or_insert(0) += self_size;
-            }
-            for u in path_urls.iter() {
-                *cum_url.entry(u.clone()).or_insert(0) += self_size;
-            }
-            for f in path_fns.iter() {
-                *cum_fn.entry(f.clone()).or_insert(0) += self_size;
-            }
-        }
+                // Determine focus match for this node + path.
+                let node_matches_focus = match &focus_re {
+                    None => true,
+                    Some(re) => re.is_match(&frame_label) || re.is_match(&url) || re.is_match(&fn_name),
+                };
+                let path_has_match = has_focus_match_in_path || node_matches_focus;
 
-        // Push children (in reverse so they're processed in order — not strictly necessary).
-        for child in node.children.iter().rev() {
-            stack.push(Frame::Enter {
-                node: child,
-                path_frames: path_frames.clone(),
-                path_urls: path_urls.clone(),
-                path_fns: path_fns.clone(),
-                has_focus_match_in_path: path_has_match,
-            });
+                path_frames.push(frame_label.clone());
+                path_urls.push(url.clone());
+                path_fns.push(fn_name.clone());
+
+                let self_size = node.self_size;
+                if self_size > 0 && (focus_re.is_none() || path_has_match) {
+                    let leaf_ignored = ignore_re
+                        .as_ref()
+                        .map(|re| re.is_match(&frame_label) || re.is_match(&url) || re.is_match(&fn_name))
+                        .unwrap_or(false);
+
+                    total_size += self_size;
+                    if !leaf_ignored {
+                        *self_frame.entry(frame_label).or_insert(0) += self_size;
+                        *self_url.entry(url).or_insert(0) += self_size;
+                        *self_fn.entry(fn_name).or_insert(0) += self_size;
+                        *count_frame.entry(path_frames.last().unwrap().clone()).or_insert(0) += 1;
+                    }
+
+                    // Cumulative: each unique frame/url/fn on the path gets self_size once
+                    let mut seen: std::collections::HashSet<&str> =
+                        std::collections::HashSet::with_capacity(path_frames.len());
+                    for f in &path_frames {
+                        if seen.insert(f.as_str()) {
+                            *cum_frame.entry(f.clone()).or_insert(0) += self_size;
+                        }
+                    }
+                    seen.clear();
+                    for u in &path_urls {
+                        if seen.insert(u.as_str()) {
+                            *cum_url.entry(u.clone()).or_insert(0) += self_size;
+                        }
+                    }
+                    seen.clear();
+                    for f in &path_fns {
+                        if seen.insert(f.as_str()) {
+                            *cum_fn.entry(f.clone()).or_insert(0) += self_size;
+                        }
+                    }
+                }
+
+                stack.push(Action::Exit);
+                for child in node.children.iter().rev() {
+                    stack.push(Action::Enter {
+                        node: child,
+                        has_focus_match_in_path: path_has_match,
+                    });
+                }
+            }
         }
     }
 
@@ -1106,3 +1116,70 @@ fn number_after_key(data: &[u8], key: &[u8]) -> f64 {
     }
     parse_f64(data, &mut pos)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cumulative_summary_deduplicates_recursion() {
+        // Recursive call: root -> foo -> foo -> foo (leaf self_size = 100)
+        let root = HeapProfileNode {
+            call_frame: CallFrame {
+                function_name: "root".to_string(),
+                script_id: "1".to_string(),
+                url: "app.js".to_string(),
+                line_number: 0,
+                column_number: 0,
+            },
+            self_size: 0,
+            children: vec![HeapProfileNode {
+                call_frame: CallFrame {
+                    function_name: "foo".to_string(),
+                    script_id: "1".to_string(),
+                    url: "app.js".to_string(),
+                    line_number: 10,
+                    column_number: 0,
+                },
+                self_size: 0,
+                children: vec![HeapProfileNode {
+                    call_frame: CallFrame {
+                        function_name: "foo".to_string(),
+                        script_id: "1".to_string(),
+                        url: "app.js".to_string(),
+                        line_number: 10,
+                        column_number: 0,
+                    },
+                    self_size: 0,
+                    children: vec![HeapProfileNode {
+                        call_frame: CallFrame {
+                            function_name: "foo".to_string(),
+                            script_id: "1".to_string(),
+                            url: "app.js".to_string(),
+                            line_number: 10,
+                            column_number: 0,
+                        },
+                        self_size: 100,
+                        children: Vec::new(),
+                    }],
+                }],
+            }],
+        };
+
+        let result = HeapProfileResult {
+            head: root,
+            start_time: 0.0,
+            end_time: 1.0,
+        };
+
+        let summary = compute_cumulative_summary(&result, None, &FilterOptions::default()).unwrap();
+        assert_eq!(summary.total_size, 100);
+
+        let foo_entry = summary.by_function.get("foo").unwrap();
+        // Leaf self-size is 100
+        assert_eq!(foo_entry.self_size, 100);
+        // Cumulative size should be 100, NOT 300!
+        assert_eq!(foo_entry.cumulative_size, 100);
+    }
+}
+

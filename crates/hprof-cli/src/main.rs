@@ -5,7 +5,9 @@
 //! binary: parse, summarize, retained sizes, retention paths.
 
 mod analyze;
+mod buffers;
 mod calltree;
+mod closures;
 mod detached;
 mod diff;
 mod dot;
@@ -20,6 +22,7 @@ mod retainers;
 mod session;
 mod sizes;
 mod strings;
+mod suspects;
 mod top;
 mod trend;
 mod ui;
@@ -283,10 +286,13 @@ impl Drop for WorkingNote {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Analyze,
+    Buffers,
+    Closures,
     Detached,
     Edges,
     Sizes,
     Strings,
+    Suspects,
     Session,
     Trend,
     Diff,
@@ -460,10 +466,13 @@ fn parse_args(argv: &[String]) -> Args {
             }
             "--open" => args.open = true,
             "analyze" => args.command = Command::Analyze,
+            "buffers" => args.command = Command::Buffers,
+            "closures" | "contexts" => args.command = Command::Closures,
             "detached" => args.command = Command::Detached,
             "edges" => args.command = Command::Edges,
             "sizes" => args.command = Command::Sizes,
             "strings" => args.command = Command::Strings,
+            "suspects" | "leaks" => args.command = Command::Suspects,
             "session" | "repl" => args.command = Command::Session,
             "trend" => args.command = Command::Trend,
             "diff" => args.command = Command::Diff,
@@ -503,6 +512,9 @@ fn print_usage() {
 
  {b}Commands:{r}
     {c}analyze{r}   Analyze profile file and print summary to stdout (default)
+    {c}suspects{r}  Automated leak suspects and memory bloat report
+    {c}buffers{r}   Inspect ArrayBuffers, typed arrays, and WebAssembly memory
+    {c}closures{r}  Inspect closures, lexical contexts, and captured variables
     {c}detached{r}  List detached V8 nodes and optional owner chains
     {c}edges{r}     Search object properties and edge names
     {c}sizes{r}     Show a power-of-two self-size histogram
@@ -699,10 +711,13 @@ fn main() -> ExitCode {
 
         let result = match args.command {
             Command::Analyze => analyze::run(file, type_name, &args),
+            Command::Buffers => buffers::run(file, type_name, &args),
+            Command::Closures => closures::run(file, type_name, &args),
             Command::Detached => detached::run(file, type_name, &args),
             Command::Edges => edges::run(file, type_name, &args),
             Command::Sizes => sizes::run(file, type_name, &args),
             Command::Strings => strings::run(file, type_name, &args),
+            Command::Suspects => suspects::run(file, type_name, &args),
             Command::Dot => dot::run(file, type_name, &args),
             Command::List => list::run(file, type_name, &args),
             Command::Inspect => inspect::run(file, type_name, &args),

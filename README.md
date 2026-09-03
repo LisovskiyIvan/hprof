@@ -108,6 +108,15 @@ hprof owners a.heapsnapshot b.heapsnapshot --name '(object elements)' --exact \
 ### Leak-hunting helpers
 
 ```bash
+# automated leak suspects report (big dominators, accumulators, detached nodes)
+hprof suspects Heap.heapsnapshot
+
+# binary buffers, ArrayBuffers, and WebAssembly memory backing stores
+hprof buffers Heap.heapsnapshot
+
+# closures, execution contexts, and captured variables
+hprof closures Heap.heapsnapshot
+
 # largest individual nodes; add --exact to force a dominator calculation
 hprof top Heap.heapsnapshot --top 30
 hprof top Heap.heapsnapshot --top 30 --exact
