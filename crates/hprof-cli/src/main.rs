@@ -104,6 +104,9 @@ fn truncate_visible(source: &str, width: usize) -> String {
     if len <= width {
         return plain;
     }
+    if width == 0 {
+        return String::new();
+    }
     if width <= 1 {
         return "…".to_string();
     }
@@ -177,7 +180,7 @@ pub fn format_duration(ms: f64) -> String {
 // Tables (ported from the TS printTable)
 // ============================================================================
 
-pub fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+pub fn render_table(headers: &[&str], rows: &[Vec<String>], terminal_width: usize) -> String {
     let normalized_rows: Vec<Vec<String>> = rows
         .iter()
         .map(|row| row.iter().map(|cell| normalize_cell(cell)).collect())
@@ -198,46 +201,61 @@ pub fn print_table(headers: &[&str], rows: &[Vec<String>]) {
 
     let padding_width = 2 * (widths.len().saturating_sub(1));
     if !widths.is_empty() {
-        let terminal_width = terminal_width();
-        let fixed_columns_width: usize = widths[..widths.len() - 1].iter().sum();
-        let last_min = headers[widths.len() - 1].chars().count();
-        let last_max = (terminal_width - 2 - padding_width - fixed_columns_width).max(last_min);
-        let last = widths.len() - 1;
-        widths[last] = widths[last].min(last_max);
+        let available = terminal_width
+            .saturating_sub(2)
+            .saturating_sub(padding_width)
+            .max(1);
+        let header_widths: Vec<usize> =
+            headers.iter().map(|h| h.chars().count()).collect();
+        let mut excess = widths.iter().sum::<usize>().saturating_sub(available);
+        if excess > 0 {
+            let mut order: Vec<usize> = (0..widths.len()).collect();
+            order.sort_unstable_by_key(|&i| std::cmp::Reverse(widths[i]));
+            let min_widths = vec![1usize; widths.len()];
+            for floors in [&header_widths, &min_widths] {
+                for &i in &order {
+                    if excess == 0 {
+                        break;
+                    }
+                    let take = widths[i].saturating_sub(floors[i]).min(excess);
+                    widths[i] -= take;
+                    excess -= take;
+                }
+            }
+        }
     }
 
     let header_line = headers
         .iter()
         .enumerate()
-        .map(|(i, h)| pad_visible(&dim(h), widths[i]))
+        .map(|(i, h)| pad_visible(&dim(&truncate_visible(h, widths[i])), widths[i]))
         .collect::<Vec<_>>()
         .join("  ");
-    println!("  {header_line}");
+    let mut out = String::new();
+    out.push_str(&format!("  {header_line}\n"));
     let sep_width: usize = widths.iter().sum::<usize>() + padding_width;
-    println!("  {}", dim(&"─".repeat(sep_width)));
+    out.push_str(&format!("  {}\n", dim(&"─".repeat(sep_width))));
 
-    for (row_index, row) in rows.iter().enumerate() {
+    for row in rows.iter() {
         let line = row
             .iter()
             .enumerate()
             .map(|(i, cell)| {
-                let w = widths[i];
-                if i == row.len() - 1 {
-                    let truncated = truncate_visible(cell, w);
-                    let styled = apply_cell_style(cell, &truncated);
-                    return pad_visible(&styled, w);
-                }
-                let normalized = &normalized_rows[row_index][i];
-                if *normalized == strip_ansi(cell) {
-                    return pad_visible(cell, w);
-                }
-                pad_visible(normalized, w)
+                let w = widths.get(i).copied().unwrap_or(0);
+                let truncated = truncate_visible(cell, w);
+                let styled = apply_cell_style(cell, &truncated);
+                pad_visible(&styled, w)
             })
             .collect::<Vec<_>>()
             .join("  ");
-        println!("  {line}");
+        out.push_str(&format!("  {line}\n"));
     }
-    println!();
+    out.push('\n');
+    out
+}
+
+pub fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+    print!("{}", render_table(headers, rows, terminal_width()));
 }
 
 fn terminal_width() -> usize {
@@ -737,4 +755,67 @@ fn main() -> ExitCode {
     }
 
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn visible_len(s: &str) -> usize {
+        strip_ansi(s).chars().count()
+    }
+
+    #[test]
+    fn huge_middle_cell_fits_terminal() {
+        let big = format!("data:{}", "a".repeat(5000));
+        let headers = ["INDEX", "NAME", "TYPE"];
+        let rows = vec![vec![
+            "1".to_string(),
+            big,
+            "\x1b[35mobject\x1b[0m".to_string(),
+        ]];
+        let out = render_table(&headers, &rows, 120);
+        for line in out.lines() {
+            assert!(visible_len(line) <= 120, "line too wide: {line}");
+        }
+    }
+
+    #[test]
+    fn truncated_cell_keeps_color() {
+        let headers = ["A", "B"];
+        let rows = vec![vec!["\x1b[35mobject\x1b[0m".to_string(), "x".to_string()]];
+        let out = render_table(&headers, &rows, 10);
+        assert!(out.contains("\x1b[35m"), "missing magenta lead: {out:?}");
+        assert!(out.contains("\x1b[0m"), "missing reset: {out:?}");
+        assert!(out.contains('…'), "cell was not truncated: {out:?}");
+        for line in out.lines() {
+            assert!(visible_len(line) <= 10, "line too wide: {line}");
+        }
+    }
+
+    #[test]
+    fn wide_headers_are_truncated_too() {
+        let headers = ["SOURCE INDEX", "SOURCE ID", "SOURCE TYPE", "TARGET INDEX"];
+        let rows = vec![vec![
+            "1".to_string(),
+            "2".to_string(),
+            "3".to_string(),
+            "4".to_string(),
+        ]];
+        let out = render_table(&headers, &rows, 60);
+        for line in out.lines() {
+            assert!(visible_len(line) <= 60, "line too wide: {line}");
+        }
+    }
+
+    #[test]
+    fn short_table_format() {
+        let headers = ["A", "B"];
+        let rows = vec![
+            vec!["x".to_string(), "y".to_string()],
+            vec!["long".to_string(), "z".to_string()],
+        ];
+        let out = render_table(&headers, &rows, 120);
+        assert_eq!(out, "  A     B\n  ───────\n  x     y\n  long  z\n\n");
+    }
 }

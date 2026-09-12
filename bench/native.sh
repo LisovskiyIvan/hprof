@@ -39,22 +39,39 @@ HEAPSNAP="$(snap heapsnapshot)"
 HEAPPROF="$(snap heapprofile)"
 TIMELINE="$(snap heaptimeline)"
 
-# peak RSS in MB for a command (polls /proc while it runs)
+# peak RSS in MB for a command (polls /proc while it runs,
+# falls back to ps on macOS where /proc does not exist)
 peak_rss_mb() {
   "$@" >/dev/null 2>&1 &
   local pid=$! peak=0 rss
   sleep 0.3
   while kill -0 "$pid" 2>/dev/null; do
-    rss=$(grep VmRSS "/proc/$pid/status" 2>/dev/null | grep -o '[0-9]*')
-    [ -n "$rss" ] && [ "$rss" -gt "$peak" ] && peak=$rss
+    if [ -f "/proc/$pid/status" ]; then
+      rss=$(grep VmRSS "/proc/$pid/status" 2>/dev/null | grep -o '[0-9][0-9]*' | head -n 1)
+      [ -n "$rss" ] && [ "$rss" -gt "$peak" ] && peak=$rss
+    else
+      rss=$(ps -o rss= -p "$pid" 2>/dev/null | grep -o '[0-9][0-9]*' | head -n 1)
+      [ -n "$rss" ] && [ "$rss" -gt "$peak" ] && peak=$rss
+    fi
     sleep 0.1
   done
   wait "$pid" 2>/dev/null
   echo $((peak / 1024))
 }
 
-# wall time in ms (one run), via date +%s%N
-now_ms() { date +%s%N | awk '{print int($1/1000000)}'; }
+# wall clock in ms, portable across Linux and macOS. GNU date (%s%N) is the
+# cheapest (no interpreter startup); BSD date does not support %N, so fall
+# back to perl/python3.
+if date +%s%N 2>/dev/null | grep -qE '^[0-9]+$'; then
+  now_ms() { date +%s%N | awk '{print int($1/1000000)}'; }
+elif command -v perl >/dev/null 2>&1; then
+  now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time*1000'; }
+elif command -v python3 >/dev/null 2>&1; then
+  now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+else
+  echo "bench: no millisecond clock (need GNU date, perl or python3)" >&2
+  exit 1
+fi
 
 bench_phase() { # name, cmd... — status line to stderr, JSON record to stdout
   local name="$1"; shift

@@ -102,6 +102,10 @@ pub struct RawData {
     pub edge_field_count: usize,
 }
 
+/// Strings larger than this are decoded on every `resolve` without memoizing,
+/// so multi-megabyte V8 strings (e.g. data: URLs) never pile up in memory.
+const MEMO_MAX_STRING_BYTES: usize = 64 * 1024;
+
 /// Lazy string table: byte spans into the mmap, decoded on demand with a
 /// memo so repeated resolutions (e.g. per-row node names) are cheap.
 pub struct StringTable {
@@ -153,12 +157,17 @@ impl StringTable {
 
     /// Decode string `idx` (escapes and surrogate pairs handled).
     pub fn resolve(&self, mmap: &Mmap, idx: usize) -> Option<String> {
+        let span = self.spans.get(idx).copied()?;
+        if span.1.saturating_sub(span.0) as usize > MEMO_MAX_STRING_BYTES {
+            let raw =
+                &mmap[self.start + span.0 as usize..self.start + span.1 as usize];
+            return Some(decode_json_string(raw));
+        }
         let memo = self.memo.borrow();
         if let Some(cached) = memo.get(idx).and_then(|s| s.as_ref()) {
             return Some(cached.clone());
         }
         drop(memo);
-        let span = self.spans.get(idx).copied()?;
         let raw = &mmap[self.start + span.0 as usize..self.start + span.1 as usize];
         let decoded = decode_json_string(raw);
         self.memo.borrow_mut()[idx] = Some(decoded.clone());
@@ -287,6 +296,20 @@ fn eq_ci(a: &str, b: &str) -> bool {
         a.eq_ignore_ascii_case(b)
     } else {
         a.to_lowercase() == b.to_lowercase()
+    }
+}
+
+/// Case-insensitive exact name match that also accepts the V8 display-name
+/// suffix after the last `" / "` (e.g. `"system / ExternalStringData"`
+/// matches `"ExternalStringData"`).
+#[inline]
+fn eq_ci_name(hay: &str, needle: &str) -> bool {
+    if eq_ci(hay, needle) {
+        return true;
+    }
+    match hay.rfind(" / ") {
+        Some(pos) => eq_ci(&hay[pos + 3..], needle),
+        None => false,
     }
 }
 
@@ -490,11 +513,11 @@ impl HeapSnapshot {
             let nfc = raw.node_field_count as u32;
             let to_off = raw.edge_offsets.to_node;
             let efc = raw.edge_field_count;
-            for rec in edges.chunks_mut(efc) {
+            edges.par_chunks_mut(efc).for_each(|rec| {
                 if rec.len() > to_off {
                     rec[to_off] /= nfc;
                 }
-            }
+            });
             edges
         };
         self.raw.as_mut().unwrap().edges = Some(edges);
@@ -1892,7 +1915,7 @@ impl HeapSnapshot {
                 let (s, e) = spans[idx];
                 let decoded = decode_json_string(&mmap_bytes[sbase + s as usize..sbase + e as usize]);
                 if exact {
-                    eq_ci(&decoded, query_name)
+                    eq_ci_name(&decoded, query_name)
                 } else {
                     contains_ci(&decoded, query_name)
                 }
@@ -2097,7 +2120,7 @@ impl HeapSnapshot {
                         .unwrap_or_else(|| format!("#{name_or_index}"))
                 };
                 let name_matches = if query.exact {
-                    eq_ci(&name, &query.name)
+                    eq_ci_name(&name, &query.name)
                 } else {
                     contains_ci(&name, &query.name)
                 };
@@ -4009,6 +4032,47 @@ mod tests {
         assert!(!eq_ci("Функция", "вектор"));
         // empty strings are equal
         assert!(eq_ci("", ""));
+    }
+
+    #[test]
+    fn eq_ci_name_matches_display_suffix() {
+        assert!(eq_ci_name("system / ExternalStringData", "ExternalStringData"));
+        assert!(eq_ci_name("system / ExternalStringData", "externalstringdata"));
+        assert!(eq_ci_name("ExternalStringData", "ExternalStringData"));
+        assert!(eq_ci_name("ExternalStringData", "externalstringdata"));
+        assert!(!eq_ci_name("system / InternalStringData", "ExternalStringData"));
+        assert!(!eq_ci_name("InternalStringData", "ExternalStringData"));
+        assert!(!eq_ci_name("system / ExternalStringDataExtra", "ExternalStringData"));
+    }
+
+    #[test]
+    fn string_table_skips_memo_for_large_strings() {
+        let short = b"hello";
+        let long_len = MEMO_MAX_STRING_BYTES + 1;
+        let mut data = Vec::with_capacity(short.len() + long_len);
+        data.extend_from_slice(short);
+        data.resize(short.len() + long_len, b'a');
+        let path = std::env::temp_dir().join(format!(
+            "hprof_string_memo_{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, &data).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mmap = unsafe { Mmap::map(&file).unwrap() };
+        let table = StringTable {
+            start: 0,
+            spans: vec![
+                (0, short.len() as u32),
+                (short.len() as u32, (short.len() + long_len) as u32),
+            ],
+            memo: std::cell::RefCell::new(vec![None, None]),
+        };
+        assert_eq!(table.resolve(&mmap, 0).as_deref(), Some("hello"));
+        assert!(table.memo.borrow()[0].is_some());
+        let decoded = table.resolve(&mmap, 1).unwrap();
+        assert_eq!(decoded.len(), long_len);
+        assert!(table.memo.borrow()[1].is_none());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
