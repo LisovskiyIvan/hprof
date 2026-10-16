@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Read;
 
 use ahash::AHashMap;
-use memchr::memchr;
+use memchr::{memchr, memchr2};
 use memmap2::Mmap;
 use rayon::prelude::*;
 
@@ -14,11 +14,10 @@ pub struct HeapSnapshot {
     meta: Option<SnapshotMeta>,
     raw: Option<RawData>,
     edge_starts: Option<Vec<u32>>,
-    /// Cached full (top=MAX, no-filter) summary. Built once on first
-    /// `stream_summary` call; subsequent calls slice from this. This is the
-    /// single biggest perf win for snapshot analysis — avoids re-parsing the
-    /// 1.5GB mmap on every diff / flamegraph / treemap call.
-    full_summary: Option<HeapSnapshotSummary>,
+    /// Cachedcompact raw summary (`(name_idx, size, count)` sorted by size desc).
+    /// Avoids decoding all 100k+ inline strings when only top-K rows or total
+    /// heap size are needed.
+    raw_summary: Option<RawSummary>,
     /// Cached dominator-tree analysis. Built on demand by `ensure_retained`
     /// and shared by `retained_summary`, `search_nodes` and `shortest_path`.
     retained_data: Option<RetainedData>,
@@ -28,6 +27,14 @@ pub struct HeapSnapshot {
     /// dominator computation — so queries that only need "who owns this"
     /// never pay for Lengauer–Tarjan.
     parents: Option<ParentMap>,
+}
+
+struct RawSummary {
+    total_size: usize,
+    total_count: usize,
+    /// `(representative_name_idx, total_size, total_count)` sorted by `size` descending.
+    by_name_idx: Vec<(u32, usize, usize)>,
+    by_node_type: HashMap<String, TypeSummary>,
 }
 
 /// Cached dominator-tree analysis (per-node retained sizes + reverse graph).
@@ -40,9 +47,7 @@ pub struct HeapSnapshot {
 /// `rev_starts`/`rev_sources` form a flat CSR of *incoming* edges: node with
 /// pre `w` is referenced by sources `rev_sources[rev_starts[w]..rev_starts[w+1]]`.
 /// One pass over the forward edges builds it, and it serves both the idom
-/// iteration (predecessors) and the shortest-path BFS. The old per-node
-/// `Vec<Vec<usize>>` predecessor table cost ~370MB for a 7.4M-node snapshot;
-/// this flat layout costs ~124MB and is faster to build.
+/// iteration (predecessors) and the shortest-path BFS.
 pub struct RetainedData {
     /// retained (self + dominated subtree) size per node, node space
     pub retained: Vec<f64>,
@@ -59,25 +64,21 @@ pub struct RetainedData {
     pub vertex: Vec<u32>,
 }
 
-/// First incoming edge per node (the "owner" edge), in node order.
-/// `index[n]` is the record index of the first node with an edge into `n`;
-/// `edge_type[n]` / `edge_name_or_index[n]` describe that edge (`u32::MAX`
-/// when `n` has no incoming edges).
+/// First incoming edge per node (the "owner" node), in node order.
+/// `index[n]` is the record index of the first node with an edge into `n`
+/// (`u32::MAX` when `n` has no incoming edges). Edge type/name are resolved
+/// on demand for the few hops walked by `retainer_chain`, saving 134MB on a
+/// 16.7M-node snapshot.
 pub struct ParentMap {
     pub index: Vec<u32>,
-    pub edge_type: Vec<u32>,
-    pub edge_name_or_index: Vec<u32>,
 }
 
 /// Node records in struct-of-arrays layout, one entry per node. The fields
 /// V8 writes per record are split into typed columns; fields we never read
-/// (`trace_node_id`) are dropped entirely. For a 26M-node snapshot this is
-/// ~500MB instead of ~625MB interleaved, and the column scans (summary
-/// aggregation, find) read contiguous memory instead of striding through
-/// interleaved records.
+/// (`trace_node_id`) are dropped entirely.
 pub struct NodeColumns {
-    /// index into `node_types` (V8 has a small fixed set; u16 is ample)
-    pub types: Vec<u16>,
+    /// index into `node_types` (V8 has a small fixed set; u8 is ample)
+    pub types: Vec<u8>,
     /// index into the string table
     pub names: Vec<u32>,
     pub ids: Vec<u32>,
@@ -87,13 +88,28 @@ pub struct NodeColumns {
     pub detachedness: Vec<u8>,
 }
 
+pub const EDGE_SYNC_STRIDE: usize = 1024;
+
+/// Compact edge columns: `types` (1B/edge) + `to_nodes` (4B/edge) + coarse
+/// `sync_offsets` into the mmap for reading `name_or_index` on demand without
+/// keeping an extra 162MB `Vec<u32>` resident in memory.
+pub struct EdgeColumns {
+    pub types: Vec<u8>,
+    pub to_nodes: Vec<u32>,
+    pub sync_offsets: Vec<usize>,
+    pub bytes_start: usize,
+    pub bytes_end: usize,
+}
+
 pub struct RawData {
     pub meta: SnapshotMeta,
     pub mmap: Mmap,
     pub nodes: NodeColumns,
-    /// byte range of the `edges` array content (start..=end), parsed on demand
+    /// byte position of `[` opening the `"edges":[` array
+    edges_open: Option<usize>,
+    /// byte range of the `edges` array content (start..=end), located on demand
     edges_range: Option<(usize, usize)>,
-    pub edges: Option<Vec<u32>>,
+    pub edges: Option<EdgeColumns>,
     pub strings: StringTable,
     pub edge_offsets: EdgeFieldOffsets,
     pub node_types: Vec<String>,
@@ -105,85 +121,225 @@ pub struct RawData {
 /// Strings larger than this are decoded on every `resolve` without memoizing,
 /// so multi-megabyte V8 strings (e.g. data: URLs) never pile up in memory.
 const MEMO_MAX_STRING_BYTES: usize = 64 * 1024;
+const MEMO_MAX_ENTRIES: usize = 32 * 1024;
 
-/// Lazy string table: byte spans into the mmap, decoded on demand with a
-/// memo so repeated resolutions (e.g. per-row node names) are cheap.
-pub struct StringTable {
-    /// offset into the mmap where the string content starts
+pub(crate) struct StringScanState {
+    /// offset into the mmap where the string content starts (past `[`)
     start: usize,
+    /// offset from which to search backwards for `"strings":[` if `start == 0`
+    search_from: usize,
     /// per-string (start, end) relative to `start`, content still escaped
     spans: Vec<(u32, u32)>,
-    memo: std::cell::RefCell<Vec<Option<String>>>,
+    cursor: usize,
+    done: bool,
+}
+
+impl StringScanState {
+    fn ensure_start(&mut self, mmap: &Mmap) {
+        if self.start == 0 && !self.done {
+            let data = &mmap[..];
+            let strings_marker = b"\"strings\":[";
+            let from = self.search_from.min(data.len());
+            if let Some(rel) = rfind_marker(&data[from..], strings_marker) {
+                let s = from + rel + strings_marker.len();
+                self.start = s;
+                self.cursor = s;
+            } else if let Some(abs) = find_marker(data, strings_marker) {
+                let s = abs + strings_marker.len();
+                self.start = s;
+                self.cursor = s;
+            } else {
+                self.done = true;
+            }
+        }
+    }
+
+    fn scan_until(&mut self, mmap: &Mmap, target_idx: usize) {
+        self.ensure_start(mmap);
+        if self.done || self.spans.len() > target_idx {
+            return;
+        }
+        let data = &mmap[..];
+        let start = self.start;
+        let end = data.len();
+        let mut i = self.cursor;
+
+        while i < end && self.spans.len() <= target_idx {
+            if data[i] == b',' {
+                i += 1;
+                if i < end && data[i] == b'\n' {
+                    i += 1;
+                }
+            }
+            if i >= end {
+                self.done = true;
+                break;
+            }
+            let b = data[i];
+            let s0 = if b == b'"' {
+                i + 1
+            } else if b == b']' {
+                self.done = true;
+                break;
+            } else {
+                match memchr2(b'"', b']', &data[i..]) {
+                    Some(off) => {
+                        let pos = i + off;
+                        if data[pos] == b']' {
+                            self.cursor = pos;
+                            self.done = true;
+                            break;
+                        }
+                        pos + 1
+                    }
+                    None => {
+                        self.cursor = end;
+                        self.done = true;
+                        break;
+                    }
+                }
+            };
+            i = s0;
+            loop {
+                match memchr2(b'"', b'\\', &data[i..]) {
+                    Some(off) => {
+                        let pos = i + off;
+                        if data[pos] == b'\\' {
+                            i = (pos + 2).min(end);
+                        } else {
+                            self.spans.push(((s0 - start) as u32, (pos - start) as u32));
+                            i = pos + 1;
+                            break;
+                        }
+                    }
+                    None => {
+                        i = end;
+                        self.done = true;
+                        break;
+                    }
+                }
+            }
+        }
+        self.cursor = i;
+    }
+}
+
+impl std::ops::Deref for StringScanState {
+    type Target = [(u32, u32)];
+    fn deref(&self) -> &Self::Target {
+        &self.spans
+    }
+}
+
+/// Lazy string table: byte spans into the mmap are scanned incrementally on
+/// demand with SIMD `memchr2`, and decoded strings are cached in a bounded
+/// hash map (0 bytes upfront instead of a 38MB `Vec<Option<String>>`).
+pub struct StringTable {
+    state: std::sync::RwLock<StringScanState>,
+    memo: std::sync::RwLock<AHashMap<usize, String>>,
 }
 
 impl StringTable {
-    /// Scan the `"strings":[` array starting at `strings_start` (position of
-    /// the `[`), recording the byte span of each string.
-    fn scan(mmap: &Mmap, strings_start: usize) -> StringTable {
-        let data = &mmap[..];
-        let start = strings_start + 1; // past '['
-        let end = data.len();
-        let mut spans: Vec<(u32, u32)> = Vec::with_capacity(1 << 16);
-        let mut i = start;
-        while i < end {
-            if data[i] != b'"' {
-                if data[i] == b']' {
-                    break;
-                }
-                i += 1;
-                continue;
-            }
-            let s0 = i + 1;
-            i += 1;
-            while i < end {
-                if data[i] == b'\\' {
-                    i += 2;
-                } else if data[i] == b'"' {
-                    spans.push(((s0 - start) as u32, (i - start) as u32));
-                    i += 1;
-                    break;
-                } else {
-                    i += 1;
-                }
-            }
-        }
-        let span_count = spans.len();
+    /// Create a lazy string table whose `"strings":[` array opens at `strings_open`.
+    pub(crate) fn new_at(strings_open: usize) -> StringTable {
+        let start = strings_open + 1;
         StringTable {
-            start,
-            spans,
-            memo: std::cell::RefCell::new(vec![None; span_count]),
+            state: std::sync::RwLock::new(StringScanState {
+                start,
+                search_from: 0,
+                spans: Vec::new(),
+                cursor: start,
+                done: false,
+            }),
+            memo: std::sync::RwLock::new(AHashMap::new()),
         }
+    }
+
+    /// Create a fully lazy string table that locates `"strings":[` on first access.
+    fn new_deferred(search_from: usize) -> StringTable {
+        StringTable {
+            state: std::sync::RwLock::new(StringScanState {
+                start: 0,
+                search_from,
+                spans: Vec::new(),
+                cursor: 0,
+                done: false,
+            }),
+            memo: std::sync::RwLock::new(AHashMap::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_spans_for_test(start: usize, spans: Vec<(u32, u32)>) -> StringTable {
+        StringTable {
+            state: std::sync::RwLock::new(StringScanState {
+                start,
+                search_from: 0,
+                spans,
+                cursor: start,
+                done: true,
+            }),
+            memo: std::sync::RwLock::new(AHashMap::new()),
+        }
+    }
+
+    /// Ensure all string spans are scanned and return `(start_offset, spans_guard)`.
+    pub(crate) fn all_spans<'a>(
+        &'a self,
+        mmap: &Mmap,
+    ) -> (usize, std::sync::RwLockReadGuard<'a, StringScanState>) {
+        {
+            let mut state = self.state.write().unwrap();
+            if !state.done {
+                if state.spans.capacity() == 0 {
+                    state.spans.reserve(1 << 16);
+                }
+                state.scan_until(mmap, usize::MAX);
+            }
+        }
+        let guard = self.state.read().unwrap();
+        let start = guard.start;
+        (start, guard)
     }
 
     /// Decode string `idx` (escapes and surrogate pairs handled).
     pub fn resolve(&self, mmap: &Mmap, idx: usize) -> Option<String> {
-        let span = self.spans.get(idx).copied()?;
-        if span.1.saturating_sub(span.0) as usize > MEMO_MAX_STRING_BYTES {
-            let raw =
-                &mmap[self.start + span.0 as usize..self.start + span.1 as usize];
-            return Some(decode_json_string(raw));
-        }
-        let memo = self.memo.borrow();
-        if let Some(cached) = memo.get(idx).and_then(|s| s.as_ref()) {
+        if let Some(cached) = self.memo.read().unwrap().get(&idx) {
             return Some(cached.clone());
         }
-        drop(memo);
-        let raw = &mmap[self.start + span.0 as usize..self.start + span.1 as usize];
+        let (start, span) = {
+            let mut state = self.state.write().unwrap();
+            if idx >= state.spans.len() && !state.done {
+                state.scan_until(mmap, idx);
+            }
+            let span = state.spans.get(idx).copied()?;
+            (state.start, span)
+        };
+        let raw = &mmap[start + span.0 as usize..start + span.1 as usize];
+        if span.1.saturating_sub(span.0) as usize > MEMO_MAX_STRING_BYTES {
+            return Some(decode_json_string(raw));
+        }
         let decoded = decode_json_string(raw);
-        self.memo.borrow_mut()[idx] = Some(decoded.clone());
+        let mut memo = self.memo.write().unwrap();
+        if memo.len() < MEMO_MAX_ENTRIES {
+            memo.insert(idx, decoded.clone());
+        }
         Some(decoded)
     }
 
     /// All strings containing `query` (case-insensitive), up to `limit`.
     pub fn search(&self, mmap: &Mmap, query: &str, limit: usize) -> Vec<(usize, String)> {
+        let (sbase, spans_guard) = self.all_spans(mmap);
+        let spans: &[(u32, u32)] = &spans_guard;
+        let mmap_bytes = &mmap[..];
         let mut out = Vec::new();
-        for idx in 0..self.spans.len() {
-            if let Some(v) = self.resolve(mmap, idx) {
-                if contains_ci(&v, query) {
-                    out.push((idx, v));
-                    if out.len() >= limit {
-                        break;
-                    }
+        for (idx, &(s, e)) in spans.iter().enumerate() {
+            let raw = &mmap_bytes[sbase + s as usize..sbase + e as usize];
+            if raw_string_matches(raw, query, false) {
+                let v = decode_json_string(raw);
+                out.push((idx, v));
+                if out.len() >= limit {
+                    break;
                 }
             }
         }
@@ -193,6 +349,12 @@ impl StringTable {
 
 /// Decode one JSON string from `raw[start..end]` (escape sequences included).
 pub(crate) fn decode_json_string(raw: &[u8]) -> String {
+    if memchr(b'\\', raw).is_none() {
+        return match std::str::from_utf8(raw) {
+            Ok(s) => s.to_owned(),
+            Err(_) => String::from_utf8_lossy(raw).into_owned(),
+        };
+    }
     let mut s: Vec<u8> = Vec::with_capacity(raw.len());
     let mut i = 0usize;
     let len = raw.len();
@@ -210,6 +372,9 @@ pub(crate) fn decode_json_string(raw: &[u8]) -> String {
                 b't' => s.push(b'\t'),
                 b'u' => {
                     let hexv = |idx: usize| -> u16 {
+                        if idx + 4 > len {
+                            return 0;
+                        }
                         let mut v: u16 = 0;
                         for &b in &raw[idx..idx + 4] {
                             v = v * 16
@@ -223,10 +388,6 @@ pub(crate) fn decode_json_string(raw: &[u8]) -> String {
                         v
                     };
                     let mut cp: u32 = hexv(i + 2) as u32;
-                    // i += 6 lands on the byte right after the 4 hex digits,
-                    // which is where a following low-surrogate '\uXXXX' would
-                    // begin (the old code checked raw[i+1]/raw[i+2]/hexv(i+3),
-                    // which skipped the low surrogate and dropped both chars)
                     i += 6;
                     if (0xD800..0xDC00).contains(&cp)
                         && i + 5 < len
@@ -252,6 +413,30 @@ pub(crate) fn decode_json_string(raw: &[u8]) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&s).into_owned()
+}
+
+/// Allocation-free match of a raw JSON string slice against `query_name`.
+/// Only decodes into a temporary `String` when backslash escapes are present.
+#[inline]
+fn raw_string_matches(raw: &[u8], query_name: &str, exact: bool) -> bool {
+    if query_name.is_ascii() && raw.len() < query_name.len() {
+        return false;
+    }
+    if memchr(b'\\', raw).is_none() {
+        if let Ok(s) = std::str::from_utf8(raw) {
+            return if exact {
+                eq_ci_name(s, query_name)
+            } else {
+                contains_ci(s, query_name)
+            };
+        }
+    }
+    let decoded = decode_json_string(raw);
+    if exact {
+        eq_ci_name(&decoded, query_name)
+    } else {
+        contains_ci(&decoded, query_name)
+    }
 }
 
 /// ASCII-fast, allocation-free case-insensitive substring search. Non-ASCII
@@ -320,7 +505,7 @@ impl HeapSnapshot {
             meta: None,
             raw: None,
             edge_starts: None,
-            full_summary: None,
+            raw_summary: None,
             retained_data: None,
             parents: None,
         }
@@ -393,15 +578,24 @@ impl HeapSnapshot {
         let strings_marker = b"\"strings\":[";
 
         let nodes_start = find_marker(data, nodes_marker).ok_or(Error::HeaderParseFailed)?;
-        let strings_start = find_marker(data, strings_marker).ok_or(Error::HeaderParseFailed)?;
 
         // nodes are needed by every query; edges and strings are parsed
-        // lazily (get_node_edges / name resolution) to keep memory down on
-        // multi-GB snapshots. The region is bounded to the nodes array so the
-        // parallel parser can split it at commas.
+        // lazily to keep memory and page faults down on multi-GB snapshots.
         let nodes_open = nodes_start + nodes_marker.len() - 1; // position of '['
         let nodes_end = find_array_end(data, nodes_open);
         let nodes_bytes = &data[nodes_open + 1..=nodes_end];
+
+        // `"edges":[` immediately follows the closing `]` of `nodes`. Check the
+        // small window right after `nodes_end` (already in L1 cache) so we know
+        // where `edges` starts without scanning `nodes` a second time later.
+        let edges_marker = b"\"edges\":[";
+        let lookahead_end = (nodes_end + 1024).min(data.len());
+        let edges_open = if nodes_end + 1 < lookahead_end {
+            find_marker(&data[nodes_end + 1..lookahead_end], edges_marker)
+                .map(|rel| nodes_end + 1 + rel + edges_marker.len() - 1)
+        } else {
+            None
+        };
 
         let node_offsets = NodeFieldOffsets::from_fields(&meta.meta.node_fields)?;
         let edge_offsets = EdgeFieldOffsets::from_fields(&meta.meta.edge_fields)?;
@@ -410,18 +604,13 @@ impl HeapSnapshot {
         let node_field_count = meta.meta.node_fields.len();
         let edge_field_count = meta.meta.edge_fields.len();
 
-        // Split the flat node records into typed columns, dropping the fields
-        // nothing reads. Preferred path streams record-aligned chunks straight
-        // into the columns (no interleaved transient, which was ~625MB for a
-        // 26M-node snapshot); the sweep path is the fallback for inputs whose
-        // layout breaks the comma-counted record alignment.
         let nodes = match node_columns_streaming(nodes_bytes, node_field_count, &node_offsets) {
             Some(cols) => cols,
             None => {
                 let flat = parse_numbers_par(nodes_bytes);
-                let types: Vec<u16> = flat
+                let types: Vec<u8> = flat
                     .par_chunks(node_field_count)
-                    .map(|r| r[node_offsets.type_] as u16)
+                    .map(|r| r[node_offsets.type_] as u8)
                     .collect();
                 let names: Vec<u32> = flat
                     .par_chunks(node_field_count)
@@ -460,17 +649,26 @@ impl HeapSnapshot {
             }
         };
 
-        // the edges array is located lazily in ensure_edges — locating it
-        // here would scan the whole (often ~700MB) edges array even for
-        // queries that never touch edges
-
-        // string table: scan byte spans lazily, decode on demand
-        let strings_table = StringTable::scan(&mmap, strings_start + strings_marker.len() - 1);
+        // For small snapshots (< 16 MiB), validate `"strings":[` immediately;
+        // for large snapshots, defer locating `"strings":[` until the first
+        // string resolution so commands like `sizes` and `detached` never fault
+        // the `edges`, `locations`, or `strings` mmap pages into RSS.
+        let strings_table = if data.len() < (16 << 20) {
+            let search_from = (nodes_end + 1).min(data.len());
+            let strings_start = rfind_marker(&data[search_from..], strings_marker)
+                .map(|rel| search_from + rel)
+                .or_else(|| find_marker(data, strings_marker))
+                .ok_or(Error::HeaderParseFailed)?;
+            StringTable::new_at(strings_start + strings_marker.len() - 1)
+        } else {
+            StringTable::new_deferred(nodes_end + 1)
+        };
 
         self.raw = Some(RawData {
             meta,
             mmap,
             nodes,
+            edges_open,
             edges_range: None,
             edges: None,
             strings: strings_table,
@@ -483,6 +681,28 @@ impl HeapSnapshot {
         Ok(())
     }
 
+    fn locate_edges_range(&mut self) -> crate::Result<(usize, usize)> {
+        let raw = self.raw.as_mut().unwrap();
+        if let Some(r) = raw.edges_range {
+            return Ok(r);
+        }
+        let open = match raw.edges_open {
+            Some(o) => o,
+            None => {
+                let edges_marker = b"\"edges\":[";
+                let start =
+                    find_marker(&raw.mmap, edges_marker).ok_or(Error::HeaderParseFailed)?;
+                let o = start + edges_marker.len() - 1;
+                raw.edges_open = Some(o);
+                o
+            }
+        };
+        let end = find_array_end(&raw.mmap, open);
+        let range = (open + 1, end);
+        raw.edges_range = Some(range);
+        Ok(range)
+    }
+
     fn ensure_edges(&mut self) -> crate::Result<()> {
         let needs = match self.raw.as_ref() {
             Some(raw) => raw.edges.is_none(),
@@ -491,34 +711,35 @@ impl HeapSnapshot {
         if !needs {
             return Ok(());
         }
+        let (start, end) = self.locate_edges_range()?;
         let edges = {
             let raw = self.raw.as_ref().unwrap();
-            let (start, end) = match raw.edges_range {
-                Some(r) => r,
-                None => {
-                    let edges_marker = b"\"edges\":[";
-                    let start =
-                        find_marker(&raw.mmap, edges_marker).ok_or(Error::HeaderParseFailed)?;
-                    let open = start + edges_marker.len() - 1;
-                    let end = find_array_end(&raw.mmap, open);
-                    (open + 1, end)
-                }
-            };
-            let mut edges = parse_numbers_par(&raw.mmap[start..=end]);
-            // `to_node` is written by V8 as the absolute record base
-            // (node_index * node_field_count). Normalize it to a plain node
-            // index in place (done once at parse time, no extra allocation) so
-            // every consumer — including the hottest loops (DFS, reverse-CSR,
-            // parent map) — skips a per-edge division.
-            let nfc = raw.node_field_count as u32;
-            let to_off = raw.edge_offsets.to_node;
+            let edges_bytes = &raw.mmap[start..=end];
+            let nfc = raw.node_field_count.max(1) as u32;
             let efc = raw.edge_field_count;
-            edges.par_chunks_mut(efc).for_each(|rec| {
-                if rec.len() > to_off {
-                    rec[to_off] /= nfc;
+            match edge_columns_streaming(edges_bytes, start, end + 1, efc, nfc, &raw.edge_offsets) {
+                Some(cols) => cols,
+                None => {
+                    let flat = parse_numbers_par(edges_bytes);
+                    let type_off = raw.edge_offsets.type_;
+                    let to_off = raw.edge_offsets.to_node;
+                    let types: Vec<u8> = flat
+                        .par_chunks(efc)
+                        .map(|r| r.get(type_off).copied().unwrap_or(0) as u8)
+                        .collect();
+                    let to_nodes: Vec<u32> = flat
+                        .par_chunks(efc)
+                        .map(|r| r.get(to_off).copied().unwrap_or(0) / nfc)
+                        .collect();
+                    EdgeColumns {
+                        types,
+                        to_nodes,
+                        sync_offsets: Vec::new(),
+                        bytes_start: start,
+                        bytes_end: end + 1,
+                    }
                 }
-            });
-            edges
+            }
         };
         self.raw.as_mut().unwrap().edges = Some(edges);
         Ok(())
@@ -557,59 +778,88 @@ impl HeapSnapshot {
         top: usize,
         filter: Option<&str>,
     ) -> crate::Result<HeapSnapshotSummary> {
-        // Build the full (untruncated, unfiltered) summary once and cache it.
-        // Subsequent calls — including those from `diff`, `to_flamegraph` and
-        // `to_treemap` — slice from this cached value. For a 1.5GB snapshot
-        // this turns a 6-second analysis into a 1-second one.
-        if self.full_summary.is_none() {
-            let full = self.compute_full_summary()?;
-            self.full_summary = Some(full);
+        self.ensure_raw_summary()?;
+        let raw = self.raw.as_ref().unwrap();
+        let summary = self.raw_summary.as_ref().unwrap();
+        let filter_re = filter.and_then(|f| regex::Regex::new(f).ok());
+
+        let mut by_node_name: HashMap<String, TypeSummary> = HashMap::new();
+        for &(name_idx, size, count) in &summary.by_name_idx {
+            if top != usize::MAX && by_node_name.len() >= top {
+                break;
+            }
+            if size == 0 {
+                continue;
+            }
+            let name = raw
+                .strings
+                .resolve(&raw.mmap, name_idx as usize)
+                .unwrap_or_else(|| format!("<string#{}>", name_idx));
+            if let Some(re) = &filter_re {
+                if !re.is_match(&name) {
+                    continue;
+                }
+            }
+            let entry = by_node_name
+                .entry(name)
+                .or_insert(TypeSummary { size: 0, count: 0 });
+            entry.size += size;
+            entry.count += count;
         }
-        let full = self.full_summary.as_ref().unwrap();
-        Ok(slice_summary(full, top, filter))
+
+        Ok(HeapSnapshotSummary {
+            total_size: summary.total_size,
+            total_count: summary.total_count,
+            by_node_name,
+            by_node_type: summary.by_node_type.clone(),
+        })
     }
 
-    fn compute_full_summary(&mut self) -> crate::Result<HeapSnapshotSummary> {
-        // Reuse the already-parsed node records from ensure_raw instead of
-        // re-parsing the mmap — in the analyze --retained flow the nodes
-        // array would otherwise be parsed twice (~350MB of scanning).
+    fn ensure_raw_summary(&mut self) -> crate::Result<()> {
+        if self.raw_summary.is_some() {
+            return Ok(());
+        }
         self.ensure_raw()?;
         let raw = self.raw.as_ref().unwrap();
         let col = &raw.nodes;
         let node_types = raw.node_types.as_slice();
-        let strings = &raw.strings;
 
         let total_node_count = col.ids.len();
+        let num_threads = rayon::current_num_threads().max(1);
+        let num_chunks = (num_threads * 4).max(1);
+        let chunk_size = total_node_count.div_ceil(num_chunks).max(1);
 
-        let chunks_per_thread = (total_node_count / rayon::current_num_threads().max(1)).max(1);
         let partials: Vec<(
             usize,
             usize,
-            AHashMap<u32, (usize, usize, u32)>,
             AHashMap<u32, (usize, usize)>,
-        )> = (0..total_node_count)
+            Vec<(usize, usize)>,
+        )> = (0..num_chunks)
             .into_par_iter()
-            .chunks(chunks_per_thread)
-            .map(|chunk| {
+            .map(|c| {
+                let start = (c * chunk_size).min(total_node_count);
+                let end = ((c + 1) * chunk_size).min(total_node_count);
                 let mut local_size = 0usize;
                 let mut local_count = 0usize;
-                let mut local_by_name: AHashMap<u32, (usize, usize, u32)> = AHashMap::new();
-                let mut local_by_type: AHashMap<u32, (usize, usize)> = AHashMap::new();
+                let mut local_by_name: AHashMap<u32, (usize, usize)> = AHashMap::new();
+                let mut local_by_type: Vec<(usize, usize)> = vec![(0, 0); node_types.len().max(16)];
 
-                for n in chunk {
-                    let type_idx = col.types[n] as u32;
-                    let name_idx = col.names[n];
+                for n in start..end {
                     let self_size = col.self_sizes[n] as usize;
                     local_count += 1;
                     local_size += self_size;
 
                     if self_size > 0 {
-                        let e = local_by_name.entry(name_idx).or_insert((0, 0, type_idx));
+                        let type_idx = col.types[n] as usize;
+                        let name_idx = col.names[n];
+                        let e = local_by_name.entry(name_idx).or_insert((0, 0));
                         e.0 += self_size;
                         e.1 += 1;
-                        let te = local_by_type.entry(type_idx).or_insert((0, 0));
-                        te.0 += self_size;
-                        te.1 += 1;
+                        if type_idx >= local_by_type.len() {
+                            local_by_type.resize(type_idx + 1, (0, 0));
+                        }
+                        local_by_type[type_idx].0 += self_size;
+                        local_by_type[type_idx].1 += 1;
                     }
                 }
                 (local_size, local_count, local_by_name, local_by_type)
@@ -618,57 +868,52 @@ impl HeapSnapshot {
 
         let mut total_size = 0usize;
         let mut total_count = 0usize;
-        let mut by_name_idx: AHashMap<u32, (usize, usize, u32)> = AHashMap::new();
-        let mut by_type_idx: AHashMap<u32, (usize, usize)> = AHashMap::new();
+        let mut by_name_map: AHashMap<u32, (usize, usize)> = AHashMap::new();
+        let mut by_type_vec: Vec<(usize, usize)> = vec![(0, 0); node_types.len().max(16)];
 
         for (size, count, local_names, local_types) in partials {
             total_size += size;
             total_count += count;
-            for (name_idx, (sz, cnt, type_idx)) in local_names {
-                let e = by_name_idx.entry(name_idx).or_insert((0, 0, 0));
-                e.0 += sz;
-                e.1 += cnt;
-                e.2 = type_idx;
-            }
-            for (type_idx, (sz, cnt)) in local_types {
-                let e = by_type_idx.entry(type_idx).or_insert((0, 0));
+            for (name_idx, (sz, cnt)) in local_names {
+                let e = by_name_map.entry(name_idx).or_insert((0, 0));
                 e.0 += sz;
                 e.1 += cnt;
             }
+            if local_types.len() > by_type_vec.len() {
+                by_type_vec.resize(local_types.len(), (0, 0));
+            }
+            for (type_idx, (sz, cnt)) in local_types.into_iter().enumerate() {
+                by_type_vec[type_idx].0 += sz;
+                by_type_vec[type_idx].1 += cnt;
+            }
         }
 
-        let table = strings;
-
-        // Build the full (untruncated, unfiltered) name and type maps. We keep
-        // ALL names regardless of size, so subsequent slice_summary() can apply
-        // any (top, filter) combination cheaply without re-parsing the mmap.
-        let mut by_node_name: HashMap<String, TypeSummary> = HashMap::new();
-        for (&name_idx, &(size, count, _type_idx)) in &by_name_idx {
-            let name = table
-                .resolve(&raw.mmap, name_idx as usize)
-                .unwrap_or_else(|| format!("<string#{}>", name_idx));
-            let entry = by_node_name
-                .entry(name)
-                .or_insert(TypeSummary { size: 0, count: 0 });
-            entry.size += size;
-            entry.count += count;
-        }
+        let mut by_name_idx: Vec<(u32, usize, usize)> = by_name_map
+            .into_iter()
+            .filter(|&(_, (sz, _))| sz > 0)
+            .map(|(idx, (sz, cnt))| (idx, sz, cnt))
+            .collect();
+        by_name_idx.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         let mut by_node_type: HashMap<String, TypeSummary> = HashMap::new();
-        for (&type_idx, &(size, count)) in &by_type_idx {
+        for (type_idx, (size, count)) in by_type_vec.into_iter().enumerate() {
+            if size == 0 && count == 0 {
+                continue;
+            }
             let type_name = node_types
-                .get(type_idx as usize)
+                .get(type_idx)
                 .cloned()
                 .unwrap_or_else(|| type_idx.to_string());
             by_node_type.insert(type_name, TypeSummary { size, count });
         }
 
-        Ok(HeapSnapshotSummary {
+        self.raw_summary = Some(RawSummary {
             total_size,
             total_count,
-            by_node_name,
+            by_name_idx,
             by_node_type,
-        })
+        });
+        Ok(())
     }
 
     /// Fetch a single node by record index (name resolved). Used by the CLI
@@ -691,8 +936,6 @@ impl HeapSnapshot {
         let wanted = (page + 1) * page_size;
         let mut total = 0usize;
 
-        // keep the query in its original case — `contains_ci` folds ASCII
-        // without allocating, avoiding a lowercased copy per scanned node
         let query_orig;
         let q_match = if let Some(q) = options.query {
             if q.is_empty() {
@@ -705,10 +948,6 @@ impl HeapSnapshot {
             None
         };
 
-        // Numeric sorts (the common case: size / id / edge-count pages) select
-        // with a bounded heap over plain numbers, so the loop stays
-        // allocation-free. Name/type sorts and query filtering need the
-        // strings resolved, so they take the slower path.
         let numeric_sort = match options.sort {
             SortField::SelfSize | SortField::Id | SortField::EdgeCount => true,
             SortField::Name | SortField::Type => false,
@@ -717,8 +956,7 @@ impl HeapSnapshot {
 
         let mut selected: Vec<(usize, HeapSnapshotNode)> = Vec::with_capacity(wanted);
 
-        if numeric_sort {
-            // keep the top-`wanted` by the numeric key
+        if numeric_sort && q_match.is_none() {
             let col = &raw.nodes;
             let key_of = |node_index: usize| -> u64 {
                 match options.sort {
@@ -728,7 +966,6 @@ impl HeapSnapshot {
                     _ => unreachable!(),
                 }
             };
-            // desc: keep largest (min-heap over the key) · asc: keep smallest
             let keep_largest = matches!(options.dir, SortDir::Desc);
             let mut heap: std::collections::BinaryHeap<HeapItem> =
                 std::collections::BinaryHeap::with_capacity(wanted + 1);
@@ -739,8 +976,8 @@ impl HeapSnapshot {
                     let type_ = raw
                         .node_types
                         .get(type_idx)
-                        .cloned()
-                        .unwrap_or_else(|| type_idx.to_string());
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
                     if type_ != ft {
                         continue;
                     }
@@ -763,7 +1000,6 @@ impl HeapSnapshot {
                 }
                 total += 1;
             }
-            // materialize the kept nodes, resolve strings for the page rows
             let mut kept: Vec<usize> = heap.into_iter().map(|h| h.idx).collect();
             kept.sort_by(|&a, &b| compare_node_indices(raw, a, b, options.sort, options.dir));
             let rows: Vec<usize> = kept
@@ -786,17 +1022,17 @@ impl HeapSnapshot {
         let col = &raw.nodes;
         for node_index in 0..raw.meta.node_count {
             let type_idx = col.types[node_index] as usize;
+            if let Some(ft) = options.type_filter {
+                let t = raw.node_types.get(type_idx).map(|s| s.as_str()).unwrap_or("");
+                if t != ft {
+                    continue;
+                }
+            }
             let type_ = raw
                 .node_types
                 .get(type_idx)
                 .cloned()
                 .unwrap_or_else(|| type_idx.to_string());
-
-            if let Some(ft) = options.type_filter {
-                if type_ != ft {
-                    continue;
-                }
-            }
 
             let name_idx = col.names[node_index] as usize;
             let name = if need_name {
@@ -833,7 +1069,6 @@ impl HeapSnapshot {
                 continue;
             }
 
-            // replace the current worst kept candidate if this one is better
             let worst_idx = selected
                 .iter()
                 .enumerate()
@@ -900,7 +1135,7 @@ impl HeapSnapshot {
         node_index: usize,
     ) -> crate::Result<(HeapSnapshotNode, Vec<HeapSnapshotEdge>)> {
         self.ensure_raw()?;
-        self.ensure_edges()?;
+        let _ = self.locate_edges_range()?;
         self.ensure_edge_starts();
         let raw = self.raw.as_ref().unwrap();
         if node_index >= raw.meta.node_count {
@@ -913,13 +1148,8 @@ impl HeapSnapshot {
         let edge_end = edge_starts[node_index + 1] as usize;
 
         let mut edges = Vec::with_capacity(edge_end - edge_start);
-        for edge_index in edge_start..edge_end {
-            let edges_vec = raw.edges.as_ref().unwrap();
-            let base = edge_index * raw.edge_field_count;
-            let type_idx = edges_vec[base + raw.edge_offsets.type_] as usize;
-            let name_or_index_val = edges_vec[base + raw.edge_offsets.name_or_index] as usize;
-            let to_node = edges_vec[base + raw.edge_offsets.to_node] as usize;
-
+        raw.for_each_edge_in_range(edge_start, edge_end, |_edge_idx, type_idx, name_or_index_val, to_node| {
+            let name_or_index_val = name_or_index_val as usize;
             let edge_type = raw
                 .edge_types
                 .get(type_idx)
@@ -939,15 +1169,12 @@ impl HeapSnapshot {
                 name_or_index: name,
                 to_node,
             });
-        }
+        });
 
         Ok((node, edges))
     }
 
     /// Emit a bounded outgoing object graph around a node as Graphviz DOT.
-    /// This is intentionally separate from the heapprofile call graph: the
-    /// nodes here are real heap objects and edge labels are properties or
-    /// element indexes.
     pub fn to_dot_subgraph(
         &mut self,
         root: usize,
@@ -955,7 +1182,7 @@ impl HeapSnapshot {
         max_nodes: usize,
     ) -> crate::Result<String> {
         self.ensure_raw()?;
-        self.ensure_edges()?;
+        let _ = self.locate_edges_range()?;
         self.ensure_edge_starts();
         let raw = self.raw.as_ref().unwrap();
         if root >= raw.meta.node_count {
@@ -963,7 +1190,6 @@ impl HeapSnapshot {
         }
         let node_limit = if max_nodes == 0 { 1_000 } else { max_nodes };
         let edge_starts = self.edge_starts.as_ref().unwrap();
-        let edges = raw.edges.as_ref().unwrap();
         let mut seen = std::collections::HashSet::with_capacity(node_limit.min(1024));
         let mut queue = std::collections::VecDeque::new();
         let mut graph_edges: Vec<(usize, usize, String)> = Vec::new();
@@ -976,23 +1202,20 @@ impl HeapSnapshot {
             }
             let start = edge_starts[source] as usize;
             let end = edge_starts[source + 1] as usize;
-            for edge_index in start..end {
-                let base = edge_index * raw.edge_field_count;
-                let target = edges[base + raw.edge_offsets.to_node] as usize;
+            raw.for_each_edge_in_range(start, end, |_edge_index, type_index, name_index, target| {
                 if target >= raw.meta.node_count {
-                    continue;
+                    return;
                 }
                 if !seen.contains(&target) && seen.len() >= node_limit {
-                    continue;
+                    return;
                 }
                 let is_new = seen.insert(target);
-                let type_index = edges[base + raw.edge_offsets.type_] as usize;
                 let edge_type = raw
                     .edge_types
                     .get(type_index)
                     .cloned()
                     .unwrap_or_else(|| type_index.to_string());
-                let name_index = edges[base + raw.edge_offsets.name_or_index] as usize;
+                let name_index = name_index as usize;
                 let edge_name = if edge_type == "element" {
                     format!("[{name_index}]")
                 } else {
@@ -1004,7 +1227,7 @@ impl HeapSnapshot {
                 if is_new && depth + 1 < max_depth {
                     queue.push_back((target, depth + 1));
                 }
-            }
+            });
         }
 
         fn dot_escape(value: &str) -> String {
@@ -1073,11 +1296,7 @@ impl HeapSnapshot {
     }
 
     /// Compute (and cache) the dominator-tree analysis: per-node retained
-    /// sizes plus a flat reverse (incoming-edge) CSR. Shared by
-    /// `get_retained_entries`, `retained_summary`, `search_nodes` and
-    /// `shortest_path`, so a CLI session that uses several of these pays the
-    /// cost once. The reverse CSR doubles as the predecessor table for the
-    /// idom iteration and as the traversal index for path BFS.
+    /// sizes plus a flat reverse (incoming-edge) CSR.
     pub fn ensure_retained(&mut self) -> crate::Result<()> {
         if self.retained_data.is_some() {
             return Ok(());
@@ -1092,47 +1311,52 @@ impl HeapSnapshot {
             .edge_types
             .iter()
             .position(|t| t == "weak")
-            .map(|idx| idx as u32);
-        let edge_field_count = raw.edge_field_count;
-        let to_node_offset = raw.edge_offsets.to_node;
-        let type_offset = raw.edge_offsets.type_;
-        let edges = raw.edges.as_ref().unwrap().as_slice();
+            .map(|idx| idx as u8)
+            .unwrap_or(u8::MAX);
+        let edges = raw.edges.as_ref().unwrap();
+        let edge_types = edges.types.as_slice();
+        let edge_to_nodes = edges.to_nodes.as_slice();
 
-        // iterative DFS from root (node 0), assigning preorder numbers. The
-        // DFS tree (dfs_parent) plus the reverse CSR feed Lengauer–Tarjan.
-        // Weak edges do not retain objects in V8 GC and are skipped.
+        // Iterative DFS from root (node 0), assigning preorder numbers.
+        // Instead of a 67MB `next_edge: Vec<u32>`, each active stack frame holds
+        // `(v_pre, next_e, end_e)` and leaf nodes (`to_start == to_end`, >45% of
+        // the heap) are assigned preorder numbers without pushing/popping a
+        // stack frame — producing the exact same DFS preorder traversal while
+        // saving 67MB and ~7.5M loop iterations.
         let mut preorder = vec![u32::MAX; node_count];
         let mut vertex: Vec<u32> = Vec::with_capacity(node_count);
         let mut dfs_parent: Vec<u32> = Vec::with_capacity(node_count);
-        // per-node cursor into its own edge range (edge_starts[v]..edge_starts[v+1])
-        let mut next_edge: Vec<u32> = edge_starts[..node_count].to_vec();
         let mut pre = 0u32;
         preorder[0] = 0;
         vertex.push(0);
         dfs_parent.push(0);
-        let mut stack: Vec<u32> = vec![0u32];
-        while let Some(&v_node) = stack.last() {
-            let end = edge_starts[v_node as usize + 1] as usize;
-            let mut e = next_edge[v_node as usize] as usize;
+        let mut stack: Vec<(u32, u32, u32)> = Vec::with_capacity(4096);
+        if edge_starts[0] < edge_starts[1] {
+            stack.push((0, edge_starts[0], edge_starts[1]));
+        }
+        while let Some(&mut (v_pre, ref mut next_e, end_e)) = stack.last_mut() {
+            let mut e = *next_e as usize;
+            let end = end_e as usize;
             let mut descended = false;
             while e < end {
-                let base = e * edge_field_count;
-                if let Some(wtype) = weak_edge_type {
-                    if edges[base + type_offset] == wtype {
-                        e += 1;
-                        continue;
-                    }
+                if edge_types[e] == weak_edge_type {
+                    e += 1;
+                    continue;
                 }
-                let to_node = edges[base + to_node_offset] as usize;
+                let to_node = edge_to_nodes[e] as usize;
                 if to_node < node_count && preorder[to_node] == u32::MAX {
-                    next_edge[v_node as usize] = (e + 1) as u32;
                     pre += 1;
                     preorder[to_node] = pre;
                     vertex.push(to_node as u32);
-                    dfs_parent.push(preorder[v_node as usize]);
-                    stack.push(to_node as u32);
-                    descended = true;
-                    break;
+                    dfs_parent.push(v_pre);
+                    let to_start = edge_starts[to_node];
+                    let to_end = edge_starts[to_node + 1];
+                    if to_start < to_end {
+                        *next_e = (e + 1) as u32;
+                        stack.push((pre, to_start, to_end));
+                        descended = true;
+                        break;
+                    }
                 }
                 e += 1;
             }
@@ -1140,192 +1364,182 @@ impl HeapSnapshot {
                 stack.pop();
             }
         }
-        // the per-node edge cursor is dead after the DFS — free it now rather
-        // than holding ~104MB through the CSR + Lengauer–Tarjan phases
-        drop(next_edge);
+        drop(stack);
 
-        // flat reverse CSR in pre space: node with pre `w` is referenced by
-        // sources rev_sources[rev_starts[w]..rev_starts[w+1]] (pre numbers).
-        // Sources unreachable from root cannot dominate anything and are
-        // skipped. Sized to the reachable set (vertex.len()), not node_count —
-        // preorder numbers only ever index the reachable nodes.
+        // Flat reverse CSR in pre space built in-place on `rev_starts` (no
+        // separate 66MB `counts`/`cursor` vector).
         let reachable = vertex.len();
-        let mut counts = vec![0u32; reachable];
+        let mut rev_starts = vec![0u32; reachable + 1];
         for &n_u32 in &vertex {
             let n = n_u32 as usize;
             let start = edge_starts[n] as usize;
             let end = edge_starts[n + 1] as usize;
             for edge_index in start..end {
-                let base = edge_index * edge_field_count;
-                if let Some(wtype) = weak_edge_type {
-                    if edges[base + type_offset] == wtype {
-                        continue;
-                    }
+                if edge_types[edge_index] == weak_edge_type {
+                    continue;
                 }
-                let to_node = edges[base + to_node_offset] as usize;
-                if to_node < node_count && preorder[to_node] != u32::MAX {
-                    counts[preorder[to_node] as usize] += 1;
+                let to_node = edge_to_nodes[edge_index] as usize;
+                if to_node < node_count {
+                    let w = preorder[to_node];
+                    if w != u32::MAX {
+                        rev_starts[w as usize + 1] += 1;
+                    }
                 }
             }
         }
-        // compute prefix sums into rev_starts
-        let mut rev_starts = counts.clone();
-        rev_starts.push(0); // rev_starts has one extra slot for the total
-        let mut prefix = 0u32;
-        for n in 0..reachable {
-            let c = rev_starts[n];
-            rev_starts[n] = prefix;
-            prefix += c;
+        for i in 1..=reachable {
+            rev_starts[i] += rev_starts[i - 1];
         }
-        rev_starts[reachable] = prefix;
 
-        // reuse `counts` as the write cursor initialized to `rev_starts[..reachable]`
-        counts.copy_from_slice(&rev_starts[..reachable]);
-        let mut cursor = counts;
         let mut rev_sources = vec![0u32; rev_starts[reachable] as usize];
-        for &n_u32 in &vertex {
+        for (v_pre, &n_u32) in vertex.iter().enumerate() {
             let n = n_u32 as usize;
             let start = edge_starts[n] as usize;
             let end = edge_starts[n + 1] as usize;
             for edge_index in start..end {
-                let base = edge_index * edge_field_count;
-                if let Some(wtype) = weak_edge_type {
-                    if edges[base + type_offset] == wtype {
-                        continue;
-                    }
+                if edge_types[edge_index] == weak_edge_type {
+                    continue;
                 }
-                let to_node = edges[base + to_node_offset] as usize;
-                if to_node < node_count && preorder[to_node] != u32::MAX {
-                    let w = preorder[to_node] as usize;
-                    rev_sources[cursor[w] as usize] = preorder[n];
-                    cursor[w] += 1;
+                let to_node = edge_to_nodes[edge_index] as usize;
+                if to_node < node_count {
+                    let w = preorder[to_node];
+                    if w != u32::MAX {
+                        let pos = rev_starts[w as usize] as usize;
+                        rev_sources[pos] = v_pre as u32;
+                        rev_starts[w as usize] = (pos + 1) as u32;
+                    }
                 }
             }
         }
+        for i in (1..=reachable).rev() {
+            rev_starts[i] = rev_starts[i - 1];
+        }
+        rev_starts[0] = 0;
 
-        // Lengauer–Tarjan dominators (with path compression). All arrays are
-        // indexed by preorder number; 0 = root. Runs in O(E · α(V)) — the
-        // Cooper–Harvey–Kennedy refinement took ~74s on a 7.4M-node snapshot,
-        // this finishes in seconds.
-        // eval/compress with a caller-owned scratch buffer: compress is called
-        // once per predecessor (~24M times on a 7.4M-node snapshot), and a
-        // fresh Vec per call was measurable allocation churn.
+        // Lengauer–Tarjan dominators in preorder space.
+        // Memory optimizations:
+        // 1. `dfs_parent` doubles as `ancestor` in place: vertex `x` is linked
+        //    into the forest iff `x > threshold` (saving 66MB).
+        // 2. `idom_pre` doubles as `bucket_next`: each vertex `v` is linked
+        //    into bucket `semi[v]` once and its `idom_pre[v]` is written only
+        //    after `bucket_next[v]` is read on bucket drain (saving 66MB).
+        #[inline]
+        fn anc(x: u32, threshold: u32, dfs_parent: &[u32]) -> u32 {
+            if x > threshold {
+                dfs_parent[x as usize]
+            } else {
+                0
+            }
+        }
+
+        #[inline]
         fn eval(
             v: u32,
+            threshold: u32,
             semi: &[u32],
             label: &mut [u32],
-            ancestor: &mut [u32],
+            dfs_parent: &mut [u32],
             scratch: &mut Vec<u32>,
         ) -> u32 {
-            if ancestor[v as usize] == 0 {
+            let a = anc(v, threshold, dfs_parent);
+            if a == 0 {
                 return label[v as usize];
             }
-            compress(v, semi, label, ancestor, scratch);
+            if anc(a, threshold, dfs_parent) != 0 {
+                compress(v, threshold, semi, label, dfs_parent, scratch);
+            }
             label[v as usize]
         }
 
-        // Iterative compress (recursion could blow the stack on deep chains).
         fn compress(
             v: u32,
+            threshold: u32,
             semi: &[u32],
             label: &mut [u32],
-            ancestor: &mut [u32],
+            dfs_parent: &mut [u32],
             scratch: &mut Vec<u32>,
         ) {
-            if ancestor[ancestor[v as usize] as usize] == 0 {
-                return;
-            }
             scratch.clear();
             let mut x = v;
-            while ancestor[ancestor[x as usize] as usize] != 0 {
+            while anc(anc(x, threshold, dfs_parent), threshold, dfs_parent) != 0 {
                 scratch.push(x);
-                x = ancestor[x as usize];
+                x = dfs_parent[x as usize];
             }
             while let Some(y) = scratch.pop() {
-                let a = ancestor[y as usize];
+                let a = dfs_parent[y as usize];
                 if semi[label[a as usize] as usize] < semi[label[y as usize] as usize] {
                     label[y as usize] = label[a as usize];
                 }
-                ancestor[y as usize] = ancestor[a as usize];
+                dfs_parent[y as usize] = anc(a, threshold, dfs_parent);
             }
         }
 
-        // Lengauer–Tarjan works in preorder space, which only covers the nodes
-        // reachable from the root (`vertex`). Using `node_count` here would
-        // index `dfs_parent` (length == vertex.len()) out of bounds for any
-        // node unreachable from the root — and waste memory on the arrays.
         let n = vertex.len();
         let mut semi: Vec<u32> = (0..n as u32).collect();
         let mut label: Vec<u32> = (0..n as u32).collect();
-        let mut ancestor = vec![0u32; n];
         let mut idom_pre = vec![u32::MAX; n];
-        idom_pre[0] = 0;
+        if n > 0 {
+            idom_pre[0] = 0;
+        }
         let mut bucket_head = vec![u32::MAX; n];
-        let mut bucket_next = vec![u32::MAX; n];
         let mut scratch: Vec<u32> = Vec::with_capacity(16);
 
         for w in (1..n).rev() {
             let wu = w;
+            let threshold_before = w as u32;
             let preds = &rev_sources[rev_starts[wu] as usize..rev_starts[wu + 1] as usize];
             for &v in preds {
-                let u = eval(v, &semi, &mut label, &mut ancestor, &mut scratch);
+                let u = eval(v, threshold_before, &semi, &mut label, &mut dfs_parent, &mut scratch);
                 if semi[u as usize] < semi[wu] {
                     semi[wu] = semi[u as usize];
                 }
             }
             let sw = semi[wu] as usize;
-            bucket_next[wu] = bucket_head[sw];
+            idom_pre[wu] = bucket_head[sw];
             bucket_head[sw] = w as u32;
-            ancestor[wu] = dfs_parent[wu];
             let p = dfs_parent[wu] as usize;
+            let threshold_after = (w - 1) as u32;
             let mut v = bucket_head[p];
             while v != u32::MAX {
                 let vu = v as usize;
-                let u = eval(v, &semi, &mut label, &mut ancestor, &mut scratch);
+                let next_v = idom_pre[vu];
+                let u = eval(v, threshold_after, &semi, &mut label, &mut dfs_parent, &mut scratch);
                 idom_pre[vu] = if semi[u as usize] < semi[vu] {
                     u
                 } else {
                     p as u32
                 };
-                v = bucket_next[vu];
+                v = next_v;
             }
             bucket_head[p] = u32::MAX;
         }
         for w in 1..n {
-            let wu = w;
-            if idom_pre[wu] != semi[wu] {
-                idom_pre[wu] = idom_pre[idom_pre[wu] as usize];
+            if idom_pre[w] != semi[w] {
+                idom_pre[w] = idom_pre[idom_pre[w] as usize];
             }
         }
-        // Lengauer–Tarjan scratch is dead: free the ~600MB of semi/label/
-        // ancestor/bucket arrays (plus dfs_parent) before allocating the
-        // node-space retained/idoms, so those land in recycled memory instead
-        // of growing the process further.
         drop(dfs_parent);
         drop(semi);
         drop(label);
-        drop(ancestor);
         drop(bucket_head);
-        drop(bucket_next);
         drop(scratch);
 
-        // retained = self + dominated subtree, accumulated in NODE space (one
-        // array instead of a pre-space buffer + a remap copy). Children (higher
-        // preorder) are final before they are folded into their idom because
-        // the reverse-preorder walk visits them first.
+        // Build `idoms` first and drop `idom_pre` (66MB) BEFORE allocating
+        // `retained` (134MB) so peak memory stays minimal.
+        let mut idoms = vec![u32::MAX; node_count];
+        for (w, &node) in vertex.iter().enumerate() {
+            idoms[node as usize] = vertex[idom_pre[w] as usize];
+        }
+        drop(idom_pre);
+
         let mut retained = vec![0.0f64; node_count];
         for &node in &vertex {
             retained[node as usize] = raw.nodes.self_sizes[node as usize] as f64;
         }
         for w in (1..vertex.len()).rev() {
             let child = vertex[w] as usize;
-            let dom = vertex[idom_pre[w] as usize] as usize;
+            let dom = idoms[child] as usize;
             retained[dom] += retained[child];
-        }
-
-        let mut idoms = vec![u32::MAX; node_count];
-        for (w, &node) in vertex.iter().enumerate() {
-            idoms[node as usize] = vertex[idom_pre[w] as usize];
         }
 
         self.retained_data = Some(RetainedData {
@@ -1357,9 +1571,6 @@ impl HeapSnapshot {
     ) -> crate::Result<RetainedResult> {
         self.ensure_raw()?;
 
-        // Exact retained sizes need the full dominator computation (~1GB peak
-        // on a 7.4M-node snapshot). For very large snapshots the default keeps
-        // the fast approximate top-by-self-size view so it stays responsive.
         if top_n == 0 {
             return Ok(RetainedResult {
                 approximate: !exact && self.raw.as_ref().unwrap().meta.node_count > 5_000_000,
@@ -1446,46 +1657,40 @@ impl HeapSnapshot {
         })
     }
 
-    /// Aggregate *exclusive* retained sizes by node name and type: a node's
-    /// retained size is attributed to its name bucket only when its immediate
-    /// dominator carries a different name (the same convention Chrome
-    /// DevTools uses for the "Retained size by constructor" view). This makes
-    /// the summary answer "what actually holds this memory", not just "what
-    /// has big self size".
+    /// Aggregate *exclusive* retained sizes by node name and type.
     pub fn retained_summary(
         &mut self,
         top: usize,
         filter: Option<&str>,
     ) -> crate::Result<HeapSnapshotSummary> {
         self.ensure_retained()?;
-        // total sizes come from the cached full summary
-        let _ = self.stream_summary(usize::MAX, None)?;
-        let full = self.full_summary.as_ref().unwrap();
+        self.ensure_raw_summary()?;
+        let raw_summary = self.raw_summary.as_ref().unwrap();
+        let total_size = raw_summary.total_size;
+        let total_count = raw_summary.total_count;
         let raw = self.raw.as_ref().unwrap();
         let rd = self.retained_data.as_ref().unwrap();
         let node_count = raw.meta.node_count;
 
-        // node 0 is the synthetic root (name "", type "synthetic"); its
-        // retained is the whole heap plus exclusive double-counts, which
-        // is pure noise in a "by constructor" view. DevTools shows the
-        // "(GC roots)" bucket instead, which is real.
         let mut by_name: AHashMap<u32, (usize, usize)> = AHashMap::new();
         let mut by_type: AHashMap<u32, (usize, usize)> = AHashMap::new();
-        // capture only Sync fields — RawData contains a RefCell string memo
         let col = &raw.nodes;
         let retained = &rd.retained;
         let idoms = &rd.idoms;
-        let chunks_per_thread = (node_count / rayon::current_num_threads().max(1)).max(1);
-        let partials: Vec<(AHashMap<u32, (usize, usize)>, AHashMap<u32, (usize, usize)>)> = (1
-            ..node_count)
+        let num_threads = rayon::current_num_threads().max(1);
+        let num_chunks = (num_threads * 4).max(1);
+        let chunk_size = node_count.div_ceil(num_chunks).max(1);
+        let partials: Vec<(AHashMap<u32, (usize, usize)>, AHashMap<u32, (usize, usize)>)> = (0
+            ..num_chunks)
             .into_par_iter()
-            .chunks(chunks_per_thread)
-            .map(|chunk| {
+            .map(|c| {
+                let start = (c * chunk_size).max(1).min(node_count);
+                let end = ((c + 1) * chunk_size).min(node_count);
                 let mut local_name: AHashMap<u32, (usize, usize)> = AHashMap::new();
                 let mut local_type: AHashMap<u32, (usize, usize)> = AHashMap::new();
-                for n in chunk {
-                    let retained = retained[n] as usize;
-                    if retained == 0 {
+                for n in start..end {
+                    let ret = retained[n] as usize;
+                    if ret == 0 {
                         continue;
                     }
                     let name_idx = col.names[n];
@@ -1498,12 +1703,12 @@ impl HeapSnapshot {
                     };
                     if dom_name != name_idx {
                         let e = local_name.entry(name_idx).or_insert((0, 0));
-                        e.0 += retained;
+                        e.0 += ret;
                         e.1 += 1;
                     }
                     if dom_type != type_idx {
                         let e = local_type.entry(type_idx).or_insert((0, 0));
-                        e.0 += retained;
+                        e.0 += ret;
                         e.1 += 1;
                     }
                 }
@@ -1524,27 +1729,34 @@ impl HeapSnapshot {
         }
 
         let filter_re = filter.and_then(|f| regex::Regex::new(f).ok());
-        let mut names: Vec<(String, TypeSummary)> = by_name
+        // Sort by `size` descending BEFORE resolving strings so we only decode
+        // the top `top` constructor names instead of all 100k+ inline strings!
+        let mut raw_names: Vec<(u32, usize, usize)> = by_name
             .into_iter()
-            .filter_map(|(idx, (size, count))| {
-                if size == 0 {
-                    return None;
-                }
-                let name = raw
-                    .strings
-                    .resolve(&raw.mmap, idx as usize)
-                    .unwrap_or_else(|| format!("<string#{}>", idx));
-                if let Some(re) = &filter_re {
-                    if !re.is_match(&name) {
-                        return None;
-                    }
-                }
-                Some((name, TypeSummary { size, count }))
-            })
+            .filter(|&(_, (sz, _))| sz > 0)
+            .map(|(idx, (sz, cnt))| (idx, sz, cnt))
             .collect();
-        names.sort_by(|a, b| b.1.size.cmp(&a.1.size));
-        if top != usize::MAX {
-            names.truncate(top);
+        raw_names.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let mut by_node_name: HashMap<String, TypeSummary> = HashMap::new();
+        for (idx, size, count) in raw_names {
+            if top != usize::MAX && by_node_name.len() >= top {
+                break;
+            }
+            let name = raw
+                .strings
+                .resolve(&raw.mmap, idx as usize)
+                .unwrap_or_else(|| format!("<string#{}>", idx));
+            if let Some(re) = &filter_re {
+                if !re.is_match(&name) {
+                    continue;
+                }
+            }
+            let entry = by_node_name
+                .entry(name)
+                .or_insert(TypeSummary { size: 0, count: 0 });
+            entry.size += size;
+            entry.count += count;
         }
 
         let mut types: Vec<(String, TypeSummary)> = by_type
@@ -1572,9 +1784,9 @@ impl HeapSnapshot {
         }
 
         Ok(HeapSnapshotSummary {
-            total_size: full.total_size,
-            total_count: full.total_count,
-            by_node_name: names.into_iter().collect(),
+            total_size,
+            total_count,
+            by_node_name,
             by_node_type: types.into_iter().collect(),
         })
     }
@@ -1585,61 +1797,47 @@ impl HeapSnapshot {
         self.ensure_retained()?;
         let raw = self.raw.as_ref().unwrap();
         let rd = self.retained_data.as_ref().unwrap();
-
-        // Pre-resolve every distinct node name once, in parallel. The string
-        // memo is a RefCell (not Sync), so parallel chunks decode through the
-        // raw byte spans instead. Serial decode+lowercase through the memo was
-        // the dominant cost of find/search on multi-GB snapshots (measurably
-        // slower than a full `analyze`); matching now folds case on the fly
-        // (`contains_ci`) without allocating a lowercased copy per name — the
-        // snapshots contain multi-megabyte inline strings that make that
-        // allocation dominant.
         let col = &raw.nodes;
-        let mut distinct: Vec<u32> = {
-            let mut set: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            set.reserve(raw.meta.node_count / 16);
-            for n in 0..raw.meta.node_count {
-                set.insert(col.names[n]);
-            }
-            set.into_iter().collect()
-        };
-        let name_cache: HashMap<u32, String> = {
-            // capture only Sync pieces (StringTable itself holds a RefCell)
-            let spans: &[(u32, u32)] = &raw.strings.spans;
-            let sbase = raw.strings.start;
-            let mmap_bytes: &[u8] = &raw.mmap[..];
-            let pairs: Vec<(u32, String)> = distinct
-                .par_drain(..)
-                .map(|idx| {
-                    let decoded = spans
-                        .get(idx as usize)
-                        .map(|&(s, e)| {
-                            decode_json_string(&mmap_bytes[sbase + s as usize..sbase + e as usize])
-                        })
-                        .unwrap_or_default();
-                    (idx, decoded)
-                })
-                .collect();
-            pairs.into_iter().collect()
-        };
+
+        let (sbase, spans_guard) = raw.strings.all_spans(&raw.mmap);
+        let spans: &[(u32, u32)] = &spans_guard;
+        let mmap_bytes: &[u8] = &raw.mmap[..];
+        let num_strings = spans.len();
+
+        let matching_strings: Vec<bool> = (0..num_strings)
+            .into_par_iter()
+            .map(|idx| {
+                let (s, e) = spans[idx];
+                raw_string_matches(&mmap_bytes[sbase + s as usize..sbase + e as usize], query, false)
+            })
+            .collect();
+        drop(spans_guard);
+
+        if !matching_strings.iter().any(|&m| m) {
+            return Ok(Vec::new());
+        }
 
         let retained = &rd.retained;
-        let chunks_per_thread = (raw.meta.node_count / rayon::current_num_threads().max(1)).max(1);
-        let parts: Vec<Vec<(usize, usize)>> = (0..raw.meta.node_count)
+        let total_nodes = raw.meta.node_count;
+        let num_threads = rayon::current_num_threads().max(1);
+        let num_chunks = (num_threads * 4).max(1);
+        let chunk_size = total_nodes.div_ceil(num_chunks).max(1);
+        let parts: Vec<Vec<(usize, usize)>> = (0..num_chunks)
             .into_par_iter()
-            .chunks(chunks_per_thread)
-            .map(|chunk| {
+            .map(|c| {
+                let start = (c * chunk_size).min(total_nodes);
+                let end = ((c + 1) * chunk_size).min(total_nodes);
                 let mut found: Vec<(usize, usize)> = Vec::new();
-                for n in chunk {
-                    let name_idx = col.names[n];
-                    if !contains_ci(&name_cache[&name_idx], query) {
+                for n in start..end {
+                    let name_idx = col.names[n] as usize;
+                    if name_idx >= num_strings || !matching_strings[name_idx] {
                         continue;
                     }
-                    let retained = retained[n] as usize;
-                    if retained == 0 {
+                    let ret = retained[n] as usize;
+                    if ret == 0 {
                         continue;
                     }
-                    found.push((n, retained));
+                    found.push((n, ret));
                 }
                 found
             })
@@ -1691,40 +1889,46 @@ impl HeapSnapshot {
     }
 
     /// The edge from `from` to `to` (bounded scan of `from`'s forward edges),
-    /// as (edge_type, property name / "[i]").
+    /// as `(edge_type, property name / "[i]" / "i")`.
     fn path_edge(
         &self,
         raw: &RawData,
         edge_starts: &[u32],
         from: usize,
         to: usize,
+        bracket_element: bool,
     ) -> Option<(String, String)> {
         let start = edge_starts[from] as usize;
         let end = edge_starts[from + 1] as usize;
-        for edge_index in start..end {
-            let base = edge_index * raw.edge_field_count;
-            let to_node = raw.edges.as_ref().unwrap()[base + raw.edge_offsets.to_node] as usize;
-            if to_node != to {
-                continue;
+        let weak_edge_type = raw
+            .edge_types
+            .iter()
+            .position(|t| t == "weak");
+        let mut result: Option<(String, String)> = None;
+        raw.for_each_edge_in_range(start, end, |_edge_index, type_idx, name_or_index, to_node| {
+            if result.is_some() || to_node != to || Some(type_idx) == weak_edge_type {
+                return;
             }
-            let type_idx = raw.edges.as_ref().unwrap()[base + raw.edge_offsets.type_] as usize;
             let type_ = raw
                 .edge_types
                 .get(type_idx)
                 .cloned()
                 .unwrap_or_else(|| type_idx.to_string());
-            let name_or_index =
-                raw.edges.as_ref().unwrap()[base + raw.edge_offsets.name_or_index] as usize;
+            let name_or_index = name_or_index as usize;
             let name = if type_ == "element" {
-                name_or_index.to_string()
+                if bracket_element {
+                    format!("[{name_or_index}]")
+                } else {
+                    name_or_index.to_string()
+                }
             } else {
                 raw.strings
                     .resolve(&raw.mmap, name_or_index)
                     .unwrap_or_else(|| format!("#{}", name_or_index))
             };
-            return Some((type_, name));
-        }
-        None
+            result = Some((type_, name));
+        });
+        result
     }
 
     /// Shortest path from the GC root to `node_index`, following incoming
@@ -1744,7 +1948,6 @@ impl HeapSnapshot {
         }
         let target_pre = rd.preorder[node_index];
         if target_pre == u32::MAX {
-            // unreachable from root — no path exists
             return Ok(ShortestPath {
                 found: false,
                 nodes: Vec::new(),
@@ -1752,7 +1955,6 @@ impl HeapSnapshot {
             });
         }
 
-        // BFS from the target over incoming edges (pre space) until root.
         let n = rd.vertex.len();
         let mut parent: Vec<u32> = vec![u32::MAX; n];
         let mut depth = vec![0u32; n];
@@ -1789,8 +1991,6 @@ impl HeapSnapshot {
             });
         }
 
-        // reconstruct: root -> ... -> target via parent pointers (pre space),
-        // mapped to node indices
         let mut pres: Vec<usize> = vec![0usize];
         let mut cur = 0usize;
         while cur != target_pre as usize {
@@ -1818,7 +2018,7 @@ impl HeapSnapshot {
             let from = rd.vertex[w[0]] as usize;
             let to = rd.vertex[w[1]] as usize;
             edges.push(
-                self.path_edge(raw, edge_starts, from, to)
+                self.path_edge(raw, edge_starts, from, to, false)
                     .map(|(type_, name)| PathEdge { type_, name })
                     .unwrap_or_else(|| PathEdge {
                         type_: String::new(),
@@ -1835,8 +2035,8 @@ impl HeapSnapshot {
     }
 
     /// Build (or reuse) the first-incoming-edge map. One pass over the
-    /// forward edges; the first edge into a node wins (matches the classic
-    /// (object elements) owner walk). O(E), no dominator analysis.
+    /// forward edges; the first edge into a node wins. O(E), no dominator
+    /// analysis, and stores only `index: Vec<u32>` (67MB instead of 201MB).
     fn ensure_parent_map(&mut self) -> crate::Result<()> {
         if self.parents.is_some() {
             return Ok(());
@@ -1848,45 +2048,36 @@ impl HeapSnapshot {
         let edge_starts = self.edge_starts.as_ref().unwrap();
         let node_count = raw.meta.node_count;
         let edges = raw.edges.as_ref().unwrap();
+        let edge_types = edges.types.as_slice();
+        let edge_to_nodes = edges.to_nodes.as_slice();
 
         let weak_edge_type = raw
             .edge_types
             .iter()
             .position(|t| t == "weak")
-            .map(|idx| idx as u32);
+            .map(|idx| idx as u8)
+            .unwrap_or(u8::MAX);
 
         let mut index = vec![u32::MAX; node_count];
-        let mut edge_type = vec![u32::MAX; node_count];
-        let mut edge_name_or_index = vec![u32::MAX; node_count];
         for n in 0..node_count {
             let start = edge_starts[n] as usize;
             let end = edge_starts[n + 1] as usize;
             for edge_index in start..end {
-                let base = edge_index * raw.edge_field_count;
-                let etype = edges[base + raw.edge_offsets.type_];
-                if Some(etype) == weak_edge_type {
+                if edge_types[edge_index] == weak_edge_type {
                     continue;
                 }
-                let to_node = edges[base + raw.edge_offsets.to_node] as usize;
+                let to_node = edge_to_nodes[edge_index] as usize;
                 if to_node < node_count && index[to_node] == u32::MAX {
                     index[to_node] = n as u32;
-                    edge_type[to_node] = etype;
-                    edge_name_or_index[to_node] = edges[base + raw.edge_offsets.name_or_index];
                 }
             }
         }
-        self.parents = Some(ParentMap {
-            index,
-            edge_type,
-            edge_name_or_index,
-        });
+        self.parents = Some(ParentMap { index });
         Ok(())
     }
 
     /// Find nodes by name (exact or substring) with optional self-size and
-    /// node-type filters. Unlike `search_nodes` this does NOT require the
-    /// dominator analysis — it is a plain parallel scan, returns every match
-    /// (including nodes with `retained == 0`), and ranks by self size.
+    /// node-type filters.
     pub fn find_nodes(&mut self, query: &NameQuery) -> crate::Result<Vec<NameMatch>> {
         self.ensure_raw()?;
         let raw = self.raw.as_ref().unwrap();
@@ -1902,10 +2093,8 @@ impl HeapSnapshot {
         let type_filter = query.type_filter.as_deref();
         let node_types = raw.node_types.as_slice();
 
-        // Step 1: Pre-match query across string table spans in parallel.
-        // String table is orders of magnitude smaller than nodes (10k-100k vs 20M+).
-        let spans: &[(u32, u32)] = &raw.strings.spans;
-        let sbase = raw.strings.start;
+        let (sbase, spans_guard) = raw.strings.all_spans(&raw.mmap);
+        let spans: &[(u32, u32)] = &spans_guard;
         let mmap_bytes: &[u8] = &raw.mmap[..];
         let num_strings = spans.len();
 
@@ -1913,27 +2102,26 @@ impl HeapSnapshot {
             .into_par_iter()
             .map(|idx| {
                 let (s, e) = spans[idx];
-                let decoded = decode_json_string(&mmap_bytes[sbase + s as usize..sbase + e as usize]);
-                if exact {
-                    eq_ci_name(&decoded, query_name)
-                } else {
-                    contains_ci(&decoded, query_name)
-                }
+                raw_string_matches(&mmap_bytes[sbase + s as usize..sbase + e as usize], query_name, exact)
             })
             .collect();
+        drop(spans_guard);
 
-        // If no strings matched the query, no node can match!
         if !matching_strings.iter().any(|&m| m) {
             return Ok(Vec::new());
         }
 
-        let chunks_per_thread = (raw.meta.node_count / rayon::current_num_threads().max(1)).max(1);
-        let parts: Vec<Vec<(usize, usize)>> = (0..raw.meta.node_count)
+        let total_nodes = raw.meta.node_count;
+        let num_threads = rayon::current_num_threads().max(1);
+        let num_chunks = (num_threads * 4).max(1);
+        let chunk_size = total_nodes.div_ceil(num_chunks).max(1);
+        let parts: Vec<Vec<(usize, usize)>> = (0..num_chunks)
             .into_par_iter()
-            .chunks(chunks_per_thread)
-            .map(|chunk| {
+            .map(|c| {
+                let start = (c * chunk_size).min(total_nodes);
+                let end = ((c + 1) * chunk_size).min(total_nodes);
                 let mut found: Vec<(usize, usize)> = Vec::new();
-                for n in chunk {
+                for n in start..end {
                     let name_idx = col.names[n] as usize;
                     if name_idx >= num_strings || !matching_strings[name_idx] {
                         continue;
@@ -1983,16 +2171,15 @@ impl HeapSnapshot {
             .collect())
     }
 
-    /// Resolve a node's edges into displayable properties: primitive values
-    /// (numbers, strings) are inlined, object values become a reference to
-    /// the target node. This is what lets you read e.g. `renderingGroupId`
-    /// of a GPUParticleSystem without walking value nodes by hand.
+    /// Resolve a node's edges into displayable properties. When `raw.edges` is
+    /// not yet loaded, reads the single node's edges directly from the mmap
+    /// without allocating the 202MB edge table.
     pub fn get_node_properties(
         &mut self,
         node_index: usize,
     ) -> crate::Result<(HeapSnapshotNode, Vec<NodeProperty>)> {
         self.ensure_raw()?;
-        self.ensure_edges()?;
+        let _ = self.locate_edges_range()?;
         self.ensure_edge_starts();
         let raw = self.raw.as_ref().unwrap();
         if node_index >= raw.meta.node_count {
@@ -2003,20 +2190,16 @@ impl HeapSnapshot {
         let edge_starts = self.edge_starts.as_ref().unwrap();
         let start = edge_starts[node_index] as usize;
         let end = edge_starts[node_index + 1] as usize;
-        let edges = raw.edges.as_ref().unwrap();
         let col = &raw.nodes;
 
         let mut props = Vec::with_capacity(end - start);
-        for edge_index in start..end {
-            let base = edge_index * raw.edge_field_count;
-            let type_idx = edges[base + raw.edge_offsets.type_] as usize;
+        raw.for_each_edge_in_range(start, end, |_edge_index, type_idx, name_or_index, to_node| {
+            let name_or_index = name_or_index as usize;
             let edge_type = raw
                 .edge_types
                 .get(type_idx)
                 .cloned()
                 .unwrap_or_else(|| type_idx.to_string());
-            let name_or_index = edges[base + raw.edge_offsets.name_or_index] as usize;
-            let to_node = edges[base + raw.edge_offsets.to_node] as usize;
             let name = if edge_type == "element" {
                 format!("[{name_or_index}]")
             } else {
@@ -2064,97 +2247,262 @@ impl HeapSnapshot {
                 edge_type,
                 value,
             });
-        }
+        });
         Ok((node, props))
     }
 
-    /// Find incoming object properties/edges by their displayed name. This
-    /// scans the edge array without building dominators and returns the
-    /// retaining source plus the referenced target for each match.
+    /// Find incoming object properties/edges by their displayed name.
+    /// Pre-matches strings and streams edge chunks in parallel without
+    /// allocating `String`s inside the 40.4M-edge loop or materializing
+    /// `EdgeColumns`.
     pub fn find_edges(&mut self, query: &EdgeQuery) -> crate::Result<Vec<EdgeMatch>> {
         self.ensure_raw()?;
-        self.ensure_edges()?;
+        if query.name.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (eb_start, eb_end) = self.locate_edges_range()?;
         self.ensure_edge_starts();
         let raw = self.raw.as_ref().unwrap();
         let edge_starts = self.edge_starts.as_ref().unwrap();
-        let edges = raw.edges.as_ref().unwrap();
-        let mut matches = Vec::new();
 
-        if query.name.is_empty() {
-            return Ok(matches);
+        let (sbase, spans_guard) = raw.strings.all_spans(&raw.mmap);
+        let spans: &[(u32, u32)] = &spans_guard;
+        let mmap_bytes: &[u8] = &raw.mmap[..];
+        let num_strings = spans.len();
+        let exact = query.exact;
+        let query_name = query.name.as_str();
+
+        let matching_strings: Vec<bool> = (0..num_strings)
+            .into_par_iter()
+            .map(|idx| {
+                let (s, e) = spans[idx];
+                raw_string_matches(&mmap_bytes[sbase + s as usize..sbase + e as usize], query_name, exact)
+            })
+            .collect();
+        drop(spans_guard);
+
+        let allowed_source_types: Vec<bool> = (0..raw.node_types.len().max(16))
+            .map(|idx| match query.type_filter.as_deref() {
+                None => true,
+                Some(filter) => {
+                    let st = raw
+                        .node_types
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or_else(|| idx.to_string());
+                    eq_ci(&st, filter)
+                }
+            })
+            .collect();
+
+        let allowed_edge_types: Vec<bool> = (0..raw.edge_types.len().max(16))
+            .map(|idx| match query.edge_type.as_deref() {
+                None => true,
+                Some(filter) => {
+                    let et = raw
+                        .edge_types
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or_else(|| idx.to_string());
+                    eq_ci(&et, filter)
+                }
+            })
+            .collect();
+
+        let element_type_idx = raw.edge_types.iter().position(|t| t == "element");
+        let element_can_match = query
+            .name
+            .bytes()
+            .all(|b| b == b'[' || b == b']' || b.is_ascii_digit());
+        let any_string_matches = matching_strings.iter().any(|&m| m);
+        if !any_string_matches && !element_can_match {
+            return Ok(Vec::new());
         }
 
-        'nodes: for source_index in 0..raw.meta.node_count {
+        let edges_bytes = &raw.mmap[eb_start..=eb_end];
+        let efc = raw.edge_field_count;
+        let nfc = raw.node_field_count.max(1) as u32;
+        let type_off = raw.edge_offsets.type_;
+        let name_off = raw.edge_offsets.name_or_index;
+        let to_off = raw.edge_offsets.to_node;
+        let limit = if query.limit == 0 { usize::MAX } else { query.limit };
+        let node_types_col = raw.nodes.types.as_slice();
+
+        let chunks = aligned_record_chunks_par(edges_bytes, efc);
+        let raw_matches: Vec<(usize, usize, u32, usize)> = if let Some(chunks) = chunks {
+            let parts: Vec<Vec<(usize, usize, u32, usize)>> = chunks
+                .par_iter()
+                .map(|&(byte_s, byte_e, edge_s, _edge_e)| {
+                    let mut local = Vec::new();
+                    let mut source_idx = edge_starts
+                        .partition_point(|&s| (s as usize) <= edge_s)
+                        .saturating_sub(1);
+                    let mut edge_idx = edge_s;
+                    let slice = &edges_bytes[byte_s..byte_e];
+                    let mut i = 0usize;
+                    let len = slice.len();
+                    let mut rec = [0u32; 8];
+                    let mut f = 0usize;
+                    while i < len {
+                        let ch = slice[i];
+                        if ch == b']' {
+                            break;
+                        }
+                        if ch.is_ascii_digit() {
+                            let mut val = (ch - b'0') as u32;
+                            i += 1;
+                            while i < len && slice[i].is_ascii_digit() {
+                                val = val * 10 + (slice[i] - b'0') as u32;
+                                i += 1;
+                            }
+                            rec[f] = val;
+                            f += 1;
+                            if f == efc {
+                                f = 0;
+                                while source_idx + 1 < edge_starts.len()
+                                    && edge_idx >= edge_starts[source_idx + 1] as usize
+                                {
+                                    source_idx += 1;
+                                }
+                                let etype = rec[type_off] as usize;
+                                let stype = node_types_col
+                                    .get(source_idx)
+                                    .copied()
+                                    .unwrap_or(0) as usize;
+                                if allowed_edge_types.get(etype).copied().unwrap_or(false)
+                                    && allowed_source_types.get(stype).copied().unwrap_or(false)
+                                {
+                                    let name_or_idx = rec[name_off];
+                                    let is_elem = Some(etype) == element_type_idx;
+                                    let matched = if !is_elem {
+                                        (name_or_idx as usize) < num_strings
+                                            && matching_strings[name_or_idx as usize]
+                                    } else if element_can_match {
+                                        let formatted = format!("[{name_or_idx}]");
+                                        if exact {
+                                            eq_ci_name(&formatted, query_name)
+                                        } else {
+                                            contains_ci(&formatted, query_name)
+                                        }
+                                    } else {
+                                        false
+                                    };
+                                    if matched {
+                                        let to_node = (rec[to_off] / nfc) as usize;
+                                        local.push((source_idx, etype, name_or_idx, to_node));
+                                        if local.len() >= limit {
+                                            break;
+                                        }
+                                    }
+                                }
+                                edge_idx += 1;
+                            }
+                            continue;
+                        }
+                        i += 1;
+                    }
+                    local
+                })
+                .collect();
+            let mut out = Vec::new();
+            for p in parts {
+                for item in p {
+                    out.push(item);
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+                if out.len() >= limit {
+                    break;
+                }
+            }
+            out
+        } else {
+            let mut out = Vec::new();
+            let flat = parse_numbers_par(edges_bytes);
+            let mut source_idx = 0usize;
+            for (edge_idx, rec) in flat.chunks(efc).enumerate() {
+                if rec.len() < efc {
+                    break;
+                }
+                while source_idx + 1 < edge_starts.len()
+                    && edge_idx >= edge_starts[source_idx + 1] as usize
+                {
+                    source_idx += 1;
+                }
+                let etype = rec[type_off] as usize;
+                let stype = node_types_col.get(source_idx).copied().unwrap_or(0) as usize;
+                if allowed_edge_types.get(etype).copied().unwrap_or(false)
+                    && allowed_source_types.get(stype).copied().unwrap_or(false)
+                {
+                    let name_or_idx = rec[name_off];
+                    let is_elem = Some(etype) == element_type_idx;
+                    let matched = if !is_elem {
+                        (name_or_idx as usize) < num_strings && matching_strings[name_or_idx as usize]
+                    } else if element_can_match {
+                        let formatted = format!("[{name_or_idx}]");
+                        if exact {
+                            eq_ci_name(&formatted, query_name)
+                        } else {
+                            contains_ci(&formatted, query_name)
+                        }
+                    } else {
+                        false
+                    };
+                    if matched {
+                        out.push((source_idx, etype, name_or_idx, (rec[to_off] / nfc) as usize));
+                        if out.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+            }
+            out
+        };
+
+        let mut matches = Vec::with_capacity(raw_matches.len());
+        for (source_index, edge_type_index, name_or_index, target_index) in raw_matches {
             let source_type_index = raw.nodes.types[source_index] as usize;
             let source_type = raw
                 .node_types
                 .get(source_type_index)
                 .cloned()
                 .unwrap_or_else(|| source_type_index.to_string());
-            if let Some(filter) = query.type_filter.as_deref() {
-                if !eq_ci(&source_type, filter) {
-                    continue;
-                }
-            }
-            let start = edge_starts[source_index] as usize;
-            let end = edge_starts[source_index + 1] as usize;
-            for edge_index in start..end {
-                let base = edge_index * raw.edge_field_count;
-                let edge_type_index = edges[base + raw.edge_offsets.type_] as usize;
-                let edge_type = raw
-                    .edge_types
-                    .get(edge_type_index)
-                    .cloned()
-                    .unwrap_or_else(|| edge_type_index.to_string());
-                if let Some(filter) = query.edge_type.as_deref() {
-                    if !eq_ci(&edge_type, filter) {
-                        continue;
-                    }
-                }
-                let name_or_index = edges[base + raw.edge_offsets.name_or_index] as usize;
-                let name = if edge_type == "element" {
-                    format!("[{name_or_index}]")
-                } else {
-                    raw.strings
-                        .resolve(&raw.mmap, name_or_index)
-                        .unwrap_or_else(|| format!("#{name_or_index}"))
-                };
-                let name_matches = if query.exact {
-                    eq_ci_name(&name, &query.name)
-                } else {
-                    contains_ci(&name, &query.name)
-                };
-                if !name_matches {
-                    continue;
-                }
-
-                let target_index = edges[base + raw.edge_offsets.to_node] as usize;
-                let (target_id, target_name, target_type) = if target_index < raw.meta.node_count {
-                    let target = Self::create_node(raw, target_index);
-                    (target.id, target.name, target.type_)
-                } else {
-                    (0, format!("<out of range #{target_index}>"), String::new())
-                };
-                let source_name = raw
-                    .strings
-                    .resolve(&raw.mmap, raw.nodes.names[source_index] as usize)
-                    .unwrap_or_default();
-                matches.push(EdgeMatch {
-                    source_index,
-                    source_id: raw.nodes.ids[source_index] as usize,
-                    source_name,
-                    source_type: source_type.clone(),
-                    edge_type,
-                    name,
-                    target_index,
-                    target_id,
-                    target_name,
-                    target_type,
-                });
-                if query.limit > 0 && matches.len() >= query.limit {
-                    break 'nodes;
-                }
-            }
+            let edge_type = raw
+                .edge_types
+                .get(edge_type_index)
+                .cloned()
+                .unwrap_or_else(|| edge_type_index.to_string());
+            let name_or_index = name_or_index as usize;
+            let name = if edge_type == "element" {
+                format!("[{name_or_index}]")
+            } else {
+                raw.strings
+                    .resolve(&raw.mmap, name_or_index)
+                    .unwrap_or_else(|| format!("#{name_or_index}"))
+            };
+            let (target_id, target_name, target_type) = if target_index < raw.meta.node_count {
+                let target = Self::create_node(raw, target_index);
+                (target.id, target.name, target.type_)
+            } else {
+                (0, format!("<out of range #{target_index}>"), String::new())
+            };
+            let source_name = raw
+                .strings
+                .resolve(&raw.mmap, raw.nodes.names[source_index] as usize)
+                .unwrap_or_default();
+            matches.push(EdgeMatch {
+                source_index,
+                source_id: raw.nodes.ids[source_index] as usize,
+                source_name,
+                source_type,
+                edge_type,
+                name,
+                target_index,
+                target_id,
+                target_name,
+                target_type,
+            });
         }
         Ok(matches)
     }
@@ -2172,34 +2520,35 @@ impl HeapSnapshot {
 
         let edge_starts = self.edge_starts.as_ref().unwrap();
         let edges = raw.edges.as_ref().unwrap();
+        let to_nodes = edges.to_nodes.as_slice();
+        let target_u32 = node_index as u32;
         let mut out = Vec::new();
         for n in 0..raw.meta.node_count {
             let start = edge_starts[n] as usize;
             let end = edge_starts[n + 1] as usize;
             for edge_index in start..end {
-                let base = edge_index * raw.edge_field_count;
-                let to_node = edges[base + raw.edge_offsets.to_node] as usize;
-                if to_node != node_index {
+                if to_nodes[edge_index] != target_u32 {
                     continue;
                 }
-                let type_idx = edges[base + raw.edge_offsets.type_] as usize;
-                let edge_type = raw
-                    .edge_types
-                    .get(type_idx)
-                    .cloned()
-                    .unwrap_or_else(|| type_idx.to_string());
-                let name_or_index = edges[base + raw.edge_offsets.name_or_index] as usize;
-                let name = if edge_type == "element" {
-                    format!("[{name_or_index}]")
-                } else {
-                    raw.strings
-                        .resolve(&raw.mmap, name_or_index)
-                        .unwrap_or_else(|| format!("#{name_or_index}"))
-                };
-                out.push(RetainerRef {
-                    source: n,
-                    edge_type,
-                    name,
+                raw.for_each_edge_in_range(edge_index, edge_index + 1, |_, type_idx, name_or_index, _| {
+                    let name_or_index = name_or_index as usize;
+                    let edge_type = raw
+                        .edge_types
+                        .get(type_idx)
+                        .cloned()
+                        .unwrap_or_else(|| type_idx.to_string());
+                    let name = if edge_type == "element" {
+                        format!("[{name_or_index}]")
+                    } else {
+                        raw.strings
+                            .resolve(&raw.mmap, name_or_index)
+                            .unwrap_or_else(|| format!("#{name_or_index}"))
+                    };
+                    out.push(RetainerRef {
+                        source: n,
+                        edge_type,
+                        name,
+                    });
                 });
             }
         }
@@ -2208,9 +2557,7 @@ impl HeapSnapshot {
 
     /// Walk the first-parent chain from `node_index` up to `max_depth` hops,
     /// stopping on cycles (an already-seen node) or when a node has no
-    /// parent. The chain is ordered from the target upward: `[0]` is the
-    /// target itself, the last element is the top of the chain. `cycle` is
-    /// set on the final hop when the walk was cut short by a cycle.
+    /// parent.
     pub fn retainer_chain(
         &mut self,
         node_index: usize,
@@ -2227,6 +2574,7 @@ impl HeapSnapshot {
         }
 
         let pm = self.parents.as_ref().unwrap();
+        let edge_starts = self.edge_starts.as_ref().unwrap();
         let col = &raw.nodes;
         let mut chain: Vec<RetainerChainNode> = Vec::with_capacity(max_depth.min(64) + 1);
         let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -2234,7 +2582,6 @@ impl HeapSnapshot {
         let mut hops = 0usize;
         loop {
             if !seen.insert(cur) {
-                // cycle: the parent chain loops back to an already-seen node
                 if let Some(last) = chain.last_mut() {
                     last.cycle = true;
                 }
@@ -2243,22 +2590,11 @@ impl HeapSnapshot {
             let type_idx = col.types[cur] as usize;
             let name_idx = col.names[cur] as usize;
             let parent = pm.index[cur];
-            let edge_type = if parent == u32::MAX {
-                String::new()
+            let (edge_type, edge_name) = if parent == u32::MAX {
+                (String::new(), String::new())
             } else {
-                raw.edge_types
-                    .get(pm.edge_type[cur] as usize)
-                    .cloned()
-                    .unwrap_or_else(|| pm.edge_type[cur].to_string())
-            };
-            let edge_name = if parent == u32::MAX {
-                String::new()
-            } else if edge_type == "element" {
-                format!("[{}]", pm.edge_name_or_index[cur])
-            } else {
-                raw.strings
-                    .resolve(&raw.mmap, pm.edge_name_or_index[cur] as usize)
-                    .unwrap_or_else(|| format!("#{}", pm.edge_name_or_index[cur]))
+                self.path_edge(raw, edge_starts, parent as usize, cur, true)
+                    .unwrap_or_default()
             };
             chain.push(RetainerChainNode {
                 node_index: cur,
@@ -2287,10 +2623,7 @@ impl HeapSnapshot {
         Ok(chain)
     }
 
-    /// Classify nodes matched by `query` into owner groups: each match is
-    /// walked up its first-parent chain (`depth` hops) and the resulting
-    /// "owner -> parent -> ..." chain string is the group key. Groups carry
-    /// count and summed self size, sorted by self size descending.
+    /// Classify nodes matched by `query` into owner groups.
     pub fn owner_groups(
         &mut self,
         query: &NameQuery,
@@ -2303,12 +2636,9 @@ impl HeapSnapshot {
         for m in &matches {
             total_self += m.self_size;
             let chain = self.retainer_chain(m.node_index, depth)?;
-            // chain[0] is the match itself; the owner chain starts at [1].
             let mut parts: Vec<String> = Vec::new();
             for (i, hop) in chain.iter().enumerate().skip(1) {
                 if i == 1 {
-                    // immediate owner: name, with a type fallback like the
-                    // classic scripts use for unnamed nodes
                     if hop.name.is_empty() {
                         parts.push(format!("({})", hop.type_));
                     } else {
@@ -2359,8 +2689,7 @@ impl HeapSnapshot {
         self.raw.as_ref().map(|r| r.edge_field_count)
     }
 
-    /// Build a flamegraph for a heap snapshot. We aggregate by node name
-    /// (constructor name) at the root, and break down by type beneath.
+    /// Build a flamegraph for a heap snapshot.
     pub fn to_flamegraph(
         &mut self,
         top: Option<usize>,
@@ -2370,23 +2699,15 @@ impl HeapSnapshot {
         let total_size = summary.total_size;
         let _total_count = summary.total_count;
 
-        // Root: "Heap".
         let mut children: Vec<FlamegraphFrame> = Vec::new();
-
-        // Group by type, then by name.
         let mut by_type: HashMap<String, Vec<(String, usize, usize)>> = HashMap::new();
         for (name, info) in &summary.by_node_name {
-            // Find type for this name from by_node_type — we don't have a direct mapping,
-            // so we'll just store under "(unknown)" if missing.
-            // The TypeSummary in summary.by_node_name doesn't carry type, so just
-            // attribute everything under "all".
             by_type.entry("all".to_string()).or_default().push((
                 name.clone(),
                 info.size,
                 info.count,
             ));
         }
-        // Also push type totals as top-level entries when name info isn't available.
         for (type_name, info) in &summary.by_node_type {
             by_type.entry(type_name.clone()).or_default().push((
                 format!("<{}>", type_name),
@@ -2441,9 +2762,6 @@ impl HeapSnapshot {
             children: Vec::new(),
         };
 
-        // Group node names under their type. We don't have a direct name->type map
-        // (the summary structure doesn't carry it), so we use by_node_type as the
-        // top-level grouping and put a synthetic "all" bucket for names.
         let mut type_nodes: Vec<TreemapNode> = Vec::new();
         for (type_name, info) in &summary.by_node_type {
             let type_node = TreemapNode {
@@ -2451,7 +2769,6 @@ impl HeapSnapshot {
                 size: info.size,
                 children: Vec::new(),
             };
-            // Children: not directly mappable, so leave type-level only.
             type_nodes.push(type_node);
         }
         type_nodes.sort_by(|a, b| b.size.cmp(&a.size));
@@ -2496,10 +2813,7 @@ impl HeapSnapshot {
     }
 
     /// Compare object identities between this snapshot (the current/profile)
-    /// and `baseline`. V8 node ids are stable across snapshots, so the merge
-    /// reports genuinely new/deleted objects instead of only aggregate name
-    /// deltas. Only the top `limit` objects are materialized; the counts and
-    /// byte totals cover every node.
+    /// and `baseline`.
     pub fn object_diff(
         &mut self,
         baseline: &mut HeapSnapshot,
@@ -2512,8 +2826,7 @@ impl HeapSnapshot {
         Ok(diff_snapshot_objects(baseline_raw, profile_raw, limit))
     }
 
-    /// Return detached V8 nodes, ranked by self size. `depth` optionally adds
-    /// the first-parent owner chain for each selected node.
+    /// Return detached V8 nodes, ranked by self size.
     pub fn detached_summary(
         &mut self,
         limit: usize,
@@ -2592,13 +2905,12 @@ impl HeapSnapshot {
         })
     }
 
-    /// Build a power-of-two histogram of node self sizes. Bucket zero contains
-    /// zero-byte nodes; the remaining buckets are `[2^n, 2^(n+1)-1]`.
+    /// Build a power-of-two histogram of node self sizes.
     pub fn size_histogram(&mut self) -> crate::Result<SizeHistogram> {
         self.ensure_raw()?;
         let raw = self.raw.as_ref().unwrap();
-        let mut buckets: std::collections::BTreeMap<usize, (usize, usize)> =
-            std::collections::BTreeMap::new();
+        let mut counts = [0usize; 65];
+        let mut sizes = [0usize; 65];
         let mut total_size = 0usize;
         for &raw_size in &raw.nodes.self_sizes {
             let size = raw_size as usize;
@@ -2607,35 +2919,36 @@ impl HeapSnapshot {
             } else {
                 (usize::BITS - size.leading_zeros()) as usize
             };
-            let entry = buckets.entry(bucket).or_insert((0, 0));
-            entry.0 += 1;
-            entry.1 += size;
+            counts[bucket] += 1;
+            sizes[bucket] += size;
             total_size += size;
         }
         let bits = usize::BITS as usize;
-        let buckets = buckets
-            .into_iter()
-            .map(|(bucket, (count, total_size))| {
-                let min_size = if bucket == 0 {
-                    0
-                } else {
-                    1usize << (bucket - 1)
-                };
-                let max_size = if bucket == 0 {
-                    0
-                } else if bucket >= bits {
-                    usize::MAX
-                } else {
-                    (1usize << bucket) - 1
-                };
-                SizeBucket {
-                    min_size,
-                    max_size,
-                    count,
-                    total_size,
-                }
-            })
-            .collect();
+        let mut buckets = Vec::new();
+        for bucket in 0..65 {
+            let count = counts[bucket];
+            if count == 0 {
+                continue;
+            }
+            let min_size = if bucket == 0 {
+                0
+            } else {
+                1usize << (bucket - 1)
+            };
+            let max_size = if bucket == 0 {
+                0
+            } else if bucket >= bits {
+                usize::MAX
+            } else {
+                (1usize << bucket) - 1
+            };
+            buckets.push(SizeBucket {
+                min_size,
+                max_size,
+                count,
+                total_size: sizes[bucket],
+            });
+        }
         Ok(SizeHistogram {
             total_count: raw.nodes.self_sizes.len(),
             total_size,
@@ -2643,69 +2956,234 @@ impl HeapSnapshot {
         })
     }
 
-    /// Summarize strings by their actual contents and reference count. Node
-    /// names and non-element property names are counted; duplicate string
-    /// table entries with the same decoded content are merged.
+    /// Summarize strings by their actual contents and reference count.
+    /// Streams edge references in parallel directly from the mmap (no 485MB
+    /// edge vector allocation) and merges duplicates via a compact `u64`
+    /// `(hash40 << 24 | idx)` sort before decoding only the top `limit`
+    /// entries.
     pub fn string_stats(&mut self, limit: usize) -> crate::Result<StringStats> {
         self.ensure_raw()?;
-        self.ensure_edges()?;
+        let (eb_start, eb_end) = self.locate_edges_range()?;
         let raw = self.raw.as_ref().unwrap();
-        let mut references = vec![0usize; raw.strings.spans.len()];
+        let (sbase, spans_guard) = raw.strings.all_spans(&raw.mmap);
+        let spans: &[(u32, u32)] = &spans_guard;
+        let num_strings = spans.len();
+        if num_strings == 0 {
+            return Ok(StringStats {
+                total_strings: 0,
+                total_bytes: 0,
+                referenced_strings: 0,
+                referenced_bytes: 0,
+                entries: Vec::new(),
+            });
+        }
+
+        let mut references = vec![0u32; num_strings];
         for &name_index in &raw.nodes.names {
             if let Some(count) = references.get_mut(name_index as usize) {
-                *count += 1;
-            }
-        }
-        let edges = raw.edges.as_ref().unwrap();
-        for edge in edges.chunks(raw.edge_field_count) {
-            if edge.len() <= raw.edge_offsets.name_or_index {
-                continue;
-            }
-            let type_index = edge[raw.edge_offsets.type_] as usize;
-            let is_element = raw
-                .edge_types
-                .get(type_index)
-                .map(|kind| kind == "element")
-                .unwrap_or(false);
-            if is_element {
-                continue;
-            }
-            let name_index = edge[raw.edge_offsets.name_or_index] as usize;
-            if let Some(count) = references.get_mut(name_index) {
-                *count += 1;
+                *count = count.saturating_add(1);
             }
         }
 
+        let element_type_idx = raw
+            .edge_types
+            .iter()
+            .position(|kind| kind == "element")
+            .unwrap_or(usize::MAX);
+        let edges_bytes = &raw.mmap[eb_start..=eb_end];
+        let efc = raw.edge_field_count;
+        let type_off = raw.edge_offsets.type_;
+        let name_off = raw.edge_offsets.name_or_index;
+
+        if efc > name_off {
+            if let Some(chunks) = aligned_record_chunks_par(edges_bytes, efc) {
+                let atomic_refs: &[std::sync::atomic::AtomicU32] = unsafe {
+                    std::slice::from_raw_parts(
+                        references.as_ptr() as *const std::sync::atomic::AtomicU32,
+                        references.len(),
+                    )
+                };
+                chunks.par_iter().for_each(|&(byte_s, byte_e, _, _)| {
+                    let slice = &edges_bytes[byte_s..byte_e];
+                    let mut i = 0usize;
+                    let len = slice.len();
+                    let mut rec = [0u32; 8];
+                    let mut f = 0usize;
+                    while i < len {
+                        let ch = slice[i];
+                        if ch == b']' {
+                            break;
+                        }
+                        if ch.is_ascii_digit() {
+                            let mut val = (ch - b'0') as u32;
+                            i += 1;
+                            while i < len && slice[i].is_ascii_digit() {
+                                val = val * 10 + (slice[i] - b'0') as u32;
+                                i += 1;
+                            }
+                            rec[f] = val;
+                            f += 1;
+                            if f == efc {
+                                f = 0;
+                                if rec[type_off] as usize != element_type_idx {
+                                    let idx = rec[name_off] as usize;
+                                    if idx < num_strings {
+                                        atomic_refs[idx]
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        i += 1;
+                    }
+                });
+            } else {
+                let flat = parse_numbers_par(edges_bytes);
+                for edge in flat.chunks(efc) {
+                    if edge.len() <= name_off {
+                        continue;
+                    }
+                    if edge[type_off] as usize == element_type_idx {
+                        continue;
+                    }
+                    let name_index = edge[name_off] as usize;
+                    if let Some(count) = references.get_mut(name_index) {
+                        *count = count.saturating_add(1);
+                    }
+                }
+            }
+        }
+
+        let mmap_bytes = &raw.mmap[..];
         let mut total_bytes = 0usize;
-        for &(start, end) in &raw.strings.spans {
+        for &(start, end) in spans {
             total_bytes += end.saturating_sub(start) as usize;
         }
+
+        // Fast path for merging duplicate string contents without allocating
+        // 1.5M `String`s: pack `(hash40 << 24) | idx` into a single `u64` per
+        // referenced string, sort in parallel, and only resolve strings that
+        // collide on their 40-bit hash or survive into the top `limit`.
         let mut referenced_string_count = 0usize;
         let mut referenced_bytes = 0usize;
-        let mut by_value: AHashMap<String, (usize, usize)> = AHashMap::new();
-        for (index, &count) in references.iter().enumerate() {
-            if count == 0 {
+        let mut empty_refs = 0usize;
+        let hasher_builder = ahash::RandomState::with_seeds(1, 2, 3, 4);
+        let mut packed: Vec<u64> = Vec::with_capacity(num_strings / 2);
+
+        for (index, &count_u32) in references.iter().enumerate() {
+            if count_u32 == 0 {
                 continue;
             }
+            let count = count_u32 as usize;
             referenced_string_count += 1;
-            let value = raw
-                .strings
-                .resolve(&raw.mmap, index)
-                .unwrap_or_else(|| format!("<string#{index}>"));
-            let byte_length = value.len();
+            let (s, e) = spans[index];
+            let raw_slice = &mmap_bytes[sbase + s as usize..sbase + e as usize];
+            let byte_length = decoded_json_byte_len(raw_slice);
             referenced_bytes += byte_length.saturating_mul(count);
-            let entry = by_value.entry(value).or_insert((0, byte_length));
-            entry.0 += count;
+            if byte_length == 0 {
+                empty_refs += count;
+                continue;
+            }
+            let h = if memchr(b'\\', raw_slice).is_none() {
+                hasher_builder.hash_one(raw_slice)
+            } else {
+                let dec = decode_json_string(raw_slice);
+                hasher_builder.hash_one(dec.as_bytes())
+            };
+            packed.push((h & !0xFF_FFFFu64) | (index as u64 & 0xFF_FFFF));
         }
-        let mut entries: Vec<StringStatEntry> = by_value
+
+        packed.par_sort_unstable();
+
+        // Keep top-`limit` candidates `(referenced_bytes, references, byte_length, rep_idx)`.
+        let keep_all = limit == 0;
+        let cap = if keep_all { packed.len() + 1 } else { limit + 1 };
+        let mut top_candidates: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(cap.min(1024));
+
+        let mut push_candidate = |ref_bytes: usize, refs: usize, byte_len: usize, rep_idx: usize| {
+            if keep_all || top_candidates.len() < limit {
+                top_candidates.push((ref_bytes, refs, byte_len, rep_idx));
+                return;
+            }
+            let mut worst = 0usize;
+            for i in 1..top_candidates.len() {
+                let a = top_candidates[i];
+                let b = top_candidates[worst];
+                if a.0 < b.0 || (a.0 == b.0 && a.1 < b.1) {
+                    worst = i;
+                }
+            }
+            let w = top_candidates[worst];
+            if ref_bytes > w.0 || (ref_bytes == w.0 && refs >= w.1) {
+                top_candidates[worst] = (ref_bytes, refs, byte_len, rep_idx);
+            }
+        };
+
+        if empty_refs > 0 {
+            if let Some(empty_idx) = (0..num_strings).find(|&i| spans[i].0 == spans[i].1) {
+                push_candidate(0, empty_refs, 0, empty_idx);
+            }
+        }
+
+        let mut i = 0usize;
+        while i < packed.len() {
+            let h_top = packed[i] & !0xFF_FFFFu64;
+            let mut j = i + 1;
+            while j < packed.len() && (packed[j] & !0xFF_FFFFu64) == h_top {
+                j += 1;
+            }
+            if j == i + 1 {
+                let idx = (packed[i] & 0xFF_FFFF) as usize;
+                let refs = references[idx] as usize;
+                let (s, e) = spans[idx];
+                let raw_slice = &mmap_bytes[sbase + s as usize..sbase + e as usize];
+                let byte_len = decoded_json_byte_len(raw_slice);
+                push_candidate(refs.saturating_mul(byte_len), refs, byte_len, idx);
+            } else {
+                // Hash bucket with >1 string index: group by exact content.
+                let mut groups: Vec<(usize, usize, usize, Vec<u8>)> = Vec::with_capacity(j - i);
+                for &pk in &packed[i..j] {
+                    let idx = (pk & 0xFF_FFFF) as usize;
+                    let refs = references[idx] as usize;
+                    let (s, e) = spans[idx];
+                    let raw_slice = &mmap_bytes[sbase + s as usize..sbase + e as usize];
+                    let content: std::borrow::Cow<'_, [u8]> = if memchr(b'\\', raw_slice).is_none() {
+                        std::borrow::Cow::Borrowed(raw_slice)
+                    } else {
+                        std::borrow::Cow::Owned(decode_json_string(raw_slice).into_bytes())
+                    };
+                    if let Some(g) = groups.iter_mut().find(|g| g.3.as_slice() == content.as_ref()) {
+                        g.1 += refs;
+                    } else {
+                        let blen = content.len();
+                        groups.push((idx, refs, blen, content.into_owned()));
+                    }
+                }
+                for (rep_idx, refs, byte_len, _) in groups {
+                    push_candidate(refs.saturating_mul(byte_len), refs, byte_len, rep_idx);
+                }
+            }
+            i = j;
+        }
+        drop(spans_guard);
+
+        let mut entries: Vec<StringStatEntry> = top_candidates
             .into_iter()
-            .map(|(value, (references, byte_length))| StringStatEntry {
-                referenced_bytes: references.saturating_mul(byte_length),
-                value,
-                references,
-                byte_length,
+            .map(|(ref_bytes, refs, byte_length, rep_idx)| {
+                let value = raw
+                    .strings
+                    .resolve(&raw.mmap, rep_idx)
+                    .unwrap_or_else(|| format!("<string#{rep_idx}>"));
+                StringStatEntry {
+                    value,
+                    references: refs,
+                    byte_length,
+                    referenced_bytes: ref_bytes,
+                }
             })
             .collect();
+
         entries.sort_unstable_by(|a, b| {
             b.referenced_bytes
                 .cmp(&a.referenced_bytes)
@@ -2715,8 +3193,9 @@ impl HeapSnapshot {
         if limit > 0 && entries.len() > limit {
             entries.truncate(limit);
         }
+
         Ok(StringStats {
-            total_strings: raw.strings.spans.len(),
+            total_strings: num_strings,
             total_bytes,
             referenced_strings: referenced_string_count,
             referenced_bytes,
@@ -2727,9 +3206,9 @@ impl HeapSnapshot {
     /// Automatically identify potential memory leaks and memory bloat suspects.
     pub fn leak_suspects(&mut self, limit: usize) -> crate::Result<LeakSuspectsReport> {
         self.ensure_raw()?;
+        self.ensure_raw_summary()?;
         let total_nodes = self.raw.as_ref().unwrap().meta.node_count;
-        let summary = self.stream_summary(usize::MAX, None)?;
-        let total_heap = summary.total_size.max(1);
+        let total_heap = self.raw_summary.as_ref().unwrap().total_size.max(1);
 
         let mut suspects: Vec<SuspectEntry> = Vec::new();
 
@@ -2758,9 +3237,9 @@ impl HeapSnapshot {
             }
         }
 
-        // 2. Accumulator collections: collections (Array, Map, Set, object elements) with huge element count or self size
+        // 2. Accumulator collections: collections with huge element count or self size
         let raw = self.raw.as_ref().unwrap();
-        let mut largest_collections: Vec<(usize, usize, usize)> = Vec::new(); // (index, edge_count, self_size)
+        let mut largest_collections: Vec<(usize, usize, usize)> = Vec::new();
         for i in 0..total_nodes {
             let edge_count = raw.nodes.edge_counts[i] as usize;
             let self_size = raw.nodes.self_sizes[i] as usize;
@@ -2874,8 +3353,8 @@ impl HeapSnapshot {
             "webassembly.memory",
         ];
 
-        let spans = &raw.strings.spans;
-        let sbase = raw.strings.start;
+        let (sbase, spans_guard) = raw.strings.all_spans(&raw.mmap);
+        let spans: &[(u32, u32)] = &spans_guard;
         let mmap_bytes = &raw.mmap[..];
         let num_strings = spans.len();
 
@@ -2883,10 +3362,20 @@ impl HeapSnapshot {
             .into_par_iter()
             .map(|idx| {
                 let (s, e) = spans[idx];
-                let decoded = decode_json_string(&mmap_bytes[sbase + s as usize..sbase + e as usize]).to_lowercase();
-                buffer_needles.iter().any(|needle| decoded.contains(needle))
+                let raw_slice = &mmap_bytes[sbase + s as usize..sbase + e as usize];
+                if raw_slice.len() < 4 {
+                    return false;
+                }
+                if memchr(b'\\', raw_slice).is_none() {
+                    if let Ok(st) = std::str::from_utf8(raw_slice) {
+                        return buffer_needles.iter().any(|needle| contains_ci(st, needle));
+                    }
+                }
+                let decoded = decode_json_string(raw_slice);
+                buffer_needles.iter().any(|needle| contains_ci(&decoded, needle))
             })
             .collect();
+        drop(spans_guard);
 
         let mut buffer_indices: Vec<usize> = Vec::new();
         let mut total_self_size = 0usize;
@@ -2944,23 +3433,18 @@ impl HeapSnapshot {
     /// Analyze closures, JS execution contexts, and captured variables.
     pub fn closure_analysis(&mut self, limit: usize) -> crate::Result<ClosureAnalysis> {
         self.ensure_raw()?;
-        self.ensure_edges()?;
-        self.ensure_edge_starts();
         let raw = self.raw.as_ref().unwrap();
-        let edge_starts = self.edge_starts.as_ref().unwrap();
-        let edges = raw.edges.as_ref().unwrap();
         let total_nodes = raw.meta.node_count;
 
         let context_edge_type = raw
             .edge_types
             .iter()
-            .position(|t| t == "context")
-            .map(|idx| idx as u32);
+            .position(|t| t == "context");
         let closure_node_type = raw
             .node_types
             .iter()
             .position(|t| t == "closure")
-            .map(|idx| idx as u16);
+            .map(|idx| idx as u8);
 
         let mut closure_indices: Vec<usize> = Vec::new();
         for i in 0..total_nodes {
@@ -2970,19 +3454,25 @@ impl HeapSnapshot {
         }
 
         if closure_indices.is_empty() && context_edge_type.is_some() {
-            let ctype = context_edge_type.unwrap();
+            self.ensure_edges()?;
+            self.ensure_edge_starts();
+            let raw = self.raw.as_ref().unwrap();
+            let edge_starts = self.edge_starts.as_ref().unwrap();
+            let edge_types = raw.edges.as_ref().unwrap().types.as_slice();
+            let ctype = context_edge_type.unwrap() as u8;
             for i in 0..total_nodes {
                 let start = edge_starts[i] as usize;
                 let end = edge_starts[i + 1] as usize;
-                for e in start..end {
-                    let base = e * raw.edge_field_count;
-                    if edges[base + raw.edge_offsets.type_] == ctype {
-                        closure_indices.push(i);
-                        break;
-                    }
+                if edge_types[start..end].contains(&ctype) {
+                    closure_indices.push(i);
                 }
             }
         }
+
+        let _ = self.locate_edges_range()?;
+        self.ensure_edge_starts();
+        let raw = self.raw.as_ref().unwrap();
+        let edge_starts = self.edge_starts.as_ref().unwrap();
 
         let total_closures = closure_indices.len();
         closure_indices.sort_unstable_by(|&a, &b| {
@@ -3008,29 +3498,27 @@ impl HeapSnapshot {
 
             let start = edge_starts[idx] as usize;
             let end = edge_starts[idx + 1] as usize;
-            for e in start..end {
-                let base = e * raw.edge_field_count;
-                let etype = edges[base + raw.edge_offsets.type_];
-                if Some(etype) == context_edge_type {
-                    let ctx_node_idx = edges[base + raw.edge_offsets.to_node] as usize;
-                    if ctx_node_idx < total_nodes {
-                        let ctx_node = Self::create_node(raw, ctx_node_idx);
-                        context_id = Some(ctx_node.id);
-                        context_name = format!("{} (id={})", ctx_node.name, ctx_node.id);
+            let mut found_ctx = None;
+            raw.for_each_edge_in_range(start, end, |_, etype, _, ctx_node_idx| {
+                if found_ctx.is_none() && Some(etype) == context_edge_type {
+                    found_ctx = Some(ctx_node_idx);
+                }
+            });
+            if let Some(ctx_node_idx) = found_ctx {
+                if ctx_node_idx < total_nodes {
+                    let ctx_node = Self::create_node(raw, ctx_node_idx);
+                    context_id = Some(ctx_node.id);
+                    context_name = format!("{} (id={})", ctx_node.name, ctx_node.id);
 
-                        let c_start = edge_starts[ctx_node_idx] as usize;
-                        let c_end = edge_starts[ctx_node_idx + 1] as usize;
-                        for ce in c_start..c_end {
-                            let c_base = ce * raw.edge_field_count;
-                            let var_name_idx = edges[c_base + raw.edge_offsets.name_or_index] as usize;
-                            if let Some(var_name) = raw.strings.resolve(&raw.mmap, var_name_idx) {
-                                if !var_name.is_empty() && !var_name.starts_with("__") {
-                                    captured_vars.push(var_name);
-                                }
+                    let c_start = edge_starts[ctx_node_idx] as usize;
+                    let c_end = edge_starts[ctx_node_idx + 1] as usize;
+                    raw.for_each_edge_in_range(c_start, c_end, |_, _, var_name_idx, _| {
+                        if let Some(var_name) = raw.strings.resolve(&raw.mmap, var_name_idx as usize) {
+                            if !var_name.is_empty() && !var_name.starts_with("__") {
+                                captured_vars.push(var_name);
                             }
                         }
-                    }
-                    break;
+                    });
                 }
             }
 
@@ -3052,6 +3540,132 @@ impl HeapSnapshot {
             entries,
         })
     }
+}
+
+impl RawData {
+    /// Iterate over edges `start..end`, invoking `f(edge_index, type_idx, name_or_index, to_node)`.
+    /// Uses `EdgeColumns::sync_offsets` when `self.edges` is loaded, or seeks directly in `self.mmap`
+    /// when `self.edges` is `None`.
+    fn for_each_edge_in_range<F>(&self, start: usize, end: usize, mut f: F)
+    where
+        F: FnMut(usize, usize, u32, usize),
+    {
+        if start >= end {
+            return;
+        }
+        let efc = self.edge_field_count;
+        if efc == 0 {
+            return;
+        }
+        let type_off = self.edge_offsets.type_;
+        let name_off = self.edge_offsets.name_or_index;
+        let to_off = self.edge_offsets.to_node;
+        let nfc = self.node_field_count.max(1) as u32;
+
+        if let Some(ref cols) = self.edges {
+            if !cols.sync_offsets.is_empty() {
+                let sync_idx = start / EDGE_SYNC_STRIDE;
+                let sync_edge = sync_idx * EDGE_SYNC_STRIDE;
+                let skip_nums = (start - sync_edge) * efc;
+                let base_byte = cols.bytes_start + cols.sync_offsets[sync_idx];
+                let slice = &self.mmap[base_byte..cols.bytes_end];
+                let mut pos = if skip_nums == 0 {
+                    0
+                } else {
+                    match memchr::memchr_iter(b',', slice).nth(skip_nums - 1) {
+                        Some(rel) => rel + 1,
+                        None => return,
+                    }
+                };
+                let len = slice.len();
+                let mut rec = [0u32; 8];
+                let mut field = 0usize;
+                let mut edge_idx = start;
+                while pos < len && edge_idx < end {
+                    let ch = slice[pos];
+                    if ch == b']' {
+                        break;
+                    }
+                    if ch.is_ascii_digit() {
+                        let mut val = (ch - b'0') as u32;
+                        pos += 1;
+                        while pos < len && slice[pos].is_ascii_digit() {
+                            val = val * 10 + (slice[pos] - b'0') as u32;
+                            pos += 1;
+                        }
+                        rec[field] = val;
+                        field += 1;
+                        if field == efc {
+                            field = 0;
+                            f(
+                                edge_idx,
+                                cols.types[edge_idx] as usize,
+                                rec[name_off],
+                                cols.to_nodes[edge_idx] as usize,
+                            );
+                            edge_idx += 1;
+                        }
+                        continue;
+                    }
+                    pos += 1;
+                }
+                return;
+            }
+        }
+
+        // Direct mmap scan (when `self.edges` is `None` or fallback path)
+        let (eb_start, eb_end) = match self.edges_range {
+            Some(r) => r,
+            None => return,
+        };
+        let edges_bytes = &self.mmap[eb_start..=eb_end];
+        let skip_nums = start * efc;
+        let mut pos = match find_nth_comma_par(edges_bytes, skip_nums) {
+            Some(p) => p,
+            None => return,
+        };
+        let len = edges_bytes.len();
+        let mut rec = [0u32; 8];
+        let mut field = 0usize;
+        let mut edge_idx = start;
+        while pos < len && edge_idx < end {
+            let ch = edges_bytes[pos];
+            if ch == b']' {
+                break;
+            }
+            if ch.is_ascii_digit() {
+                let mut val = (ch - b'0') as u32;
+                pos += 1;
+                while pos < len && edges_bytes[pos].is_ascii_digit() {
+                    val = val * 10 + (edges_bytes[pos] - b'0') as u32;
+                    pos += 1;
+                }
+                rec[field] = val;
+                field += 1;
+                if field == efc {
+                    field = 0;
+                    f(
+                        edge_idx,
+                        rec[type_off] as usize,
+                        rec[name_off],
+                        (rec[to_off] / nfc) as usize,
+                    );
+                    edge_idx += 1;
+                }
+                continue;
+            }
+            pos += 1;
+        }
+    }
+}
+
+/// Compute the UTF-8 byte length of `decode_json_string(raw)` without allocating.
+#[inline]
+fn decoded_json_byte_len(raw: &[u8]) -> usize {
+    if memchr(b'\\', raw).is_none() {
+        return raw.len();
+    }
+    decode_json_string(raw).len()
 }
 
 #[derive(Clone, Copy)]
@@ -3336,6 +3950,7 @@ fn diff_snapshot_maps(
 /// Slice a (cached) full summary down to (top, filter). Avoids re-parsing the
 /// snapshot mmap on repeated calls — turning a ~1 second operation into a
 /// ~1 millisecond one.
+#[cfg(test)]
 fn slice_summary(
     full: &HeapSnapshotSummary,
     top: usize,
@@ -3561,57 +4176,58 @@ fn find_matching_brace(s: &str, start: usize) -> Option<usize> {
 }
 
 /// Find the index of the closing `]` for the array opened at `open`.
+/// Uses SIMD `memchr3`/`memchr2` to jump directly between brackets and quotes
+/// instead of inspecting every digit byte.
 pub fn find_array_end(data: &[u8], open: usize) -> usize {
     let mut i = open + 1;
     let len = data.len();
     let mut depth = 1i32;
     while i < len {
+        let Some(rel) = memchr::memchr3(b']', b'[', b'"', &data[i..]) else {
+            return len.saturating_sub(1);
+        };
+        i += rel;
         match data[i] {
-            b'[' => depth += 1,
             b']' => {
                 depth -= 1;
                 if depth == 0 {
                     return i;
                 }
+                i += 1;
+            }
+            b'[' => {
+                depth += 1;
+                i += 1;
             }
             b'"' => {
                 i += 1;
                 while i < len {
+                    let Some(srel) = memchr2(b'"', b'\\', &data[i..]) else {
+                        return len.saturating_sub(1);
+                    };
+                    i += srel;
                     if data[i] == b'\\' {
                         i += 2;
-                    } else if data[i] == b'"' {
-                        break;
                     } else {
                         i += 1;
+                        break;
                     }
                 }
             }
-            _ => {}
+            _ => i += 1,
         }
-        i += 1;
     }
-    len - 1
+    len.saturating_sub(1)
 }
 
 #[inline]
 pub fn find_marker(data: &[u8], marker: &[u8]) -> Option<usize> {
-    if marker.len() > data.len() {
-        return None;
-    }
-    let first = marker[0];
-    let mut pos = 0;
-    while pos <= data.len() - marker.len() {
-        let found = memchr(first, &data[pos..])?;
-        let abs = pos + found;
-        if abs + marker.len() > data.len() {
-            return None;
-        }
-        if &data[abs..abs + marker.len()] == marker {
-            return Some(abs);
-        }
-        pos = abs + 1;
-    }
-    None
+    memchr::memmem::find(data, marker)
+}
+
+#[inline]
+pub fn rfind_marker(data: &[u8], marker: &[u8]) -> Option<usize> {
+    memchr::memmem::rfind(data, marker)
 }
 
 #[inline]
@@ -3637,6 +4253,116 @@ pub fn parse_numbers_fast(data: &[u8]) -> Vec<u32> {
         i += 1;
     }
     numbers
+}
+
+/// Divide `data` into `num_slices` slices and compute prefix sums of comma
+/// counts in parallel using SIMD `memchr_iter(b',', ...)`.
+/// Returns `(slice_starts, comma_prefix_sums)` where both have length `slice_cnt + 1`.
+pub(crate) fn parallel_comma_prefixes(data: &[u8], num_slices: usize) -> (Vec<usize>, Vec<usize>) {
+    let n = num_slices.max(1);
+    let step = (data.len() / n).max(1);
+    let mut starts = Vec::with_capacity(n + 1);
+    let mut pos = 0usize;
+    while pos < data.len() && starts.len() < n {
+        starts.push(pos);
+        pos = (pos + step).min(data.len());
+    }
+    starts.push(data.len());
+    let slice_cnt = starts.len() - 1;
+    let counts: Vec<usize> = if data.len() >= (1 << 19) && slice_cnt > 1 {
+        (0..slice_cnt)
+            .into_par_iter()
+            .map(|i| memchr::memchr_iter(b',', &data[starts[i]..starts[i + 1]]).count())
+            .collect()
+    } else {
+        (0..slice_cnt)
+            .map(|i| memchr::memchr_iter(b',', &data[starts[i]..starts[i + 1]]).count())
+            .collect()
+    };
+    let mut prefixes = Vec::with_capacity(slice_cnt + 1);
+    prefixes.push(0);
+    let mut acc = 0usize;
+    for c in counts {
+        acc += c;
+        prefixes.push(acc);
+    }
+    (starts, prefixes)
+}
+
+/// Find the byte offset immediately after the `target_commas`-th comma in `data`
+/// (or `0` when `target_commas == 0`), using parallel SIMD comma counting on large slices.
+pub(crate) fn find_nth_comma_par(data: &[u8], target_commas: usize) -> Option<usize> {
+    if target_commas == 0 {
+        return Some(0);
+    }
+    const MIN_PAR: usize = 1 << 20;
+    if data.len() < MIN_PAR {
+        return memchr::memchr_iter(b',', data)
+            .nth(target_commas - 1)
+            .map(|p| p + 1);
+    }
+    let threads = rayon::current_num_threads().max(1);
+    let (starts, prefixes) = parallel_comma_prefixes(data, threads * 4);
+    let total = *prefixes.last().unwrap();
+    if target_commas > total {
+        return None;
+    }
+    // Find the slice `k` containing the `target_commas`-th comma (1-indexed).
+    let k = prefixes.partition_point(|&p| p < target_commas).saturating_sub(1);
+    let rem = target_commas - prefixes[k];
+    let slice = &data[starts[k]..starts[k + 1]];
+    memchr::memchr_iter(b',', slice)
+        .nth(rem - 1)
+        .map(|rel| starts[k] + rel + 1)
+}
+
+/// Partition `data` into record-aligned chunks `(byte_start, byte_end, rec_start, rec_end)`
+/// in parallel using SIMD comma prefix sums. Returns `None` if `(total_commas + 1)`
+/// is not a multiple of `field_count`.
+pub(crate) fn aligned_record_chunks_par(
+    data: &[u8],
+    field_count: usize,
+) -> Option<Vec<(usize, usize, usize, usize)>> {
+    if field_count == 0 || data.is_empty() {
+        return None;
+    }
+    let threads = rayon::current_num_threads().max(1);
+    let num_chunks = (threads * 4).max(1);
+    let (starts, prefixes) = parallel_comma_prefixes(data, num_chunks);
+    let total_commas = *prefixes.last().unwrap();
+    let total_nums = total_commas + 1;
+    if !total_nums.is_multiple_of(field_count) {
+        return None;
+    }
+    let total_recs = total_nums / field_count;
+    let mut bounds: Vec<(usize, usize)> = Vec::with_capacity(starts.len());
+    bounds.push((0, 0));
+    for k in 1..starts.len() - 1 {
+        let raw_pos = starts[k];
+        if raw_pos <= bounds.last().unwrap().0 {
+            continue;
+        }
+        let commas_before = prefixes[k];
+        let need = field_count - (commas_before % field_count);
+        if let Some(rel) = memchr::memchr_iter(b',', &data[raw_pos..]).nth(need - 1) {
+            let pos = raw_pos + rel + 1;
+            let rec_idx = (commas_before + need) / field_count;
+            if pos < data.len() && rec_idx < total_recs && rec_idx > bounds.last().unwrap().1 {
+                bounds.push((pos, rec_idx));
+            }
+        }
+    }
+    bounds.push((data.len(), total_recs));
+    Some(
+        bounds
+            .windows(2)
+            .filter_map(|w| {
+                let (bs, rs) = w[0];
+                let (be, re) = w[1];
+                (be > bs && re > rs).then_some((bs, be, rs, re))
+            })
+            .collect(),
+    )
 }
 
 /// Parse all integers from a flat comma-separated byte region in parallel.
@@ -3687,42 +4413,26 @@ pub fn parse_numbers_par(data: &[u8]) -> Vec<u32> {
 /// START at a record boundary (every `field_count` numbers), so chunks can be
 /// parsed independently into complete records and streamed into columns
 /// without materializing the whole interleaved number vector.
-///
-/// Boundaries are found by counting commas, which assumes the canonical V8
-/// layout (numbers separated by single commas, no whitespace between them).
-/// That assumption is validated exactly by the caller: a chunk parses into
-/// complete records iff its parsed count divides by `field_count` — if any
-/// chunk fails that check, the caller must fall back to a whole-array parse.
+#[cfg(test)]
 pub(crate) fn record_aligned_chunks(
     data: &[u8],
     field_count: usize,
     chunks: usize,
 ) -> Vec<(usize, usize)> {
-    use memchr::memchr;
-
     let mut bounds: Vec<usize> = Vec::with_capacity(chunks + 2);
     bounds.push(0);
     if field_count > 0 && !data.is_empty() {
-        // A boundary after the k-th comma starts number #k (0-indexed); it
-        // opens a fresh record iff k % field_count == 0. Boundaries are found
-        // left-to-right: commas in the span up to the next target are counted
-        // with a vectorizable filter-count, then at most field_count-1
-        // memchr hops reach the next aligned comma. Total scan cost is one
-        // pass over the array (a naive per-comma iterator here was measured
-        // ~0.5s slower on a 625MB array).
         let target = (data.len() / chunks.max(1)).max(1);
         let data_len = data.len();
-        let mut pos = 0usize; // current boundary (a number start)
-        let mut commas_total = 0usize; // commas strictly before `pos`
+        let mut pos = 0usize;
+        let mut commas_total = 0usize;
         let mut next_at = target;
         while pos < data_len && bounds.len() <= chunks {
             let span_end = next_at.min(data_len);
             if span_end > pos {
-                commas_total += data[pos..span_end].iter().filter(|&&b| b == b',').count();
+                commas_total += memchr::memchr_iter(b',', &data[pos..span_end]).count();
                 pos = span_end;
             }
-            // advance to the first comma at/after `pos` (a boundary must sit
-            // right after a comma — `next_at` itself may be mid-number)
             match memchr(b',', &data[pos..]) {
                 Some(c) => {
                     pos += c + 1;
@@ -3730,8 +4440,6 @@ pub(crate) fn record_aligned_chunks(
                 }
                 None => break,
             }
-            // then hop (bounded by field_count-1) until the running comma
-            // count is a multiple of field_count
             while !commas_total.is_multiple_of(field_count) {
                 match memchr(b',', &data[pos..]) {
                     Some(c) => {
@@ -3760,75 +4468,120 @@ pub(crate) fn record_aligned_chunks(
         .collect()
 }
 
-/// Stream the flat node array into `NodeColumns` without building the full
-/// interleaved `Vec<u32>` first (that transient is ~625MB for a 26M-node
-/// snapshot; here only one chunk's numbers are live per worker). Returns
-/// `None` when the record-alignment validation fails (non-canonical layout),
-/// in which case the caller falls back to `parse_numbers_par` + column sweeps.
+/// Stream the flat node array directly into pre-allocated `NodeColumns` slices
+/// in parallel without any intermediate per-chunk vectors or full interleaved
+/// `Vec<u32>`. Returns `None` when record-alignment validation fails.
 fn node_columns_streaming(
     data: &[u8],
     nfc: usize,
     offsets: &NodeFieldOffsets,
 ) -> Option<NodeColumns> {
-    if nfc == 0 {
+    let chunks = aligned_record_chunks_par(data, nfc)?;
+    let total_recs = chunks.last().map(|c| c.3).unwrap_or(0);
+    if total_recs == 0 {
         return None;
     }
-    let threads = rayon::current_num_threads().max(1);
-    let ranges = record_aligned_chunks(data, nfc, threads * 8);
-    let parts: Vec<Option<NodeColumns>> = ranges
-        .par_iter()
-        .map(|&(s, e)| {
-            let nums = parse_numbers_fast(&data[s..e]);
-            if !nums.len().is_multiple_of(nfc) {
-                return None;
-            }
-            let recs = nums.len() / nfc;
-            let mut types = Vec::with_capacity(recs);
-            let mut names = Vec::with_capacity(recs);
-            let mut ids = Vec::with_capacity(recs);
-            let mut self_sizes = Vec::with_capacity(recs);
-            let mut edge_counts = Vec::with_capacity(recs);
-            let mut detachedness = Vec::with_capacity(recs);
-            for rec in nums.chunks(nfc) {
-                types.push(rec[offsets.type_] as u16);
-                names.push(rec[offsets.name]);
-                ids.push(rec[offsets.id]);
-                self_sizes.push(rec[offsets.self_size]);
-                edge_counts.push(rec[offsets.edge_count]);
-                detachedness.push(
-                    offsets
-                        .detachedness
-                        .map(|offset| rec[offset] as u8)
-                        .unwrap_or(0),
-                );
-            }
-            drop(nums); // free this chunk's numbers before the next chunk
-            Some(NodeColumns {
-                types,
-                names,
-                ids,
-                self_sizes,
-                edge_counts,
-                detachedness,
-            })
-        })
-        .collect();
-    let parts: Vec<NodeColumns> = parts.into_iter().collect::<Option<_>>()?;
-    let cap: usize = parts.iter().map(|p| p.types.len()).sum();
-    let mut types = Vec::with_capacity(cap);
-    let mut names = Vec::with_capacity(cap);
-    let mut ids = Vec::with_capacity(cap);
-    let mut self_sizes = Vec::with_capacity(cap);
-    let mut edge_counts = Vec::with_capacity(cap);
-    let mut detachedness = Vec::with_capacity(cap);
-    for p in parts {
-        types.extend_from_slice(&p.types);
-        names.extend_from_slice(&p.names);
-        ids.extend_from_slice(&p.ids);
-        self_sizes.extend_from_slice(&p.self_sizes);
-        edge_counts.extend_from_slice(&p.edge_counts);
-        detachedness.extend_from_slice(&p.detachedness);
+
+    let mut types = vec![0u8; total_recs];
+    let mut names = vec![0u32; total_recs];
+    let mut ids = vec![0u32; total_recs];
+    let mut self_sizes = vec![0u32; total_recs];
+    let mut edge_counts = vec![0u32; total_recs];
+    let mut detachedness = vec![0u8; total_recs];
+
+    let mut tasks: Vec<(
+        usize,
+        usize,
+        &mut [u8],
+        &mut [u32],
+        &mut [u32],
+        &mut [u32],
+        &mut [u32],
+        &mut [u8],
+    )> = Vec::with_capacity(chunks.len());
+
+    let mut rem_types = types.as_mut_slice();
+    let mut rem_names = names.as_mut_slice();
+    let mut rem_ids = ids.as_mut_slice();
+    let mut rem_sizes = self_sizes.as_mut_slice();
+    let mut rem_edges = edge_counts.as_mut_slice();
+    let mut rem_det = detachedness.as_mut_slice();
+
+    for &(bs, be, rs, re) in &chunks {
+        let len = re - rs;
+        let (t_head, t_tail) = rem_types.split_at_mut(len);
+        let (n_head, n_tail) = rem_names.split_at_mut(len);
+        let (i_head, i_tail) = rem_ids.split_at_mut(len);
+        let (s_head, s_tail) = rem_sizes.split_at_mut(len);
+        let (e_head, e_tail) = rem_edges.split_at_mut(len);
+        let (d_head, d_tail) = rem_det.split_at_mut(len);
+        rem_types = t_tail;
+        rem_names = n_tail;
+        rem_ids = i_tail;
+        rem_sizes = s_tail;
+        rem_edges = e_tail;
+        rem_det = d_tail;
+        tasks.push((bs, be, t_head, n_head, i_head, s_head, e_head, d_head));
     }
+
+    let type_off = offsets.type_;
+    let name_off = offsets.name;
+    let id_off = offsets.id;
+    let size_off = offsets.self_size;
+    let edge_off = offsets.edge_count;
+    let det_off = offsets.detachedness;
+
+    let ok = tasks.into_par_iter().all(
+        |(bs, be, out_t, out_n, out_id, out_sz, out_ec, out_det)| {
+            let slice = &data[bs..be];
+            let expected_recs = out_t.len();
+            let mut i = 0usize;
+            let len = slice.len();
+            let mut rec = [0u32; 16];
+            if nfc > rec.len() {
+                return false;
+            }
+            let mut field = 0usize;
+            let mut out_i = 0usize;
+            while i < len {
+                let ch = slice[i];
+                if ch == b']' {
+                    break;
+                }
+                if ch.is_ascii_digit() {
+                    if out_i == expected_recs {
+                        return false;
+                    }
+                    let mut val = (ch - b'0') as u32;
+                    i += 1;
+                    while i < len && slice[i].is_ascii_digit() {
+                        val = val * 10 + (slice[i] - b'0') as u32;
+                        i += 1;
+                    }
+                    rec[field] = val;
+                    field += 1;
+                    if field == nfc {
+                        field = 0;
+                        out_t[out_i] = rec[type_off] as u8;
+                        out_n[out_i] = rec[name_off];
+                        out_id[out_i] = rec[id_off];
+                        out_sz[out_i] = rec[size_off];
+                        out_ec[out_i] = rec[edge_off];
+                        out_det[out_i] = det_off.map(|o| rec[o] as u8).unwrap_or(0);
+                        out_i += 1;
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+            out_i == expected_recs && field == 0
+        },
+    );
+
+    if !ok {
+        return None;
+    }
+
     Some(NodeColumns {
         types,
         names,
@@ -3836,6 +4589,114 @@ fn node_columns_streaming(
         self_sizes,
         edge_counts,
         detachedness,
+    })
+}
+
+/// Stream the flat edge array directly into pre-allocated `EdgeColumns`
+/// (`types: Vec<u8>`, `to_nodes: Vec<u32>`, and `sync_offsets` every 1,024
+/// edges) without materializing `name_or_index` or a flat `Vec<u32>`.
+fn edge_columns_streaming(
+    data: &[u8],
+    bytes_start: usize,
+    bytes_end: usize,
+    efc: usize,
+    nfc: u32,
+    offsets: &EdgeFieldOffsets,
+) -> Option<EdgeColumns> {
+    let chunks = aligned_record_chunks_par(data, efc)?;
+    let total_recs = chunks.last().map(|c| c.3).unwrap_or(0);
+    if total_recs == 0 {
+        return None;
+    }
+
+    let mut types = vec![0u8; total_recs];
+    let mut to_nodes = vec![0u32; total_recs];
+    let sync_len = total_recs.div_ceil(EDGE_SYNC_STRIDE);
+    let sync_offsets = vec![0usize; sync_len];
+    let sync_ptr = sync_offsets.as_ptr() as usize;
+
+    let mut tasks: Vec<(usize, usize, usize, &mut [u8], &mut [u32])> =
+        Vec::with_capacity(chunks.len());
+    let mut rem_types = types.as_mut_slice();
+    let mut rem_to = to_nodes.as_mut_slice();
+
+    for &(bs, be, rs, re) in &chunks {
+        let len = re - rs;
+        let (t_head, t_tail) = rem_types.split_at_mut(len);
+        let (to_head, to_tail) = rem_to.split_at_mut(len);
+        rem_types = t_tail;
+        rem_to = to_tail;
+        tasks.push((bs, be, rs, t_head, to_head));
+    }
+
+    let type_off = offsets.type_;
+    let to_off = offsets.to_node;
+    let nfc_div = nfc.max(1);
+
+    let ok = tasks
+        .into_par_iter()
+        .all(|(bs, be, rs, out_t, out_to)| {
+            let slice = &data[bs..be];
+            let expected_recs = out_t.len();
+            let mut i = 0usize;
+            let len = slice.len();
+            let mut rec = [0u32; 8];
+            if efc > rec.len() {
+                return false;
+            }
+            let mut field = 0usize;
+            let mut out_i = 0usize;
+            while i < len {
+                let ch = slice[i];
+                if ch == b']' {
+                    break;
+                }
+                if ch.is_ascii_digit() {
+                    if out_i == expected_recs {
+                        return false;
+                    }
+                    if field == 0 {
+                        let global_edge = rs + out_i;
+                        if global_edge.is_multiple_of(EDGE_SYNC_STRIDE) {
+                            let sync_idx = global_edge / EDGE_SYNC_STRIDE;
+                            // SAFETY: each `global_edge` is visited by exactly one task,
+                            // so `sync_idx` is disjoint across all parallel tasks.
+                            unsafe {
+                                *(sync_ptr as *mut usize).add(sync_idx) = bs + i;
+                            }
+                        }
+                    }
+                    let mut val = (ch - b'0') as u32;
+                    i += 1;
+                    while i < len && slice[i].is_ascii_digit() {
+                        val = val * 10 + (slice[i] - b'0') as u32;
+                        i += 1;
+                    }
+                    rec[field] = val;
+                    field += 1;
+                    if field == efc {
+                        field = 0;
+                        out_t[out_i] = rec[type_off] as u8;
+                        out_to[out_i] = rec[to_off] / nfc_div;
+                        out_i += 1;
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+            out_i == expected_recs && field == 0
+        });
+
+    if !ok {
+        return None;
+    }
+
+    Some(EdgeColumns {
+        types,
+        to_nodes,
+        sync_offsets,
+        bytes_start,
+        bytes_end,
     })
 }
 
@@ -3972,7 +4833,7 @@ mod tests {
         let streamed = node_columns_streaming(data, nfc, &offsets).expect("canonical input");
         let flat = parse_numbers_par(data);
         let reference = NodeColumns {
-            types: flat.par_chunks(nfc).map(|r| r[0] as u16).collect(),
+            types: flat.par_chunks(nfc).map(|r| r[0] as u8).collect(),
             names: flat.par_chunks(nfc).map(|r| r[1]).collect(),
             ids: flat.par_chunks(nfc).map(|r| r[2]).collect(),
             self_sizes: flat.par_chunks(nfc).map(|r| r[3]).collect(),
@@ -4059,19 +4920,18 @@ mod tests {
         std::fs::write(&path, &data).unwrap();
         let file = std::fs::File::open(&path).unwrap();
         let mmap = unsafe { Mmap::map(&file).unwrap() };
-        let table = StringTable {
-            start: 0,
-            spans: vec![
+        let table = StringTable::from_spans_for_test(
+            0,
+            vec![
                 (0, short.len() as u32),
                 (short.len() as u32, (short.len() + long_len) as u32),
             ],
-            memo: std::cell::RefCell::new(vec![None, None]),
-        };
+        );
         assert_eq!(table.resolve(&mmap, 0).as_deref(), Some("hello"));
-        assert!(table.memo.borrow()[0].is_some());
+        assert!(table.memo.read().unwrap().contains_key(&0));
         let decoded = table.resolve(&mmap, 1).unwrap();
         assert_eq!(decoded.len(), long_len);
-        assert!(table.memo.borrow()[1].is_none());
+        assert!(!table.memo.read().unwrap().contains_key(&1));
         let _ = std::fs::remove_file(&path);
     }
 

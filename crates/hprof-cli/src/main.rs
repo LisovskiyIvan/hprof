@@ -39,7 +39,10 @@ use hprof_core::detect_profile_type;
 pub fn use_color() -> bool {
     static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *C.get_or_init(|| {
-        !cfg!(windows) && std::io::stdout().is_terminal() && std::env::var("NO_COLOR").is_err()
+        !cfg!(test)
+            && !cfg!(windows)
+            && std::io::stdout().is_terminal()
+            && std::env::var("NO_COLOR").is_err()
     })
 }
 
@@ -90,6 +93,16 @@ fn strip_ansi(s: &str) -> String {
 /// Collapse ANSI codes + control characters + whitespace (for column width
 /// measurement).
 fn normalize_cell(s: &str) -> String {
+    const MAX_CELL_SAMPLE: usize = 2048;
+    let s = if s.len() > MAX_CELL_SAMPLE {
+        let mut end = MAX_CELL_SAMPLE;
+        while !s.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        &s[..end]
+    } else {
+        s
+    };
     let plain = ansi_re().replace_all(s, "");
     let plain = plain
         .chars()

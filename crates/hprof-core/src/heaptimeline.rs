@@ -25,7 +25,9 @@ use std::fs;
 use memmap2::Mmap;
 use regex::Regex;
 
-use crate::heapsnapshot::{decode_json_string, find_array_end, find_marker};
+use crate::heapsnapshot::{
+    aligned_record_chunks_par, find_array_end, find_marker, rfind_marker, StringTable,
+};
 use crate::types::*;
 use rayon::prelude::*;
 
@@ -60,10 +62,8 @@ struct TimelineData {
     tids: Vec<u32>,
     type_names: Vec<String>,
     total_allocated: usize,
-    // strings table: byte spans (relative to `strings_start`) + lazy decode memo
-    strings_start: usize,
-    string_spans: Vec<(u32, u32)>,
-    string_memo: Vec<Option<String>>,
+    // strings table: lazy decode via StringTable
+    strings: StringTable,
     // allocation stacks
     trace_infos: Vec<TraceInfo>,
     trace_nodes: Vec<TraceNode>,
@@ -138,12 +138,9 @@ fn parse_children(data: &[u8], pos: &mut usize, parent: Option<usize>, out: &mut
 // TimelineData construction
 // ---------------------------------------------------------------------------
 
-/// Stream the flat timeline `nodes` array into the four column vectors plus
-/// the running total, without materializing the whole interleaved number
-/// vector (that transient was ~400MB for a 17M-node timeline). Returns `None`
-/// when the record-alignment validation fails (non-canonical layout) so the
-/// caller can fall back to the whole-array path. See
-/// `heapsnapshot::record_aligned_chunks` for the boundary logic.
+/// Stream the flat timeline `nodes` array directly into the four pre-allocated
+/// column vectors plus running total in parallel, without any intermediate
+/// per-chunk vectors or interleaved number transient.
 fn timeline_columns_streaming(
     data: &[u8],
     nfc: usize,
@@ -152,51 +149,104 @@ fn timeline_columns_streaming(
     size_off: usize,
     tid_off: usize,
 ) -> Option<(Vec<u8>, Vec<u32>, Vec<u32>, Vec<u32>, usize, usize)> {
-    if nfc == 0 {
+    let chunks = aligned_record_chunks_par(data, nfc)?;
+    let total_recs = chunks.last().map(|c| c.3).unwrap_or(0);
+    if total_recs == 0 {
         return None;
     }
-    let threads = rayon::current_num_threads().max(1);
-    let ranges = crate::heapsnapshot::record_aligned_chunks(data, nfc, threads * 8);
-    let parts: Vec<Option<(Vec<u8>, Vec<u32>, Vec<u32>, Vec<u32>, usize)>> = ranges
-        .par_iter()
-        .map(|&(s, e)| {
-            let nums = crate::heapsnapshot::parse_numbers_fast(&data[s..e]);
-            if !nums.len().is_multiple_of(nfc) {
-                return None;
-            }
-            let recs = nums.len() / nfc;
-            let mut types = Vec::with_capacity(recs);
-            let mut names = Vec::with_capacity(recs);
-            let mut sizes = Vec::with_capacity(recs);
-            let mut tids = Vec::with_capacity(recs);
-            let mut total = 0usize;
-            for rec in nums.chunks(nfc) {
-                types.push(rec[type_off] as u8);
-                names.push(rec[name_off]);
-                sizes.push(rec[size_off]);
-                tids.push(rec[tid_off]);
-                total += rec[size_off] as usize;
-            }
-            drop(nums); // free this chunk's numbers before the next chunk
-            Some((types, names, sizes, tids, total))
-        })
-        .collect();
-    let parts: Vec<_> = parts.into_iter().collect::<Option<_>>()?;
-    let cap: usize = parts.iter().map(|p| p.0.len()).sum();
-    let mut types = Vec::with_capacity(cap);
-    let mut names = Vec::with_capacity(cap);
-    let mut sizes = Vec::with_capacity(cap);
-    let mut tids = Vec::with_capacity(cap);
-    let mut total_allocated = 0usize;
-    for (t, n, s, d, total) in parts {
-        types.extend_from_slice(&t);
-        names.extend_from_slice(&n);
-        sizes.extend_from_slice(&s);
-        tids.extend_from_slice(&d);
-        total_allocated += total;
+
+    let mut types = vec![0u8; total_recs];
+    let mut names = vec![0u32; total_recs];
+    let mut sizes = vec![0u32; total_recs];
+    let mut tids = vec![0u32; total_recs];
+    let mut totals = vec![0usize; chunks.len()];
+
+    let mut tasks: Vec<(
+        usize,
+        usize,
+        &mut [u8],
+        &mut [u32],
+        &mut [u32],
+        &mut [u32],
+        &mut usize,
+    )> = Vec::with_capacity(chunks.len());
+
+    let mut rem_types = types.as_mut_slice();
+    let mut rem_names = names.as_mut_slice();
+    let mut rem_sizes = sizes.as_mut_slice();
+    let mut rem_tids = tids.as_mut_slice();
+    let mut rem_totals = totals.as_mut_slice();
+
+    for &(bs, be, rs, re) in &chunks {
+        let len = re - rs;
+        let (t_head, t_tail) = rem_types.split_at_mut(len);
+        let (n_head, n_tail) = rem_names.split_at_mut(len);
+        let (s_head, s_tail) = rem_sizes.split_at_mut(len);
+        let (d_head, d_tail) = rem_tids.split_at_mut(len);
+        let (tot_head, tot_tail) = rem_totals.split_at_mut(1);
+        rem_types = t_tail;
+        rem_names = n_tail;
+        rem_sizes = s_tail;
+        rem_tids = d_tail;
+        rem_totals = tot_tail;
+        tasks.push((bs, be, t_head, n_head, s_head, d_head, &mut tot_head[0]));
     }
-    let node_count = types.len();
-    Some((types, names, sizes, tids, total_allocated, node_count))
+
+    let ok = tasks.into_par_iter().all(
+        |(bs, be, out_t, out_n, out_s, out_d, out_tot)| {
+            let slice = &data[bs..be];
+            let expected_recs = out_t.len();
+            let mut i = 0usize;
+            let len = slice.len();
+            let mut rec = [0u32; 16];
+            if nfc > rec.len() {
+                return false;
+            }
+            let mut field = 0usize;
+            let mut out_i = 0usize;
+            let mut chunk_total = 0usize;
+            while i < len {
+                let ch = slice[i];
+                if ch == b']' {
+                    break;
+                }
+                if ch.is_ascii_digit() {
+                    if out_i == expected_recs {
+                        return false;
+                    }
+                    let mut val = (ch - b'0') as u32;
+                    i += 1;
+                    while i < len && slice[i].is_ascii_digit() {
+                        val = val * 10 + (slice[i] - b'0') as u32;
+                        i += 1;
+                    }
+                    rec[field] = val;
+                    field += 1;
+                    if field == nfc {
+                        field = 0;
+                        out_t[out_i] = rec[type_off] as u8;
+                        out_n[out_i] = rec[name_off];
+                        let sz = rec[size_off];
+                        out_s[out_i] = sz;
+                        out_d[out_i] = rec[tid_off];
+                        chunk_total += sz as usize;
+                        out_i += 1;
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+            *out_tot = chunk_total;
+            out_i == expected_recs && field == 0
+        },
+    );
+
+    if !ok {
+        return None;
+    }
+
+    let total_allocated: usize = totals.into_iter().sum();
+    Some((types, names, sizes, tids, total_allocated, total_recs))
 }
 
 fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<TimelineData> {
@@ -276,38 +326,14 @@ fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<Timelin
         }
     };
 
-    // ---- strings table ----
-    let strings_marker = b"\"strings\":[";
-    let strings_start =
-        find_marker(data, strings_marker).ok_or(Error::HeaderParseFailed)? + strings_marker.len();
-    let strings_end = find_array_end(data, strings_start - 1);
-
-    let mut string_spans: Vec<(u32, u32)> = Vec::with_capacity(1 << 16);
-    let mut sp = strings_start;
-    while sp < strings_end {
-        if data[sp] != b'"' {
-            sp += 1;
-            continue;
-        }
-        let start = sp + 1;
-        sp += 1;
-        while sp < strings_end {
-            if data[sp] == b'\\' {
-                sp += 2;
-            } else if data[sp] == b'"' {
-                string_spans.push(((start - strings_start) as u32, (sp - strings_start) as u32));
-                sp += 1;
-                break;
-            } else {
-                sp += 1;
-            }
-        }
-    }
-    let string_memo: Vec<Option<String>> = vec![None; string_spans.len()];
-
+    // Locate trace sections and strings from the end of the file so the
+    // large `edges` array (typically 500MB+) is never scanned or faulted into RSS.
     // ---- trace_function_infos: 6 fields per record ----
     let fi_marker = b"\"trace_function_infos\":[";
-    let fi_start = find_marker(data, fi_marker).ok_or(Error::HeaderParseFailed)? + fi_marker.len();
+    let fi_start = rfind_marker(data, fi_marker)
+        .or_else(|| find_marker(data, fi_marker))
+        .ok_or(Error::HeaderParseFailed)?
+        + fi_marker.len();
     let fi_end = find_array_end(data, fi_start - 1);
     let fi_nums = crate::heapsnapshot::parse_numbers_par(&data[fi_start..=fi_end]);
     let mut trace_infos: Vec<TraceInfo> = Vec::with_capacity(fi_nums.len() / 6);
@@ -325,7 +351,10 @@ fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<Timelin
 
     // ---- trace_tree: flat layout, stride 5 ----
     let tt_marker = b"\"trace_tree\":[";
-    let tt_start = find_marker(data, tt_marker).ok_or(Error::HeaderParseFailed)? + tt_marker.len();
+    let tt_start = rfind_marker(data, tt_marker)
+        .or_else(|| find_marker(data, tt_marker))
+        .ok_or(Error::HeaderParseFailed)?
+        + tt_marker.len();
     let tt_end = find_array_end(data, tt_start - 1);
     let tt_data = &data[tt_start - 1..=tt_end]; // includes the root '['
     let mut trace_nodes: Vec<TraceNode> = Vec::new();
@@ -356,8 +385,10 @@ fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<Timelin
 
     // ---- samples: flat pairs (timestamp_us, last_assigned_id) ----
     let smp_marker = b"\"samples\":[";
-    let smp_start =
-        find_marker(data, smp_marker).ok_or(Error::HeaderParseFailed)? + smp_marker.len();
+    let smp_start = rfind_marker(data, smp_marker)
+        .or_else(|| find_marker(data, smp_marker))
+        .ok_or(Error::HeaderParseFailed)?
+        + smp_marker.len();
     let smp_end = find_array_end(data, smp_start - 1);
     let smp_nums = crate::heapsnapshot::parse_numbers_fast(&data[smp_start..=smp_end]);
     let mut samples: Vec<(u64, u64)> = Vec::with_capacity(smp_nums.len() / 2);
@@ -368,6 +399,14 @@ fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<Timelin
         samples.push((c[0] as u64, c[1] as u64));
     }
 
+    // ---- strings table: lazy on-demand string table ----
+    let strings_marker = b"\"strings\":[";
+    let strings_pos = rfind_marker(data, strings_marker)
+        .or_else(|| find_marker(data, strings_marker))
+        .ok_or(Error::HeaderParseFailed)?;
+    let strings_open = strings_pos + strings_marker.len() - 1;
+    let strings = StringTable::new_at(strings_open);
+
     Ok(TimelineData {
         mmap,
         node_count,
@@ -377,9 +416,7 @@ fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<Timelin
         tids,
         type_names: node_types.to_vec(),
         total_allocated,
-        strings_start,
-        string_spans,
-        string_memo,
+        strings,
         trace_infos,
         trace_nodes,
         trace_by_id,
@@ -391,26 +428,14 @@ fn parse_timeline(file_path: &str, meta: &SnapshotMeta) -> crate::Result<Timelin
 // Public API
 // ---------------------------------------------------------------------------
 
-fn resolve_string(data: &mut TimelineData, idx: u32) -> String {
-    if let Some(Some(s)) = data.string_memo.get(idx as usize) {
-        return s.clone();
-    }
-    let span = data.string_spans.get(idx as usize).cloned();
-    let decoded = match span {
-        Some((s, e)) => {
-            let raw = &data.mmap[data.strings_start + s as usize..data.strings_start + e as usize];
-            decode_json_string(raw)
-        }
-        None => format!("<str {}>", idx),
-    };
-    if let Some(slot) = data.string_memo.get_mut(idx as usize) {
-        *slot = Some(decoded.clone());
-    }
-    decoded
+fn resolve_string(data: &TimelineData, idx: u32) -> String {
+    data.strings
+        .resolve(&data.mmap, idx as usize)
+        .unwrap_or_else(|| format!("<str {}>", idx))
 }
 
 /// Walk a trace tree node's ancestors root->leaf and decode each frame.
-fn stack_frames(data: &mut TimelineData, ti: usize) -> Vec<TimelineStackFrame> {
+fn stack_frames(data: &TimelineData, ti: usize) -> Vec<TimelineStackFrame> {
     let mut frames: Vec<TimelineStackFrame> = Vec::new();
     let mut cur = Some(ti);
     let mut guard = 0;
@@ -447,7 +472,7 @@ fn stack_frames(data: &mut TimelineData, ti: usize) -> Vec<TimelineStackFrame> {
 
 /// Ancestor chain of function names for trace node `ti` (root first).
 /// Allocation-only variant of `stack_frames` used by `folded_stacks`.
-fn stack_names(data: &mut TimelineData, ti: usize) -> Vec<String> {
+fn stack_names(data: &TimelineData, ti: usize) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut cur = Some(ti);
     let mut guard = 0;
