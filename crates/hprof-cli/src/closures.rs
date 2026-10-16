@@ -20,7 +20,10 @@ pub fn run(file: &str, type_name: &str, args: &Args) -> Result<(), String> {
     drop(_note);
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&json!(analysis)).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!(analysis)).unwrap()
+        );
         return Ok(());
     }
 
@@ -54,13 +57,26 @@ pub fn run(file: &str, type_name: &str, args: &Args) -> Result<(), String> {
         .collect();
 
     print_table(
-        &["INDEX", "ID", "CLOSURE FUNCTION", "SELF", "RETAINED CONTEXT", "CAPTURED VARIABLES"],
+        &[
+            "INDEX",
+            "ID",
+            "CLOSURE FUNCTION",
+            "SELF",
+            "RETAINED CONTEXT",
+            "CAPTURED VARIABLES",
+        ],
         &rows,
     );
 
     println!();
-    println!("  {}: closures retain their entire parent Context even if only one variable is used.", dim("tip"));
-    println!("  {}: use `hprof props --id <context_id>` to view all properties retained by the context.", dim("tip"));
+    println!(
+        "  {}: closures retain their entire parent Context even if only one variable is used.",
+        dim("tip")
+    );
+    println!(
+        "  {}: use `hprof props --id <context_id>` to view all properties retained by the context.",
+        dim("tip")
+    );
     println!();
 
     Ok(())

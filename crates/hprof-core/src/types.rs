@@ -888,4 +888,3 @@ pub struct ClosureAnalysis {
     pub total_retained: usize,
     pub entries: Vec<ClosureEntry>,
 }
-

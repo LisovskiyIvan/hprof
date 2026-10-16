@@ -21,7 +21,10 @@ pub fn run(file: &str, type_name: &str, args: &Args) -> Result<(), String> {
     drop(_note);
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&json!(analysis)).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!(analysis)).unwrap()
+        );
         return Ok(());
     }
 
@@ -50,12 +53,22 @@ pub fn run(file: &str, type_name: &str, args: &Args) -> Result<(), String> {
         .collect();
 
     print_table(
-        &["INDEX", "ID", "BUFFER NAME", "TYPE", "SELF SIZE", "OWNER (RETAINER)"],
+        &[
+            "INDEX",
+            "ID",
+            "BUFFER NAME",
+            "TYPE",
+            "SELF SIZE",
+            "OWNER (RETAINER)",
+        ],
         &rows,
     );
 
     println!();
-    println!("  {}: use `hprof retainers --id <id> --depth 8` to inspect full retainer chains.", dim("tip"));
+    println!(
+        "  {}: use `hprof retainers --id <id> --depth 8` to inspect full retainer chains.",
+        dim("tip")
+    );
     println!();
 
     Ok(())

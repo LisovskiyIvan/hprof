@@ -69,13 +69,26 @@ pub fn run(file: &str, type_name: &str, args: &Args) -> Result<(), String> {
         .collect();
 
     print_table(
-        &["CATEGORY", "NAME / TARGET", "ID", "SIZE", "HEAP %", "ACTION / RECOMMENDATION"],
+        &[
+            "CATEGORY",
+            "NAME / TARGET",
+            "ID",
+            "SIZE",
+            "HEAP %",
+            "ACTION / RECOMMENDATION",
+        ],
         &rows,
     );
 
     println!();
-    println!("  {}: use `hprof inspect --id <id>` to view retention paths.", dim("tip"));
-    println!("  {}: use `hprof props --id <id>` to inspect fields and values.", dim("tip"));
+    println!(
+        "  {}: use `hprof inspect --id <id>` to view retention paths.",
+        dim("tip")
+    );
+    println!(
+        "  {}: use `hprof props --id <id>` to inspect fields and values.",
+        dim("tip")
+    );
     println!();
 
     Ok(())

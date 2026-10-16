@@ -69,16 +69,8 @@ pub fn run(file: &str, type_name: &str, args: &Args) -> Result<(), String> {
         }
     }
 
-    let target_index = if let Some(idx) = args.index {
-        Some(idx)
-    } else if let Some(id) = args.id {
-        let _note = WorkingNote::new("resolving node id…");
-        match snapshot.find_by_id(id).map_err(|e| e.to_string())? {
-            Some(idx) => Some(idx),
-            None => {
-                return Err(format!("no node with id {id} found in this snapshot"));
-            }
-        }
+    let target_index = if args.index.is_some() || args.id.is_some() {
+        Some(crate::props::resolve_target(&mut snapshot, args)?)
     } else {
         None
     };

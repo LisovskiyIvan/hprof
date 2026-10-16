@@ -192,8 +192,9 @@ fn timeline_columns_streaming(
         tasks.push((bs, be, t_head, n_head, s_head, d_head, &mut tot_head[0]));
     }
 
-    let ok = tasks.into_par_iter().all(
-        |(bs, be, out_t, out_n, out_s, out_d, out_tot)| {
+    let ok = tasks
+        .into_par_iter()
+        .all(|(bs, be, out_t, out_n, out_s, out_d, out_tot)| {
             let slice = &data[bs..be];
             let expected_recs = out_t.len();
             let mut i = 0usize;
@@ -238,8 +239,7 @@ fn timeline_columns_streaming(
             }
             *out_tot = chunk_total;
             out_i == expected_recs && field == 0
-        },
-    );
+        });
 
     if !ok {
         return None;

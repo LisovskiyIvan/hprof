@@ -512,12 +512,15 @@ fn compute_cumulative_summary(
             } => {
                 let fn_name = fn_name_of(node);
                 let url = url_of(node);
-                let frame_label = format!("{} @ {}:{}", fn_name, url, node.call_frame.line_number + 1);
+                let frame_label =
+                    format!("{} @ {}:{}", fn_name, url, node.call_frame.line_number + 1);
 
                 // Determine focus match for this node + path.
                 let node_matches_focus = match &focus_re {
                     None => true,
-                    Some(re) => re.is_match(&frame_label) || re.is_match(&url) || re.is_match(&fn_name),
+                    Some(re) => {
+                        re.is_match(&frame_label) || re.is_match(&url) || re.is_match(&fn_name)
+                    }
                 };
                 let path_has_match = has_focus_match_in_path || node_matches_focus;
 
@@ -529,7 +532,9 @@ fn compute_cumulative_summary(
                 if self_size > 0 && (focus_re.is_none() || path_has_match) {
                     let leaf_ignored = ignore_re
                         .as_ref()
-                        .map(|re| re.is_match(&frame_label) || re.is_match(&url) || re.is_match(&fn_name))
+                        .map(|re| {
+                            re.is_match(&frame_label) || re.is_match(&url) || re.is_match(&fn_name)
+                        })
                         .unwrap_or(false);
 
                     total_size += self_size;
@@ -537,7 +542,9 @@ fn compute_cumulative_summary(
                         *self_frame.entry(frame_label).or_insert(0) += self_size;
                         *self_url.entry(url).or_insert(0) += self_size;
                         *self_fn.entry(fn_name).or_insert(0) += self_size;
-                        *count_frame.entry(path_frames.last().unwrap().clone()).or_insert(0) += 1;
+                        *count_frame
+                            .entry(path_frames.last().unwrap().clone())
+                            .or_insert(0) += 1;
                     }
 
                     // Cumulative: each unique frame/url/fn on the path gets self_size once
@@ -1182,4 +1189,3 @@ mod tests {
         assert_eq!(foo_entry.cumulative_size, 100);
     }
 }
-

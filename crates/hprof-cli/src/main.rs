@@ -218,8 +218,7 @@ pub fn render_table(headers: &[&str], rows: &[Vec<String>], terminal_width: usiz
             .saturating_sub(2)
             .saturating_sub(padding_width)
             .max(1);
-        let header_widths: Vec<usize> =
-            headers.iter().map(|h| h.chars().count()).collect();
+        let header_widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
         let mut excess = widths.iter().sum::<usize>().saturating_sub(available);
         if excess > 0 {
             let mut order: Vec<usize> = (0..widths.len()).collect();
@@ -339,6 +338,36 @@ pub enum Command {
     Top,
     Ui,
     Help,
+}
+
+impl Command {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Command::Analyze => "analyze",
+            Command::Buffers => "buffers",
+            Command::Closures => "closures",
+            Command::Detached => "detached",
+            Command::Edges => "edges",
+            Command::Sizes => "sizes",
+            Command::Strings => "strings",
+            Command::Suspects => "suspects",
+            Command::Session => "session",
+            Command::Trend => "trend",
+            Command::Diff => "diff",
+            Command::Dot => "dot",
+            Command::List => "list",
+            Command::Inspect => "inspect",
+            Command::Find => "find",
+            Command::Props => "props",
+            Command::Retainers => "retainers",
+            Command::Owners => "owners",
+            Command::Calltree => "calltree",
+            Command::Flame => "flame",
+            Command::Top => "top",
+            Command::Ui => "ui",
+            Command::Help => "help",
+        }
+    }
 }
 
 pub struct Args {
@@ -739,6 +768,33 @@ fn main() -> ExitCode {
                 continue;
             }
         };
+        let expected = match args.command {
+            Command::Buffers
+            | Command::Closures
+            | Command::Detached
+            | Command::Edges
+            | Command::Sizes
+            | Command::Strings
+            | Command::Suspects
+            | Command::List
+            | Command::Inspect
+            | Command::Find
+            | Command::Props
+            | Command::Retainers => Some("heapsnapshot"),
+            Command::Calltree => Some("heapprofile"),
+            _ => None,
+        };
+        if let Some(exp) = expected {
+            if type_name != exp {
+                eprintln!(
+                    "  {} {} is only supported for .{exp} files",
+                    red("Error:"),
+                    args.command.name()
+                );
+                code = ExitCode::FAILURE;
+                continue;
+            }
+        }
 
         let result = match args.command {
             Command::Analyze => analyze::run(file, type_name, &args),
