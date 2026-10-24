@@ -1,5 +1,6 @@
 use memchr::memchr;
 use rayon::prelude::*;
+use std::collections::HashMap;
 
 use super::diff::{push_bounded_by_key, snapshot_object};
 use super::parser::{aligned_record_chunks_par, parse_numbers_par};
@@ -750,5 +751,278 @@ impl HeapSnapshot {
             total_retained,
             entries,
         })
+    }
+}
+
+// Source-map footprint: byte-signature scan for source-map data in the heap.
+// No map parsing — categories come from marker substrings only.
+const SMAP_NONE: u8 = 0;
+const SMAP_MAP_JSON: u8 = 1;
+const SMAP_INLINE_URI: u8 = 2;
+const SMAP_COMMENT: u8 = 3;
+
+// Known source-map library constructors (matched against node names).
+const SMAP_LIB_NAMES: [&str; 9] = [
+    "SourceMap",
+    "SourceMapConsumer",
+    "BasicSourceMapConsumer",
+    "IndexedSourceMapConsumer",
+    "SourceMapGenerator",
+    "SourceNode",
+    "SourceMapConsumerV3",
+    "MappingList",
+    "Mapping",
+];
+
+fn smap_category_name(cat: u8) -> &'static str {
+    match cat {
+        SMAP_MAP_JSON => "mapJson",
+        SMAP_INLINE_URI => "inlineUri",
+        _ => "comment",
+    }
+}
+
+/// Classify one raw (still JSON-escaped) string span. Prefilters on
+/// quote-free cores with `memmem` over the whole span, then decodes once and
+/// applies the exact markers with precedence mapJson > inlineUri > comment.
+fn classify_sourcemap_str(raw: &[u8]) -> u8 {
+    use memchr::memmem::find;
+    if find(raw, b"sourceMappingURL").is_none()
+        && find(raw, b"mappings").is_none()
+        && find(raw, b"sourcesContent").is_none()
+        && find(raw, b"version").is_none()
+    {
+        return SMAP_NONE;
+    }
+    let decoded = decode_json_string(raw);
+    if decoded.trim_start().starts_with("{\"version\":3")
+        || decoded.contains("\"mappings\":\"")
+        || decoded.contains("\"sourcesContent\"")
+    {
+        return SMAP_MAP_JSON;
+    }
+    if decoded.contains("sourceMappingURL=data:") {
+        return SMAP_INLINE_URI;
+    }
+    if decoded.contains("sourceMappingURL=") {
+        return SMAP_COMMENT;
+    }
+    SMAP_NONE
+}
+
+/// Preview text: decoded content truncated to ~80 chars, controls escaped.
+fn smap_preview(decoded: &str) -> String {
+    let mut out = String::with_capacity(80);
+    for c in decoded.chars().take(80) {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+impl HeapSnapshot {
+    /// Measure how much of the heap is source-map data. Dev builds keep big
+    /// maps in the heap; that share is a build artifact, not app memory.
+    pub fn sourcemap_footprint(&mut self, top: usize) -> crate::Result<SourceMapFootprint> {
+        self.ensure_raw()?;
+        self.ensure_raw_summary()?;
+        let raw = self.raw.as_ref().unwrap();
+        let heap_total_size = self.raw_summary.as_ref().unwrap().total_size;
+
+        // 1. per-string category over ALL spans, in parallel.
+        let (sbase, spans_guard) = raw.strings.all_spans(&raw.mmap);
+        let spans: &[(u32, u32)] = &spans_guard;
+        let mmap_bytes = &raw.mmap[..];
+        let cats: Vec<u8> = (0..spans.len())
+            .into_par_iter()
+            .map(|idx| {
+                let (s, e) = spans[idx];
+                classify_sourcemap_str(&mmap_bytes[sbase + s as usize..sbase + e as usize])
+            })
+            .collect();
+        drop(spans_guard);
+
+        let string_type = raw
+            .node_types
+            .iter()
+            .position(|t| t == "string")
+            .unwrap_or(usize::MAX);
+        let col = &raw.nodes;
+        let mut cat_bytes = [0usize; 4];
+        let mut cat_counts = [0usize; 4];
+        let mut per_string: HashMap<u32, (usize, usize)> = HashMap::new();
+        let mut lib: HashMap<String, (usize, usize)> = HashMap::new();
+
+        // 2-3. single pass over node columns.
+        for n in 0..raw.meta.node_count {
+            let size = col.self_sizes[n] as usize;
+            let name_idx = col.names[n];
+            if col.types[n] as usize == string_type {
+                if let Some(&cat) = cats.get(name_idx as usize) {
+                    if cat != SMAP_NONE {
+                        cat_bytes[cat as usize] += size;
+                        cat_counts[cat as usize] += 1;
+                        let e = per_string.entry(name_idx).or_insert((0, 0));
+                        e.0 += size;
+                        e.1 += 1;
+                    }
+                }
+            }
+            if let Some(name) = raw.strings.resolve(&raw.mmap, name_idx as usize) {
+                if SMAP_LIB_NAMES.contains(&name.as_str()) {
+                    let e = lib.entry(name).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += size;
+                }
+            }
+        }
+
+        let bytes: usize = cat_bytes[1..].iter().sum();
+        let count: usize = cat_counts[1..].iter().sum();
+        let share_pct = if heap_total_size == 0 {
+            0.0
+        } else {
+            bytes as f64 / heap_total_size as f64 * 100.0
+        };
+
+        let mut lib_objects: Vec<SourceMapLibEntry> = lib
+            .into_iter()
+            .map(|(name, (count, self_size))| SourceMapLibEntry {
+                name,
+                count,
+                self_size,
+            })
+            .collect();
+        lib_objects.sort_by(|a, b| {
+            b.self_size
+                .cmp(&a.self_size)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        let raw_ref = self.raw.as_ref().unwrap();
+        let mut top_strings: Vec<SourceMapStringEntry> = per_string
+            .iter()
+            .map(|(&idx, &(size, count))| {
+                let decoded = raw_ref
+                    .strings
+                    .resolve(&raw_ref.mmap, idx as usize)
+                    .unwrap_or_default();
+                SourceMapStringEntry {
+                    size,
+                    count,
+                    category: smap_category_name(cats[idx as usize]).to_string(),
+                    preview: smap_preview(&decoded),
+                }
+            })
+            .collect();
+        top_strings.sort_by(|a, b| {
+            b.size
+                .cmp(&a.size)
+                .then_with(|| b.count.cmp(&a.count))
+                .then_with(|| a.preview.cmp(&b.preview))
+        });
+        if top > 0 && top_strings.len() > top {
+            top_strings.truncate(top);
+        }
+
+        Ok(SourceMapFootprint {
+            heap_total_size,
+            bytes,
+            count,
+            share_pct,
+            map_json_bytes: cat_bytes[SMAP_MAP_JSON as usize],
+            map_json_count: cat_counts[SMAP_MAP_JSON as usize],
+            inline_uri_bytes: cat_bytes[SMAP_INLINE_URI as usize],
+            inline_uri_count: cat_counts[SMAP_INLINE_URI as usize],
+            comment_bytes: cat_bytes[SMAP_COMMENT as usize],
+            comment_count: cat_counts[SMAP_COMMENT as usize],
+            lib_objects,
+            top_strings,
+        })
+    }
+}
+
+#[cfg(test)]
+mod footprint_tests {
+    use super::*;
+
+    fn write_snapshot(name: &str, json: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "hprof_smap_{name}_{}.heapsnapshot",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, json).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn footprint_categories_and_lib() {
+        let json = r#"{"snapshot":{"meta":{
+            "node_fields":["type","name","id","self_size","edge_count","detachedness"],
+            "node_types":[["hidden","object","string"],"string","number","number","number","number"],
+            "edge_fields":["type","name_or_index","to_node"],
+            "edge_types":[["property"]],
+            "trace_function_info_fields":["function_id","name","script_name","script_id","line","column"],
+            "trace_node_fields":["id","function_info_index","count","size","children"],
+            "sample_fields":["timestamp_us","last_assigned_id"],
+            "location_fields":["object_index","script_id","line","column"]
+        },"node_count":5,"edge_count":0},
+        "nodes":[2,1,1,1000,0,0, 2,2,2,500,0,0, 2,3,3,32,0,0, 1,4,4,16,0,0, 2,5,5,64,0,0],
+        "edges":[],
+        "strings":["","{\"version\":3,\"sources\":[\"a.ts\"],\"mappings\":\"AAAA\"}","//# sourceMappingURL=data:application/json;base64,AAAA","//# sourceMappingURL=app.js.map","SourceMapConsumer","hello mappings and sourcesContent-ish"]}"#;
+        let path = write_snapshot("foot", json);
+        let mut snap = HeapSnapshot::new(path.clone());
+        let fp = snap.sourcemap_footprint(10).unwrap();
+
+        assert_eq!(fp.heap_total_size, 1612);
+        assert_eq!(fp.bytes, 1532);
+        assert_eq!(fp.count, 3);
+        assert!((fp.share_pct - 1532.0 / 1612.0 * 100.0).abs() < 1e-9);
+        assert_eq!((fp.map_json_bytes, fp.map_json_count), (1000, 1));
+        assert_eq!((fp.inline_uri_bytes, fp.inline_uri_count), (500, 1));
+        assert_eq!((fp.comment_bytes, fp.comment_count), (32, 1));
+        assert_eq!(fp.lib_objects.len(), 1);
+        assert_eq!(fp.lib_objects[0].name, "SourceMapConsumer");
+        assert_eq!(fp.lib_objects[0].count, 1);
+        assert_eq!(fp.lib_objects[0].self_size, 16);
+        assert_eq!(fp.top_strings.len(), 3);
+        assert_eq!(fp.top_strings[0].size, 1000);
+        assert_eq!(fp.top_strings[0].category, "mapJson");
+        assert_eq!(fp.top_strings[1].category, "inlineUri");
+        assert_eq!(fp.top_strings[2].category, "comment");
+        assert!(!fp.top_strings[0].preview.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn footprint_empty_snapshot() {
+        let json = r#"{"snapshot":{"meta":{
+            "node_fields":["type","name","id","self_size","edge_count","detachedness"],
+            "node_types":[["hidden","object","string"],"string","number","number","number","number"],
+            "edge_fields":["type","name_or_index","to_node"],
+            "edge_types":[["property"]],
+            "trace_function_info_fields":[],
+            "trace_node_fields":[],
+            "sample_fields":[],
+            "location_fields":[]
+        },"node_count":1,"edge_count":0},
+        "nodes":[1,1,1,8,0,0],
+        "edges":[],
+        "strings":["","plain"]}"#;
+        let path = write_snapshot("empty", json);
+        let mut snap = HeapSnapshot::new(path.clone());
+        let fp = snap.sourcemap_footprint(10).unwrap();
+        assert_eq!(fp.bytes, 0);
+        assert_eq!(fp.count, 0);
+        assert_eq!(fp.share_pct, 0.0);
+        assert!(fp.lib_objects.is_empty() && fp.top_strings.is_empty());
+        let _ = std::fs::remove_file(&path);
     }
 }

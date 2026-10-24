@@ -361,25 +361,21 @@ impl HeapSnapshot {
         self.ensure_retained()?;
         let raw = self.raw.as_ref().unwrap();
         let rd = self.retained_data.as_ref().unwrap();
-        let mut indexed: Vec<(usize, usize)> = Vec::with_capacity(top_n);
+        let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(usize, usize)>> =
+            std::collections::BinaryHeap::with_capacity(top_n + 1);
         for (idx, &size) in rd.retained.iter().enumerate() {
             if size <= 0.0 {
                 continue;
             }
-            if indexed.len() < top_n {
-                indexed.push((idx, size as usize));
-                continue;
-            }
-            let mut worst = 0usize;
-            for i in 1..indexed.len() {
-                if indexed[i].1 < indexed[worst].1 {
-                    worst = i;
-                }
-            }
-            if size as usize > indexed[worst].1 {
-                indexed[worst] = (idx, size as usize);
+            let size = size as usize;
+            if heap.len() < top_n {
+                heap.push(std::cmp::Reverse((size, idx)));
+            } else if size > heap.peek().unwrap().0 .0 {
+                heap.pop();
+                heap.push(std::cmp::Reverse((size, idx)));
             }
         }
+        let mut indexed: Vec<(usize, usize)> = heap.into_iter().map(|r| (r.0 .1, r.0 .0)).collect();
         indexed.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         Ok(RetainedResult {

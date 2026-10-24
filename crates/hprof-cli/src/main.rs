@@ -20,6 +20,7 @@ mod owners;
 mod props;
 mod retainers;
 mod session;
+mod smaps;
 mod sizes;
 mod strings;
 mod suspects;
@@ -335,6 +336,7 @@ pub enum Command {
     Owners,
     Calltree,
     Flame,
+    Smaps,
     Top,
     Ui,
     Help,
@@ -363,6 +365,7 @@ impl Command {
             Command::Owners => "owners",
             Command::Calltree => "calltree",
             Command::Flame => "flame",
+            Command::Smaps => "smaps",
             Command::Top => "top",
             Command::Ui => "ui",
             Command::Help => "help",
@@ -439,90 +442,187 @@ impl Default for Args {
     }
 }
 
-fn parse_args(argv: &[String]) -> Args {
+/// Parse a human-readable byte size: plain integer bytes, or a number with a
+/// case-insensitive suffix: `b`, `k`/`kb`/`kib` = 1024, `m`/`mb`/`mib` =
+/// 1024², `g`/`gb`/`gib` = 1024³. No floats; `None` on garbage/overflow.
+pub fn parse_size(s: &str) -> Option<usize> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, suffix) = s.split_at(split);
+    if num.is_empty() {
+        return None;
+    }
+    let n: usize = num.parse().ok()?;
+    let mult: usize = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    n.checked_mul(mult)
+}
+
+/// Look at `argv[pos]` (the token after a value-taking flag) without
+/// consuming it. `Ok` when it exists and does not start with `--` (values
+/// starting with a single `-` are allowed, e.g. regexes); `Err` otherwise.
+fn flag_value(argv: &[String], pos: usize, flag: &str) -> Result<String, String> {
+    match argv.get(pos) {
+        Some(v) if !v.starts_with("--") => Ok(v.clone()),
+        _ => Err(format!("  Error: option --{flag} requires a value")),
+    }
+}
+
+/// Parse a numeric flag value; `Err` carries the already-formatted message.
+fn parse_usize_flag(flag: &str, value: &str) -> Result<usize, String> {
+    value
+        .parse()
+        .map_err(|_| format!("  Error: invalid value for --{flag}: {value}"))
+}
+
+pub(crate) fn parse_args(argv: &[String]) -> Args {
     let mut args = Args::default();
     let mut i = 0;
     while i < argv.len() {
         let arg = &argv[i];
-        let next = |i: &mut usize| {
-            *i += 1;
-            argv.get(*i).cloned()
-        };
         match arg.as_str() {
             "--top" => {
                 args.top_explicit = true;
-                if let Some(v) = next(&mut i) {
-                    args.top = v.parse().unwrap_or(args.top);
-                }
+                let v = flag_value(argv, i + 1, "top").unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                i += 1;
+                args.top = parse_usize_flag("top", &v).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
             }
             "--filter" => {
-                if let Some(v) = next(&mut i) {
-                    args.filter = Some(v);
-                }
+                let v = flag_value(argv, i + 1, "filter").unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                i += 1;
+                args.filter = Some(v);
             }
             "--focus" => {
-                if let Some(v) = next(&mut i) {
-                    args.focus = Some(v);
-                }
+                let v = flag_value(argv, i + 1, "focus").unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                i += 1;
+                args.focus = Some(v);
             }
             "--ignore" => {
-                if let Some(v) = next(&mut i) {
-                    args.ignore = Some(v);
-                }
+                let v = flag_value(argv, i + 1, "ignore").unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                i += 1;
+                args.ignore = Some(v);
             }
             "--hide" => {
-                if let Some(v) = next(&mut i) {
-                    args.hide = Some(v);
-                }
+                let v = flag_value(argv, i + 1, "hide").unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                i += 1;
+                args.hide = Some(v);
             }
             "--cum" => args.cum = true,
             "--json" => args.json = true,
             "--retained" => args.retained = true,
             "--name" => {
-                if let Some(v) = next(&mut i) {
-                    args.name = Some(v);
-                }
+                let v = flag_value(argv, i + 1, "name").unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                i += 1;
+                args.name = Some(v);
             }
             "--id" => {
-                if let Some(v) = next(&mut i) {
-                    args.id = v.parse().ok();
-                }
+                let v = flag_value(argv, i + 1, "id").unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                i += 1;
+                args.id = Some(parse_usize_flag("id", &v).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }));
             }
             "--index" => {
-                if let Some(v) = next(&mut i) {
-                    args.index = v.parse().ok();
-                }
+                let v = flag_value(argv, i + 1, "index").unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                i += 1;
+                args.index = Some(parse_usize_flag("index", &v).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }));
             }
             "--min-self" => {
-                if let Some(v) = next(&mut i) {
-                    args.min_self = v.parse().unwrap_or(0);
-                }
+                let v = flag_value(argv, i + 1, "min-self").unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                i += 1;
+                args.min_self = parse_size(&v).unwrap_or_else(|| {
+                    eprintln!("  Error: invalid value for --min-self: {v}");
+                    std::process::exit(1);
+                });
             }
             "--depth" => {
-                if let Some(v) = next(&mut i) {
-                    args.depth = v.parse().ok();
-                }
+                let v = flag_value(argv, i + 1, "depth").unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                i += 1;
+                args.depth = Some(parse_usize_flag("depth", &v).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }));
             }
             "--exact" => args.exact = true,
             "--type" => {
-                if let Some(v) = next(&mut i) {
-                    args.node_type = Some(v);
-                }
+                let v = flag_value(argv, i + 1, "type").unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                i += 1;
+                args.node_type = Some(v);
             }
             "--edge-type" => {
-                if let Some(v) = next(&mut i) {
-                    args.edge_type = Some(v);
-                }
+                let v = flag_value(argv, i + 1, "edge-type").unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                i += 1;
+                args.edge_type = Some(v);
             }
             "--url" => {
-                if let Some(v) = next(&mut i) {
-                    args.url = Some(v);
-                }
+                let v = flag_value(argv, i + 1, "url").unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                i += 1;
+                args.url = Some(v);
             }
             "--port" => {
-                if let Some(v) = next(&mut i) {
-                    args.port = v.parse().unwrap_or(args.port);
-                }
+                let v = flag_value(argv, i + 1, "port").unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                i += 1;
+                args.port = v.parse().unwrap_or_else(|_| {
+                    eprintln!("  Error: invalid value for --port: {v}");
+                    std::process::exit(1);
+                });
             }
             "--open" => args.open = true,
             "analyze" => args.command = Command::Analyze,
@@ -545,6 +645,7 @@ fn parse_args(argv: &[String]) -> Args {
             "owners" => args.command = Command::Owners,
             "calltree" => args.command = Command::Calltree,
             "flame" => args.command = Command::Flame,
+            "smaps" | "sourcemaps" => args.command = Command::Smaps,
             "top" => args.command = Command::Top,
             "ui" => args.command = Command::Ui,
             "help" => args.command = Command::Help,
@@ -562,6 +663,9 @@ fn parse_args(argv: &[String]) -> Args {
             _ => args.files.push(arg.clone()),
         }
         i += 1;
+    }
+    if args.top == 0 {
+        args.top = usize::MAX;
     }
     args
 }
@@ -592,11 +696,12 @@ fn print_usage() {
     {c}owners{r}    Heap snapshot: group nodes by owner chain, diff across snapshots
     {c}calltree{r}  Inclusive call tree for a sampling profile (heapprofile)
     {c}flame{r}     Folded stacks (a;b;c <size>) for flamegraph.pl / speedscope
+    {c}smaps{r}     Source-map data share in heap snapshots (dev artifact, not app memory)
     {c}top{r}       Largest individual heap nodes by retained size
     {c}help{r}      Show this help message
 
  {b}Options:{r}
-   {y}--top <n>{r}       Number of top entries to show (default: 30; {y}0{r} = all in find/owners)
+   {y}--top <n>{r}       Number of top entries to show (default: 30; 0 = all)
    {y}--filter <re>{r}   Filter results by regex (timeline: names + stacks)
    {y}--focus <re>{r}    pprof-style focus: only frames matching contribute
    {y}--ignore <re>{r}   pprof-style ignore: drop flat attribution for matches
@@ -607,7 +712,7 @@ fn print_usage() {
    {y}--name <name>{r}    find/inspect/owners: node name to match (regex for inspect,
                           plain substring/exact for find/owners)
     {y}--exact{r}          find/owners: exact name; top: force exact dominators
-   {y}--min-self <bytes>{r} find/owners: only nodes with self_size >= N
+   {y}--min-self <size>{r} find/owners: only nodes with self_size >= N (suffixes: b/kb/mb/gb, e.g. 1mb)
      {y}--type <t>{r}       find/edges: filter node type (object, string, ...)
     {y}--edge-type <t>{r}  edges: only V8 edges of this type (property, element, ...)
    {y}--id <n>{r}         inspect/props/retainers: address a node by DevTools id
@@ -775,6 +880,7 @@ fn main() -> ExitCode {
             | Command::Edges
             | Command::Sizes
             | Command::Strings
+            | Command::Smaps
             | Command::Suspects
             | Command::List
             | Command::Inspect
@@ -804,6 +910,7 @@ fn main() -> ExitCode {
             Command::Edges => edges::run(file, type_name, &args),
             Command::Sizes => sizes::run(file, type_name, &args),
             Command::Strings => strings::run(file, type_name, &args),
+            Command::Smaps => smaps::run(file, type_name, &args),
             Command::Suspects => suspects::run(file, type_name, &args),
             Command::Dot => dot::run(file, type_name, &args),
             Command::List => list::run(file, type_name, &args),
@@ -886,5 +993,61 @@ mod tests {
         ];
         let out = render_table(&headers, &rows, 120);
         assert_eq!(out, "  A     B\n  ───────\n  x     y\n  long  z\n\n");
+    }
+
+    #[test]
+    fn parse_size_cases() {
+        assert_eq!(parse_size("0"), Some(0));
+        assert_eq!(parse_size("1024"), Some(1024));
+        assert_eq!(parse_size("1b"), Some(1));
+        assert_eq!(parse_size("1B"), Some(1));
+        assert_eq!(parse_size("1k"), Some(1024));
+        assert_eq!(parse_size("2KB"), Some(2048));
+        assert_eq!(parse_size("1kib"), Some(1024));
+        assert_eq!(parse_size("1m"), Some(1024 * 1024));
+        assert_eq!(parse_size("1mb"), Some(1024 * 1024));
+        assert_eq!(parse_size("2MiB"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_size("1g"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_size("1GB"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_size(" 1mb "), Some(1024 * 1024));
+        assert_eq!(parse_size(""), None);
+        assert_eq!(parse_size("mb"), None);
+        assert_eq!(parse_size("1.5mb"), None);
+        assert_eq!(parse_size("-5"), None);
+        assert_eq!(parse_size("10xb"), None);
+        assert_eq!(parse_size("abc"), None);
+    }
+
+    #[test]
+    fn flag_value_requires_value() {
+        let argv: Vec<String> = vec!["--top".to_string()];
+        assert_eq!(
+            flag_value(&argv, 1, "top"),
+            Err("  Error: option --top requires a value".to_string())
+        );
+        let argv: Vec<String> = vec!["--top".to_string(), "--json".to_string()];
+        assert!(flag_value(&argv, 1, "top").is_err());
+        let argv: Vec<String> = vec!["--filter".to_string(), "-foo.*".to_string()];
+        assert_eq!(flag_value(&argv, 1, "filter").unwrap(), "-foo.*");
+        let argv: Vec<String> = vec!["--top".to_string(), "10".to_string()];
+        assert_eq!(flag_value(&argv, 1, "top").unwrap(), "10");
+    }
+
+    #[test]
+    fn parse_usize_flag_rejects_garbage() {
+        assert_eq!(parse_usize_flag("top", "10"), Ok(10));
+        assert!(parse_usize_flag("top", "abc").is_err());
+        assert_eq!(
+            parse_usize_flag("top", "abc"),
+            Err("  Error: invalid value for --top: abc".to_string())
+        );
+    }
+
+    #[test]
+    fn top_zero_means_all() {
+        let argv: Vec<String> = vec!["--top".to_string(), "0".to_string()];
+        assert_eq!(parse_args(&argv).top, usize::MAX);
+        let argv: Vec<String> = vec!["--top".to_string(), "5".to_string()];
+        assert_eq!(parse_args(&argv).top, 5);
     }
 }

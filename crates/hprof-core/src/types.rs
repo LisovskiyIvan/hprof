@@ -406,6 +406,13 @@ pub struct TimelineGrowth {
 }
 
 pub fn detect_profile_type(path: &str) -> crate::Result<&'static str> {
+    // Content sniffing first: read the first 64KB and match V8 markers.
+    // A heapsnapshot/heaptimeline candidate is disambiguated via the last
+    // 1MB (`trace_function_infos`/`trace_tree` only exist in timelines).
+    // When sniffing is inconclusive, fall back to the extension match.
+    if let Some(sniffed) = sniff_profile_type(path)? {
+        return Ok(sniffed);
+    }
     let ext = path.rsplit('.').next().unwrap_or("");
     match ext {
         "heapsnapshot" => Ok("heapsnapshot"),
@@ -413,6 +420,37 @@ pub fn detect_profile_type(path: &str) -> crate::Result<&'static str> {
         "heaptimeline" => Ok("heaptimeline"),
         _ => Err(Error::UnsupportedType(ext.to_string())),
     }
+}
+
+fn sniff_profile_type(path: &str) -> crate::Result<Option<&'static str>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let mut head = vec![0u8; 64 * 1024];
+    let n = file.read(&mut head)?;
+    head.truncate(n);
+    let has_head = contains(&head, b"\"head\":");
+    let has_call_frame = contains(&head, b"callFrame");
+    if has_head && has_call_frame {
+        return Ok(Some("heapprofile"));
+    }
+    let has_snapshot = contains(&head, b"\"snapshot\":");
+    let has_nodes = contains(&head, b"\"nodes\":[");
+    if has_snapshot && has_nodes {
+        let len = file.metadata()?.len();
+        let tail_len = len.min(1024 * 1024) as usize;
+        let mut tail = vec![0u8; tail_len];
+        file.seek(SeekFrom::End(-(tail_len as i64)))?;
+        file.read_exact(&mut tail)?;
+        if contains(&tail, b"trace_function_infos") || contains(&tail, b"trace_tree") {
+            return Ok(Some("heaptimeline"));
+        }
+        return Ok(Some("heapsnapshot"));
+    }
+    Ok(None)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 pub fn format_bytes(bytes: usize) -> String {
@@ -631,6 +669,50 @@ pub struct StringStats {
     pub referenced_strings: usize,
     pub referenced_bytes: usize,
     pub entries: Vec<StringStatEntry>,
+}
+
+// ============================================================================
+// Source-map footprint: how much of the heap is source-map data
+// ============================================================================
+
+/// One known source-map library constructor found in the heap.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceMapLibEntry {
+    pub name: String,
+    pub count: usize,
+    pub self_size: usize,
+}
+
+/// One string-table entry holding source-map data.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceMapStringEntry {
+    pub size: usize,
+    pub count: usize,
+    /// "mapJson" | "inlineUri" | "comment"
+    pub category: String,
+    /// decoded content truncated to ~80 chars, control chars escaped
+    pub preview: String,
+}
+
+/// Byte-signature scan of a heap snapshot for source-map data. Dev builds
+/// keep big maps in the heap; that share is a build artifact, not app memory.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceMapFootprint {
+    pub heap_total_size: usize,
+    pub bytes: usize,
+    pub count: usize,
+    pub share_pct: f64,
+    pub map_json_bytes: usize,
+    pub map_json_count: usize,
+    pub inline_uri_bytes: usize,
+    pub inline_uri_count: usize,
+    pub comment_bytes: usize,
+    pub comment_count: usize,
+    pub lib_objects: Vec<SourceMapLibEntry>,
+    pub top_strings: Vec<SourceMapStringEntry>,
 }
 
 // ============================================================================
@@ -887,4 +969,62 @@ pub struct ClosureAnalysis {
     pub total_closures: usize,
     pub total_retained: usize,
     pub entries: Vec<ClosureEntry>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_temp(name: &str, contents: &str) -> String {
+        let path = std::env::temp_dir().join(format!("hprof_detect_{name}"));
+        std::fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn sniff_heapprofile_by_content() {
+        let json = r#"{"head":{"callFrame":{"functionName":"f","scriptId":"1","url":"a.js","lineNumber":0,"columnNumber":0},"selfSize":10,"children":[]},"startTime":0,"endTime":1}"#;
+        // Wrong extension on purpose: content must win.
+        let p = write_temp("sniff_profile.heapsnapshot", json);
+        assert_eq!(detect_profile_type(&p).unwrap(), "heapprofile");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn sniff_heapsnapshot_by_content() {
+        let json = r#"{"snapshot":{"meta":{},"node_count":0,"edge_count":0},"nodes":[],"edges":[],"strings":[]}"#;
+        let p = write_temp("sniff_snapshot.heapprofile", json);
+        assert_eq!(detect_profile_type(&p).unwrap(), "heapsnapshot");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn sniff_heaptimeline_by_content() {
+        let mut json = String::from(
+            r#"{"snapshot":{"meta":{},"node_count":0,"edge_count":0},"nodes":[],"trace_function_infos":[],"trace_tree":[]}"#,
+        );
+        json.push_str(&" ".repeat(1024));
+        let p = write_temp("sniff_timeline.heapsnapshot", &json);
+        assert_eq!(detect_profile_type(&p).unwrap(), "heaptimeline");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn sniff_extensionless_and_junk() {
+        let json = r#"{"snapshot":{"meta":{},"node_count":0,"edge_count":0},"nodes":[],"edges":[],"strings":[]}"#;
+        let p = write_temp("sniff_noext", json);
+        assert_eq!(detect_profile_type(&p).unwrap(), "heapsnapshot");
+        let _ = std::fs::remove_file(&p);
+
+        let p = write_temp("sniff_junk.txt", "this is not a profile");
+        assert!(detect_profile_type(&p).is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn missing_file_propagates_io_error() {
+        let p = std::env::temp_dir().join("hprof_detect_missing_file.heapsnapshot");
+        let _ = std::fs::remove_file(&p);
+        assert!(detect_profile_type(&p.to_string_lossy()).is_err());
+    }
 }

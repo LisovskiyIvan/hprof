@@ -471,34 +471,9 @@ fn stack_frames(data: &TimelineData, ti: usize) -> Vec<TimelineStackFrame> {
 }
 
 /// Ancestor chain of function names for trace node `ti` (root first).
-/// Allocation-only variant of `stack_frames` used by `folded_stacks`.
+/// Used by `folded_stacks`.
 fn stack_names(data: &TimelineData, ti: usize) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    let mut cur = Some(ti);
-    let mut guard = 0;
-    while let Some(ci) = cur {
-        let (fii, parent) = match data.trace_nodes.get(ci) {
-            Some(tn) => (tn.func_idx, tn.parent),
-            None => break,
-        };
-        let name_idx = match data.trace_infos.get(fii as usize) {
-            Some(info) => info.name_idx,
-            None => 0,
-        };
-        let name = if name_idx == 0 {
-            "(root)".to_string()
-        } else {
-            resolve_string(data, name_idx)
-        };
-        names.push(name);
-        cur = parent;
-        guard += 1;
-        if guard > 128 {
-            break;
-        }
-    }
-    names.reverse();
-    names
+    stack_frames(data, ti).into_iter().map(|f| f.name).collect()
 }
 
 pub struct HeapTimeline {
@@ -690,7 +665,7 @@ impl HeapTimeline {
             let frames = match stack_memo.get(&ti) {
                 Some(f) => f.clone(),
                 None => {
-                    let f = stack_frames(self.data.as_mut().unwrap(), ti);
+                    let f = stack_frames(self.data.as_ref().unwrap(), ti);
                     stack_memo.insert(ti, f.clone());
                     f
                 }
@@ -749,7 +724,7 @@ impl HeapTimeline {
             if size == 0 {
                 continue;
             }
-            let names = stack_names(self.data.as_mut().unwrap(), ti);
+            let names = stack_names(self.data.as_ref().unwrap(), ti);
             *agg.entry(names).or_insert(0) += size as u64;
         }
         let mut entries: Vec<(Vec<String>, u64)> = agg.into_iter().collect();
@@ -796,7 +771,8 @@ impl HeapTimeline {
         let mut total_size = 0u64;
         let mut total_count = 0u64;
         {
-            let data = self.data()?;
+            let _ = self.data()?;
+            let data = self.data.as_ref().unwrap();
             for i in 0..data.node_count {
                 if !matching.contains(&data.names[i]) {
                     continue;

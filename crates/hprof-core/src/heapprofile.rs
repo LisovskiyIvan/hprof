@@ -113,7 +113,7 @@ impl HeapProfile {
                 let u = url_of(node);
                 if u.to_lowercase().contains(&url) {
                     total_size += self_size;
-                    *by_frame.entry(frame_label(node)).or_insert(0) += self_size;
+                    *by_frame.entry(frame_label(&node.call_frame)).or_insert(0) += self_size;
                     *by_url.entry(u).or_insert(0) += self_size;
                     *by_function.entry(fn_name_of(node)).or_insert(0) += self_size;
                 }
@@ -338,18 +338,24 @@ impl HeapProfile {
 // concurrently on the same Arc-ed tree.
 // ============================================================================
 
-fn frame_label(node: &HeapProfileNode) -> String {
-    let fn_name = if node.call_frame.function_name.is_empty() {
+fn frame_label(cf: &CallFrame) -> String {
+    let fn_name = if cf.function_name.is_empty() {
         "(anonymous)".to_string()
     } else {
-        node.call_frame.function_name.clone()
+        cf.function_name.clone()
     };
-    let url = if node.call_frame.url.is_empty() {
+    let url = if cf.url.is_empty() {
         "<no-url>".to_string()
     } else {
-        node.call_frame.url.clone()
+        cf.url.clone()
     };
-    format!("{} @ {}:{}", fn_name, url, node.call_frame.line_number + 1)
+    format!(
+        "{} @ {}:{}:{}",
+        fn_name,
+        url,
+        cf.line_number + 1,
+        cf.column_number + 1
+    )
 }
 
 fn fn_name_of(node: &HeapProfileNode) -> String {
@@ -381,7 +387,7 @@ fn compute_flat_summary(data: &HeapProfileResult) -> crate::Result<HeapProfileSu
     while let Some(node) = stack.pop() {
         let self_size = node.self_size;
         if self_size > 0 {
-            let frame = frame_label(node);
+            let frame = frame_label(&node.call_frame);
             let url = url_of(node);
             let fn_name = fn_name_of(node);
             total_size += self_size;
@@ -512,8 +518,7 @@ fn compute_cumulative_summary(
             } => {
                 let fn_name = fn_name_of(node);
                 let url = url_of(node);
-                let frame_label =
-                    format!("{} @ {}:{}", fn_name, url, node.call_frame.line_number + 1);
+                let frame_label = frame_label(&node.call_frame);
 
                 // Determine focus match for this node + path.
                 let node_matches_focus = match &focus_re {
@@ -591,7 +596,7 @@ fn compute_cumulative_summary(
 fn walk_flatten(node: &HeapProfileNode, stack: &[String], result: &mut Vec<FlatCallFrame>) {
     let fn_name = fn_name_of(node);
     let url = url_of(node);
-    let frame = format!("{} @ {}:{}", fn_name, url, node.call_frame.line_number + 1);
+    let frame = frame_label(&node.call_frame);
     let mut next_stack = stack.to_vec();
     next_stack.push(frame);
 
@@ -627,7 +632,7 @@ fn build_flame_frame(
 
     let fn_name = fn_name_of(node);
     let url = url_of(node);
-    let name = format!("{} @ {}:{}", fn_name, url, node.call_frame.line_number + 1);
+    let name = frame_label(&node.call_frame);
 
     let is_hidden = hide_re
         .map(|re| re.is_match(&fn_name) || re.is_match(&url) || re.is_match(&name))
@@ -681,12 +686,7 @@ fn build_flame_frame(
 fn matches(node: &HeapProfileNode, re: &regex::Regex) -> bool {
     re.is_match(&node.call_frame.function_name)
         || re.is_match(&node.call_frame.url)
-        || re.is_match(&format!(
-            "{} @ {}:{}",
-            node.call_frame.function_name,
-            node.call_frame.url,
-            node.call_frame.line_number + 1
-        ))
+        || re.is_match(&frame_label(&node.call_frame))
 }
 
 fn subtree_contains_match(node: &HeapProfileNode, re: &regex::Regex) -> bool {
@@ -709,7 +709,7 @@ fn walk_collect(
     node_sizes: &mut HashMap<String, usize>,
     edges: &mut HashMap<(String, String), usize>,
 ) {
-    let name = frame_label(node);
+    let name = frame_label(&node.call_frame);
     *node_sizes.entry(name.clone()).or_insert(0) += node.self_size;
     if let Some(p) = parent_name {
         *edges.entry((p.to_string(), name.clone())).or_insert(0) += node.self_size;
@@ -724,7 +724,7 @@ fn mark_subtree_match(
     re: &regex::Regex,
     kept: &mut std::collections::HashSet<String>,
 ) -> bool {
-    let name = frame_label(node);
+    let name = frame_label(&node.call_frame);
     let mut hit = re.is_match(&name);
     for c in &node.children {
         hit |= mark_subtree_match(c, re, kept);

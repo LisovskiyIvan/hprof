@@ -84,7 +84,7 @@ impl RawData {
             return;
         }
         let efc = self.edge_field_count;
-        if efc == 0 {
+        if efc == 0 || efc > 8 {
             return;
         }
         let type_off = self.edge_offsets.type_;
@@ -300,31 +300,31 @@ impl HeapSnapshot {
                 let flat = parse_numbers_par(nodes_bytes);
                 let types: Vec<u8> = flat
                     .par_chunks(node_field_count)
-                    .map(|r| r[node_offsets.type_] as u8)
+                    .map(|r| r.get(node_offsets.type_).copied().unwrap_or(0) as u8)
                     .collect();
                 let names: Vec<u32> = flat
                     .par_chunks(node_field_count)
-                    .map(|r| r[node_offsets.name])
+                    .map(|r| r.get(node_offsets.name).copied().unwrap_or(0))
                     .collect();
                 let ids: Vec<u32> = flat
                     .par_chunks(node_field_count)
-                    .map(|r| r[node_offsets.id])
+                    .map(|r| r.get(node_offsets.id).copied().unwrap_or(0))
                     .collect();
                 let self_sizes: Vec<u32> = flat
                     .par_chunks(node_field_count)
-                    .map(|r| r[node_offsets.self_size])
+                    .map(|r| r.get(node_offsets.self_size).copied().unwrap_or(0))
                     .collect();
                 let edge_counts: Vec<u32> = flat
                     .par_chunks(node_field_count)
-                    .map(|r| r[node_offsets.edge_count])
+                    .map(|r| r.get(node_offsets.edge_count).copied().unwrap_or(0))
                     .collect();
                 let detachedness: Vec<u8> = flat
                     .par_chunks(node_field_count)
                     .map(|r| {
                         node_offsets
                             .detachedness
-                            .map(|offset| r[offset] as u8)
-                            .unwrap_or(0)
+                            .and_then(|offset| r.get(offset).copied())
+                            .unwrap_or(0) as u8
                     })
                     .collect();
                 drop(flat);
@@ -534,17 +534,17 @@ impl HeapSnapshot {
                     local_count += 1;
                     local_size += self_size;
 
+                    let type_idx = col.types[n] as usize;
+                    if type_idx >= local_by_type.len() {
+                        local_by_type.resize(type_idx + 1, (0, 0));
+                    }
+                    local_by_type[type_idx].0 += self_size;
+                    local_by_type[type_idx].1 += 1;
                     if self_size > 0 {
-                        let type_idx = col.types[n] as usize;
                         let name_idx = col.names[n];
                         let e = local_by_name.entry(name_idx).or_insert((0, 0));
                         e.0 += self_size;
                         e.1 += 1;
-                        if type_idx >= local_by_type.len() {
-                            local_by_type.resize(type_idx + 1, (0, 0));
-                        }
-                        local_by_type[type_idx].0 += self_size;
-                        local_by_type[type_idx].1 += 1;
                     }
                 }
                 (local_size, local_count, local_by_name, local_by_type)
@@ -1577,6 +1577,45 @@ mod tests {
         let closures = snap.closure_analysis(10).unwrap();
         assert_eq!(closures.total_closures, 1);
         assert_eq!(closures.entries[0].name, "myClosure");
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod by_type_counts_tests {
+    use super::*;
+
+    #[test]
+    fn zero_self_size_nodes_count_toward_by_type() {
+        // Node 1: hidden, self 0. Node 2: object "A", self 10.
+        let json = r#"{"snapshot":{"meta":{
+            "node_fields":["type","name","id","self_size","edge_count","detachedness"],
+            "node_types":[["hidden","object","synthetic"],"string","number","number","number","number"],
+            "edge_fields":["type","name_or_index","to_node"],
+            "edge_types":[["property"],"string_or_number","node"]
+        },"node_count":3,"edge_count":0},
+        "nodes":[2,0,0,0,0,0, 0,1,1,0,0,0, 1,2,2,10,0,0],
+        "edges":[],
+        "strings":["","","A"]}"#;
+        let path = std::env::temp_dir().join(format!(
+            "hprof_zero_type_{}.heapsnapshot",
+            std::process::id()
+        ));
+        std::fs::write(&path, json).unwrap();
+
+        let mut snap = HeapSnapshot::new(path.to_string_lossy().into_owned());
+        let summary = snap.stream_summary(usize::MAX, None).unwrap();
+        assert_eq!(summary.total_count, 3);
+        assert_eq!(summary.total_size, 10);
+        let hidden = summary.by_node_type.get("hidden").unwrap();
+        assert_eq!(hidden.count, 1);
+        assert_eq!(hidden.size, 0);
+        let object = summary.by_node_type.get("object").unwrap();
+        assert_eq!(object.count, 1);
+        assert_eq!(object.size, 10);
+        // Zero-size rows stay out of the name table (string-table cardinality).
+        assert!(!summary.by_node_name.values().any(|t| t.size == 0));
 
         let _ = std::fs::remove_file(&path);
     }

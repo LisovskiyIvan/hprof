@@ -55,18 +55,15 @@ fn analyze_heapprofile(file: &str, args: &Args) -> Result<(), String> {
                     "count": e.count,
                 })
             };
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "file": file,
-                    "type": "heapprofile",
-                    "totalSize": summary.total_size,
-                    "byFrame": sorted_entries(&summary.by_frame).into_iter().map(entry).collect::<Vec<_>>(),
-                    "byUrl": sorted_entries(&summary.by_url).into_iter().map(entry).collect::<Vec<_>>(),
-                    "byFunction": sorted_entries(&summary.by_function).into_iter().map(entry).collect::<Vec<_>>(),
-                }))
-                .unwrap()
-            );
+            let obj = json!({
+                "file": file,
+                "type": "heapprofile",
+                "totalSize": summary.total_size,
+                "byFrame": sorted_entries(&summary.by_frame).into_iter().map(entry).collect::<Vec<_>>(),
+                "byUrl": sorted_entries(&summary.by_url).into_iter().map(entry).collect::<Vec<_>>(),
+                "byFunction": sorted_entries(&summary.by_function).into_iter().map(entry).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&obj).unwrap());
             return Ok(());
         }
 
@@ -132,20 +129,16 @@ fn analyze_heapprofile(file: &str, args: &Args) -> Result<(), String> {
             .summarize(Some(args.top), args.filter.as_deref())
             .map_err(|e| e.to_string())?
     };
-
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "file": file,
-                "type": "heapprofile",
-                "totalSize": summary.total_size,
-                "byFrame": size_pairs(&summary.by_frame),
-                "byUrl": size_pairs(&summary.by_url),
-                "byFunction": size_pairs(&summary.by_function),
-            }))
-            .unwrap()
-        );
+        let obj = json!({
+            "file": file,
+            "type": "heapprofile",
+            "totalSize": summary.total_size,
+            "byFrame": size_pairs(&summary.by_frame),
+            "byUrl": size_pairs(&summary.by_url),
+            "byFunction": size_pairs(&summary.by_function),
+        });
+        println!("{}", serde_json::to_string_pretty(&obj).unwrap());
         return Ok(());
     }
 
@@ -258,6 +251,10 @@ fn analyze_heapsnapshot(file: &str, args: &Args) -> Result<(), String> {
         None
     };
 
+    let smaps = snapshot
+        .sourcemap_footprint(args.top)
+        .map_err(|e| e.to_string())?;
+
     if args.json {
         let mut obj = json!({
             "file": file,
@@ -270,6 +267,19 @@ fn analyze_heapsnapshot(file: &str, args: &Args) -> Result<(), String> {
             "byNodeName": sorted_names(&summary.by_node_name).into_iter().map(|(name, size, count)| json!({"name": name, "size": size, "count": count})).collect::<Vec<_>>(),
             "byNodeType": sorted_names(&summary.by_node_type).into_iter().map(|(name, size, count)| json!({"type": name, "size": size, "count": count})).collect::<Vec<_>>(),
         });
+        if smaps.bytes > 0 {
+            obj["sourceMaps"] = json!({
+                "bytes": smaps.bytes,
+                "count": smaps.count,
+                "sharePct": smaps.share_pct,
+                "mapJsonBytes": smaps.map_json_bytes,
+                "mapJsonCount": smaps.map_json_count,
+                "inlineUriBytes": smaps.inline_uri_bytes,
+                "inlineUriCount": smaps.inline_uri_count,
+                "commentBytes": smaps.comment_bytes,
+                "commentCount": smaps.comment_count,
+            });
+        }
         if let Some(r) = &retained {
             obj["retainedByNodeName"] = json!(sorted_names(&r.by_node_name)
                 .into_iter()
@@ -299,6 +309,7 @@ fn analyze_heapsnapshot(file: &str, args: &Args) -> Result<(), String> {
             .join(" | "),
         ),
     );
+    print_smaps_warning(&smaps, file);
 
     if let Some(r) = &retained {
         let mut rows: Vec<(String, usize, usize, usize, usize)> = Vec::new();
@@ -441,27 +452,23 @@ fn analyze_heaptimeline(file: &str, args: &Args) -> Result<(), String> {
     let growth = timeline.growth().map_err(|e| e.to_string())?;
 
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "file": file,
-                "type": "heaptimeline",
-                "nodeCount": meta.node_count,
-                "edgeCount": meta.edge_count,
-                "totalAllocated": summary.total_allocated,
-                "totalFreed": summary.total_freed,
-                "byType": sorted_types(&summary.by_type).into_iter().map(|(t, a, f, c)| json!({"type": t, "allocated": a, "freed": f, "count": c})).collect::<Vec<_>>(),
-                "names": names_json(&names),
-                "stacks": stacks_json(&stacks),
-                "growth": {
-                    "spanUs": growth.span_us,
-                    "objectsStart": growth.objects_start,
-                    "objectsEnd": growth.objects_end,
-                    "samples": growth.samples,
-                },
-            }))
-            .unwrap()
-        );
+        let obj = json!({
+            "file": file,
+            "type": "heaptimeline",
+            "nodeCount": meta.node_count,
+            "edgeCount": meta.edge_count,
+            "totalAllocated": summary.total_allocated,
+            "byType": sorted_types(&summary.by_type).into_iter().map(|(t, a, _f, c)| json!({"type": t, "allocated": a, "count": c})).collect::<Vec<_>>(),
+            "names": names_json(&names),
+            "stacks": stacks_json(&stacks),
+            "growth": {
+                "spanUs": growth.span_us,
+                "objectsStart": growth.objects_start,
+                "objectsEnd": growth.objects_end,
+                "samples": growth.samples,
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&obj).unwrap());
         return Ok(());
     }
 
@@ -663,11 +670,32 @@ fn stacks_json(stacks: &TimelineStacksResult) -> serde_json::Value {
         .collect::<Vec<_>>())
 }
 
+/// One warning line in text output when source-map data is a visible share
+/// of the heap — a build artifact, not app memory.
+fn print_smaps_warning(fp: &hprof_core::SourceMapFootprint, file: &str) {
+    if fp.bytes > 0 && fp.share_pct >= 1.0 {
+        println!(
+            "  {}",
+            yellow(&format!(
+                "⚠ source maps: {} ({:.1}% of heap) — dev artifact, not app memory · hprof smaps {file}",
+                format_bytes(fp.bytes),
+                fp.share_pct
+            ))
+        );
+    }
+}
+
 pub fn format_stack(stack: &[hprof_core::TimelineStackFrame]) -> String {
     stack
         .iter()
-        .map(|f| f.name.as_str())
-        .filter(|n| *n != "(root)" && !n.is_empty())
+        .filter(|f| f.name != "(root)" && !f.name.is_empty())
+        .map(|f| {
+            if !f.script.is_empty() {
+                format!("{} ({}:{})", f.name, f.script, f.line + 1)
+            } else {
+                f.name.clone()
+            }
+        })
         .collect::<Vec<_>>()
         .join(" <- ")
 }
