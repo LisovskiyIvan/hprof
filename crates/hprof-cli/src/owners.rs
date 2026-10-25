@@ -61,10 +61,14 @@ fn print_pair_diff(baseline_path: &str, profile_path: &str, b: &OwnerAnalysis, p
 
     // keep numeric deltas so the table sorts by real values, not formatted
     // strings; order by |self delta| desc, then |count delta|, then chain
+    let bmap: std::collections::HashMap<&str, &hprof_core::OwnerGroup> =
+        b.groups.iter().map(|g| (g.chain.as_str(), g)).collect();
+    let pmap: std::collections::HashMap<&str, &hprof_core::OwnerGroup> =
+        p.groups.iter().map(|g| (g.chain.as_str(), g)).collect();
     let mut data: Vec<(i64, i64, String)> = Vec::new();
     for k in &keys {
-        let bg = b.groups.iter().find(|g| &g.chain == *k);
-        let pg = p.groups.iter().find(|g| &g.chain == *k);
+        let bg = bmap.get(k.as_str()).copied();
+        let pg = pmap.get(k.as_str()).copied();
         let bself = bg.map(|g| g.self_size).unwrap_or(0);
         let pself = pg.map(|g| g.self_size).unwrap_or(0);
         let dself = pself as i64 - bself as i64;
@@ -166,11 +170,15 @@ pub fn run(files: &[String], args: &Args) -> Result<(), String> {
                     .collect();
                 keys.sort();
                 keys.dedup();
+                let bmap: std::collections::HashMap<&str, &hprof_core::OwnerGroup> =
+                    b.groups.iter().map(|g| (g.chain.as_str(), g)).collect();
+                let pmap: std::collections::HashMap<&str, &hprof_core::OwnerGroup> =
+                    p.groups.iter().map(|g| (g.chain.as_str(), g)).collect();
                 let entries = keys
                     .iter()
                     .filter_map(|k| {
-                        let bg = b.groups.iter().find(|g| &g.chain == *k);
-                        let pg = p.groups.iter().find(|g| &g.chain == *k);
+                        let bg = bmap.get(k.as_str()).copied();
+                        let pg = pmap.get(k.as_str()).copied();
                         let bself = bg.map(|g| g.self_size).unwrap_or(0);
                         let pself = pg.map(|g| g.self_size).unwrap_or(0);
                         let dself = pself as i64 - bself as i64;

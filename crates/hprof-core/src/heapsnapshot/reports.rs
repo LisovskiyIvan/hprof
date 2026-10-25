@@ -792,6 +792,18 @@ fn smap_category_name(cat: u8) -> &'static str {
     }
 }
 
+/// Exact lib-name membership for one raw (still JSON-escaped) string span:
+/// identical to `resolve(span)` + `SMAP_LIB_NAMES.contains(...)`, but only
+/// decodes spans that actually contain escapes.
+fn span_is_smap_lib(raw: &[u8]) -> bool {
+    if memchr::memchr(b'\\', raw).is_some() {
+        let dec = decode_json_string(raw);
+        SMAP_LIB_NAMES.contains(&dec.as_str())
+    } else {
+        SMAP_LIB_NAMES.iter().any(|n| n.as_bytes() == raw)
+    }
+}
+
 /// Classify one raw (still JSON-escaped) string span. Prefilters on
 /// quote-free cores with `memmem` over the whole span, then decodes once and
 /// applies the exact markers with precedence mapJson > inlineUri > comment.
@@ -844,18 +856,45 @@ impl HeapSnapshot {
         let raw = self.raw.as_ref().unwrap();
         let heap_total_size = self.raw_summary.as_ref().unwrap().total_size;
 
-        // 1. per-string category over ALL spans, in parallel.
+        // 1. per-string category + lib-name flag over ALL spans, in parallel.
+        // One fused pass; the node sweep below only runs when something
+        // matched, so heaps without source-map data pay just this scan.
         let (sbase, spans_guard) = raw.strings.all_spans(&raw.mmap);
         let spans: &[(u32, u32)] = &spans_guard;
         let mmap_bytes = &raw.mmap[..];
-        let cats: Vec<u8> = (0..spans.len())
+        let marks: Vec<(u8, bool)> = (0..spans.len())
             .into_par_iter()
             .map(|idx| {
                 let (s, e) = spans[idx];
-                classify_sourcemap_str(&mmap_bytes[sbase + s as usize..sbase + e as usize])
+                let raw_slice = &mmap_bytes[sbase + s as usize..sbase + e as usize];
+                (
+                    classify_sourcemap_str(raw_slice),
+                    span_is_smap_lib(raw_slice),
+                )
             })
             .collect();
         drop(spans_guard);
+
+        let any_cat = marks.iter().any(|&(cat, _)| cat != SMAP_NONE);
+        let any_lib = marks.iter().any(|&(_, is_lib)| is_lib);
+        if !any_cat && !any_lib {
+            // Zero result: exactly what the sweep below would produce when
+            // no span matches (all counters 0, empty tables).
+            return Ok(SourceMapFootprint {
+                heap_total_size,
+                bytes: 0,
+                count: 0,
+                share_pct: 0.0,
+                map_json_bytes: 0,
+                map_json_count: 0,
+                inline_uri_bytes: 0,
+                inline_uri_count: 0,
+                comment_bytes: 0,
+                comment_count: 0,
+                lib_objects: Vec::new(),
+                top_strings: Vec::new(),
+            });
+        }
 
         let string_type = raw
             .node_types
@@ -868,23 +907,26 @@ impl HeapSnapshot {
         let mut per_string: HashMap<u32, (usize, usize)> = HashMap::new();
         let mut lib: HashMap<String, (usize, usize)> = HashMap::new();
 
-        // 2-3. single pass over node columns.
+        // 2-3. single pass over node columns; only lib-candidate names are
+        // resolved (every other node skips the string decode entirely).
         for n in 0..raw.meta.node_count {
             let size = col.self_sizes[n] as usize;
             let name_idx = col.names[n];
+            let (cat, is_lib) = marks
+                .get(name_idx as usize)
+                .copied()
+                .unwrap_or((SMAP_NONE, false));
             if col.types[n] as usize == string_type {
-                if let Some(&cat) = cats.get(name_idx as usize) {
-                    if cat != SMAP_NONE {
-                        cat_bytes[cat as usize] += size;
-                        cat_counts[cat as usize] += 1;
-                        let e = per_string.entry(name_idx).or_insert((0, 0));
-                        e.0 += size;
-                        e.1 += 1;
-                    }
+                if cat != SMAP_NONE {
+                    cat_bytes[cat as usize] += size;
+                    cat_counts[cat as usize] += 1;
+                    let e = per_string.entry(name_idx).or_insert((0, 0));
+                    e.0 += size;
+                    e.1 += 1;
                 }
             }
-            if let Some(name) = raw.strings.resolve(&raw.mmap, name_idx as usize) {
-                if SMAP_LIB_NAMES.contains(&name.as_str()) {
+            if is_lib {
+                if let Some(name) = raw.strings.resolve(&raw.mmap, name_idx as usize) {
                     let e = lib.entry(name).or_insert((0, 0));
                     e.0 += 1;
                     e.1 += size;
@@ -925,7 +967,7 @@ impl HeapSnapshot {
                 SourceMapStringEntry {
                     size,
                     count,
-                    category: smap_category_name(cats[idx as usize]).to_string(),
+                    category: smap_category_name(marks[idx as usize].0).to_string(),
                     preview: smap_preview(&decoded),
                 }
             })
