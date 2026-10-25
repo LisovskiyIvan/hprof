@@ -2,7 +2,7 @@ use ahash::AHashMap;
 use memchr::{memchr, memchr2};
 use memmap2::Mmap;
 
-use super::parser::rfind_marker;
+use super::parser::{find_marker, rfind_marker};
 
 pub(crate) const MEMO_MAX_STRING_BYTES: usize = 64 * 1024;
 pub(crate) const MEMO_MAX_ENTRIES: usize = 32 * 1024;
@@ -33,7 +33,14 @@ impl StringScanState {
             let data = &mmap[..];
             let limit = self.search_from.min(data.len());
             let marker = b"\"strings\":[";
-            if let Some(pos) = rfind_marker(&data[..limit], marker) {
+            // The strings section sits after the nodes array in V8 output, so
+            // scan forward from `search_from` first and only then fall back to
+            // a whole-file search (older writers may place it elsewhere).
+            if let Some(pos) = rfind_marker(&data[limit..], marker) {
+                let s = limit + pos + marker.len();
+                self.start = s;
+                self.cursor = s;
+            } else if let Some(pos) = find_marker(data, marker) {
                 let s = pos + marker.len();
                 self.start = s;
                 self.cursor = s;
