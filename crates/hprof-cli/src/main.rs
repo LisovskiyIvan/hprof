@@ -20,8 +20,8 @@ mod owners;
 mod props;
 mod retainers;
 mod session;
-mod smaps;
 mod sizes;
+mod smaps;
 mod strings;
 mod suspects;
 mod top;
@@ -882,12 +882,11 @@ fn main() -> ExitCode {
             | Command::Strings
             | Command::Smaps
             | Command::Suspects
-            | Command::List
             | Command::Inspect
             | Command::Find
             | Command::Props
             | Command::Retainers => Some("heapsnapshot"),
-            Command::Calltree => Some("heapprofile"),
+            Command::Calltree | Command::List => Some("heapprofile"),
             _ => None,
         };
         if let Some(exp) = expected {
