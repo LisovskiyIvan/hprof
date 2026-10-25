@@ -81,7 +81,8 @@ impl HeapProfile {
     pub fn flatten(&mut self) -> crate::Result<Vec<FlatCallFrame>> {
         let data = self.data_arc()?;
         let mut result = Vec::new();
-        walk_flatten(&data.head, &[], &mut result);
+        let mut stack = Vec::with_capacity(64);
+        walk_flatten(&data.head, &mut stack, &mut result);
         Ok(result)
     }
 
@@ -529,27 +530,30 @@ fn compute_cumulative_summary(
                 };
                 let path_has_match = has_focus_match_in_path || node_matches_focus;
 
-                path_frames.push(frame_label.clone());
-                path_urls.push(url.clone());
-                path_fns.push(fn_name.clone());
+                path_frames.push(frame_label);
+                path_urls.push(url);
+                path_fns.push(fn_name);
+                // Borrow the just-pushed path entries instead of keeping
+                // parallel owned copies: map keys are cloned only on insert.
+                let frame_label = path_frames.last().unwrap().as_str();
+                let url = path_urls.last().unwrap().as_str();
+                let fn_name = path_fns.last().unwrap().as_str();
 
                 let self_size = node.self_size;
                 if self_size > 0 && (focus_re.is_none() || path_has_match) {
                     let leaf_ignored = ignore_re
                         .as_ref()
                         .map(|re| {
-                            re.is_match(&frame_label) || re.is_match(&url) || re.is_match(&fn_name)
+                            re.is_match(frame_label) || re.is_match(url) || re.is_match(fn_name)
                         })
                         .unwrap_or(false);
 
                     total_size += self_size;
                     if !leaf_ignored {
-                        *self_frame.entry(frame_label).or_insert(0) += self_size;
-                        *self_url.entry(url).or_insert(0) += self_size;
-                        *self_fn.entry(fn_name).or_insert(0) += self_size;
-                        *count_frame
-                            .entry(path_frames.last().unwrap().clone())
-                            .or_insert(0) += 1;
+                        bump(&mut self_frame, frame_label, self_size);
+                        bump(&mut self_url, url, self_size);
+                        bump(&mut self_fn, fn_name, self_size);
+                        bump(&mut count_frame, frame_label, 1);
                     }
 
                     // Cumulative: each unique frame/url/fn on the path gets self_size once
@@ -557,19 +561,19 @@ fn compute_cumulative_summary(
                         std::collections::HashSet::with_capacity(path_frames.len());
                     for f in &path_frames {
                         if seen.insert(f.as_str()) {
-                            *cum_frame.entry(f.clone()).or_insert(0) += self_size;
+                            bump(&mut cum_frame, f.as_str(), self_size);
                         }
                     }
                     seen.clear();
                     for u in &path_urls {
                         if seen.insert(u.as_str()) {
-                            *cum_url.entry(u.clone()).or_insert(0) += self_size;
+                            bump(&mut cum_url, u.as_str(), self_size);
                         }
                     }
                     seen.clear();
                     for f in &path_fns {
                         if seen.insert(f.as_str()) {
-                            *cum_fn.entry(f.clone()).or_insert(0) += self_size;
+                            bump(&mut cum_fn, f.as_str(), self_size);
                         }
                     }
                 }
@@ -593,12 +597,24 @@ fn compute_cumulative_summary(
     })
 }
 
-fn walk_flatten(node: &HeapProfileNode, stack: &[String], result: &mut Vec<FlatCallFrame>) {
+/// `map[key] += by` without cloning `key` when it is already present.
+#[inline]
+fn bump(map: &mut HashMap<String, usize>, key: &str, by: usize) {
+    match map.get_mut(key) {
+        Some(v) => *v += by,
+        None => {
+            map.insert(key.to_string(), by);
+        }
+    }
+}
+
+fn walk_flatten(node: &HeapProfileNode, stack: &mut Vec<String>, result: &mut Vec<FlatCallFrame>) {
     let fn_name = fn_name_of(node);
     let url = url_of(node);
     let frame = frame_label(&node.call_frame);
-    let mut next_stack = stack.to_vec();
-    next_stack.push(frame);
+    // One mutable path stack shared by the whole walk: the path is cloned
+    // only for emitted leaves instead of on every tree node.
+    stack.push(frame);
 
     if node.self_size > 0 {
         result.push(FlatCallFrame {
@@ -607,13 +623,14 @@ fn walk_flatten(node: &HeapProfileNode, stack: &[String], result: &mut Vec<FlatC
             line_number: node.call_frame.line_number,
             column_number: node.call_frame.column_number,
             self_size: node.self_size,
-            stack: next_stack.clone(),
+            stack: stack.clone(),
         });
     }
 
     for child in &node.children {
-        walk_flatten(child, &next_stack, result);
+        walk_flatten(child, stack, result);
     }
+    stack.pop();
 }
 
 /// Recursive flamegraph builder. Returns None when the entire sub-tree is

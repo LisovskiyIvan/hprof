@@ -112,36 +112,48 @@ impl HeapSnapshot {
         }
 
         let reachable = rd.vertex.len();
-        let mut dist = vec![u32::MAX; reachable];
-        let mut parent = vec![u32::MAX; reachable];
+        // Single BFS-tree array: `next[w] = u` means the root→target path
+        // continues from `w` to `u`; `u32::MAX` marks unvisited. Depth is
+        // tracked level-wise so no dense `dist` array is needed (saves
+        // 4 bytes x reachable transient per query).
+        let mut next = vec![u32::MAX; reachable];
         let mut queue: std::collections::VecDeque<u32> =
             std::collections::VecDeque::with_capacity(1024);
 
-        dist[target_pre as usize] = 0;
+        next[target_pre as usize] = target_pre;
         queue.push_back(target_pre);
         let mut found = false;
+        let mut depth = 0usize;
 
         let rev_starts = rd.rev_starts.as_slice();
         let rev_sources = rd.rev_sources.as_slice();
 
-        while let Some(w) = queue.pop_front() {
-            let d = dist[w as usize];
-            if w == 0 {
-                found = true;
-                break;
-            }
-            if d as usize >= max_depth {
-                continue;
-            }
-            let s_start = rev_starts[w as usize] as usize;
-            let s_end = rev_starts[w as usize + 1] as usize;
-            for &u in &rev_sources[s_start..s_end] {
-                if dist[u as usize] == u32::MAX {
-                    dist[u as usize] = d + 1;
-                    parent[u as usize] = w;
-                    queue.push_back(u);
+        while !queue.is_empty() {
+            let level_len = queue.len();
+            let mut reached_root = false;
+            for _ in 0..level_len {
+                let w = queue.pop_front().unwrap();
+                if w == 0 {
+                    found = true;
+                    reached_root = true;
+                    break;
+                }
+                if depth >= max_depth {
+                    continue;
+                }
+                let s_start = rev_starts[w as usize] as usize;
+                let s_end = rev_starts[w as usize + 1] as usize;
+                for &u in &rev_sources[s_start..s_end] {
+                    if next[u as usize] == u32::MAX {
+                        next[u as usize] = w;
+                        queue.push_back(u);
+                    }
                 }
             }
+            if reached_root {
+                break;
+            }
+            depth += 1;
         }
 
         if !found {
@@ -155,7 +167,7 @@ impl HeapSnapshot {
         let mut pres: Vec<usize> = vec![0usize];
         let mut cur = 0usize;
         while cur != target_pre as usize {
-            cur = parent[cur] as usize;
+            cur = next[cur] as usize;
             pres.push(cur);
         }
 

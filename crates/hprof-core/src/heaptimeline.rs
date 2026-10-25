@@ -654,7 +654,6 @@ impl HeapTimeline {
         let top = top.unwrap_or(30);
         let _ = self.data()?;
 
-        let mut stack_memo: HashMap<usize, Vec<TimelineStackFrame>> = HashMap::new();
         let mut agg: HashMap<Vec<TimelineStackFrame>, (u64, u64)> = HashMap::new();
         let node_count = self.data.as_ref().map(|d| d.trace_nodes.len()).unwrap_or(0);
         for ti in 0..node_count {
@@ -666,14 +665,9 @@ impl HeapTimeline {
             if count == 0 {
                 continue;
             }
-            let frames = match stack_memo.get(&ti) {
-                Some(f) => f.clone(),
-                None => {
-                    let f = stack_frames(self.data.as_ref().unwrap(), ti);
-                    stack_memo.insert(ti, f.clone());
-                    f
-                }
-            };
+            // Each trace node is visited exactly once, so the stack is built
+            // once per node and moved straight into the aggregation.
+            let frames = stack_frames(self.data.as_ref().unwrap(), ti);
             if let Some(re) = &filter_re {
                 if !frames.iter().any(|f| re.is_match(&f.name)) {
                     continue;
