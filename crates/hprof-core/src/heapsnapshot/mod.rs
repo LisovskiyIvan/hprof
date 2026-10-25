@@ -339,6 +339,22 @@ impl HeapSnapshot {
             }
         };
 
+        // Node records are fully parsed into the column vectors at this point;
+        // drop the mmapped node bytes from RSS (advisory — a later re-read
+        // would simply re-fault them).
+        #[cfg(unix)]
+        {
+            // SAFETY: read-only mapping, never written — the discarded pages
+            // are clean file-backed pages that re-fault from the file.
+            unsafe {
+                let _ = mmap.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    nodes_open,
+                    nodes_end + 1 - nodes_open,
+                );
+            }
+        }
+
         let strings_table = if data.len() < (16 << 20) {
             let search_from = (nodes_end + 1).min(data.len());
             let strings_start = rfind_marker(&data[search_from..], strings_marker)

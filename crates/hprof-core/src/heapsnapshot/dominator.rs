@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use ahash::AHashMap;
 use rayon::prelude::*;
 
+use super::parser::{edge_adj_streaming, parse_numbers_par};
 use super::strings::raw_string_matches;
 use super::HeapSnapshot;
 use crate::types::*;
@@ -32,20 +33,66 @@ impl HeapSnapshot {
             return Ok(());
         }
         self.ensure_raw()?;
-        self.ensure_edges()?;
         self.ensure_edge_starts();
-        let raw = self.raw.as_ref().unwrap();
+        let (eb_start, eb_end) = self.locate_edges_range()?;
+        let node_count;
+        // Transient forward adjacency: one `to_nodes` column per edge record
+        // (`u32::MAX` marks weak edges, which dominators ignore). The edge
+        // columns (`types`, sync offsets) are never materialized here — the
+        // whole pass runs off this single column and drops it before the LT
+        // phase, so retained-only commands never pay for edge columns.
+        let adj = {
+            let raw = self.raw.as_ref().unwrap();
+            node_count = raw.meta.node_count;
+            let weak_edge_type = raw
+                .edge_types
+                .iter()
+                .position(|t| t == "weak")
+                .map(|idx| idx as u8)
+                .unwrap_or(u8::MAX);
+            let efc = raw.edge_field_count;
+            let nfc = raw.node_field_count as u32;
+            let edges_bytes = &raw.mmap[eb_start..=eb_end];
+            match edge_adj_streaming(edges_bytes, efc, nfc, &raw.edge_offsets, weak_edge_type) {
+                Some(adj) => adj,
+                None => {
+                    // Misaligned input: sweep the flat numbers instead.
+                    let flat = parse_numbers_par(edges_bytes);
+                    let type_off = raw.edge_offsets.type_;
+                    let to_off = raw.edge_offsets.to_node;
+                    let nfc_div = nfc.max(1);
+                    let efc_step = efc.max(1);
+                    flat.chunks(efc_step)
+                        .map(|r| {
+                            if r.get(type_off).copied().unwrap_or(0) as u8 == weak_edge_type {
+                                u32::MAX
+                            } else {
+                                r.get(to_off).copied().unwrap_or(0) / nfc_div
+                            }
+                        })
+                        .collect()
+                }
+            }
+        };
+        // The edge bytes are now parsed into `adj`; drop their resident pages
+        // before the DFS/rev/LT phases — the mmapped edge array is the single
+        // biggest RSS item on large dumps. Later edge-name lookups re-fault
+        // only the few pages they touch.
+        #[cfg(unix)]
+        {
+            let raw = self.raw.as_ref().unwrap();
+            // SAFETY: the mapping is read-only and never written, so every
+            // page in the range is a clean file-backed page; DONTNEED only
+            // discards them and later reads re-fault from the file.
+            unsafe {
+                let _ = raw.mmap.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    eb_start,
+                    eb_end + 1 - eb_start,
+                );
+            }
+        }
         let edge_starts = self.edge_starts.as_ref().unwrap();
-        let node_count = raw.meta.node_count;
-        let weak_edge_type = raw
-            .edge_types
-            .iter()
-            .position(|t| t == "weak")
-            .map(|idx| idx as u8)
-            .unwrap_or(u8::MAX);
-        let edges = raw.edges.as_ref().unwrap();
-        let edge_types = edges.types.as_slice();
-        let edge_to_nodes = edges.to_nodes.as_slice();
 
         // Iterative DFS from root (node 0), assigning preorder numbers.
         // Instead of a 67MB `next_edge: Vec<u32>`, each active stack frame holds
@@ -69,23 +116,22 @@ impl HeapSnapshot {
             let end = end_e as usize;
             let mut descended = false;
             while e < end {
-                if edge_types[e] == weak_edge_type {
-                    e += 1;
-                    continue;
-                }
-                let to_node = edge_to_nodes[e] as usize;
-                if to_node < node_count && preorder[to_node] == u32::MAX {
-                    pre += 1;
-                    preorder[to_node] = pre;
-                    vertex.push(to_node as u32);
-                    dfs_parent.push(v_pre);
-                    let to_start = edge_starts[to_node];
-                    let to_end = edge_starts[to_node + 1];
-                    if to_start < to_end {
-                        *next_e = (e + 1) as u32;
-                        stack.push((pre, to_start, to_end));
-                        descended = true;
-                        break;
+                let to = adj[e];
+                if to != u32::MAX {
+                    let to_node = to as usize;
+                    if to_node < node_count && preorder[to_node] == u32::MAX {
+                        pre += 1;
+                        preorder[to_node] = pre;
+                        vertex.push(to_node as u32);
+                        dfs_parent.push(v_pre);
+                        let to_start = edge_starts[to_node];
+                        let to_end = edge_starts[to_node + 1];
+                        if to_start < to_end {
+                            *next_e = (e + 1) as u32;
+                            stack.push((pre, to_start, to_end));
+                            descended = true;
+                            break;
+                        }
                     }
                 }
                 e += 1;
@@ -105,10 +151,11 @@ impl HeapSnapshot {
             let start = edge_starts[n] as usize;
             let end = edge_starts[n + 1] as usize;
             for edge_index in start..end {
-                if edge_types[edge_index] == weak_edge_type {
+                let to = adj[edge_index];
+                if to == u32::MAX {
                     continue;
                 }
-                let to_node = edge_to_nodes[edge_index] as usize;
+                let to_node = to as usize;
                 if to_node < node_count {
                     let w = preorder[to_node];
                     if w != u32::MAX {
@@ -127,10 +174,11 @@ impl HeapSnapshot {
             let start = edge_starts[n] as usize;
             let end = edge_starts[n + 1] as usize;
             for edge_index in start..end {
-                if edge_types[edge_index] == weak_edge_type {
+                let to = adj[edge_index];
+                if to == u32::MAX {
                     continue;
                 }
-                let to_node = edge_to_nodes[edge_index] as usize;
+                let to_node = to as usize;
                 if to_node < node_count {
                     let w = preorder[to_node];
                     if w != u32::MAX {
@@ -145,6 +193,7 @@ impl HeapSnapshot {
             rev_starts[i] = rev_starts[i - 1];
         }
         rev_starts[0] = 0;
+        drop(adj);
 
         // Lengauer–Tarjan dominators in preorder space.
         // Memory optimizations:
@@ -277,6 +326,7 @@ impl HeapSnapshot {
         drop(idom_pre);
 
         let mut retained = vec![0.0f64; node_count];
+        let raw = self.raw.as_ref().unwrap();
         for &node in &vertex {
             retained[node as usize] = raw.nodes.self_sizes[node as usize] as f64;
         }

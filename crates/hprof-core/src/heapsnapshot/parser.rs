@@ -531,6 +531,88 @@ pub fn node_columns_streaming(
     })
 }
 
+/// Stream the flat edge array into a single `to_nodes` adjacency column
+/// (`u32::MAX` marks weak edges, which dominator analysis ignores) without
+/// materializing `types`, `name_or_index` or sync offsets. Indexed by global
+/// edge record, so per-node ranges come from `edge_starts`.
+pub fn edge_adj_streaming(
+    data: &[u8],
+    efc: usize,
+    nfc: u32,
+    offsets: &EdgeFieldOffsets,
+    weak_type: u8,
+) -> Option<Vec<u32>> {
+    let chunks = aligned_record_chunks_par(data, efc)?;
+    let total_recs = chunks.last().map(|c| c.3).unwrap_or(0);
+    if total_recs == 0 {
+        return None;
+    }
+
+    let mut to_nodes = vec![0u32; total_recs];
+    let mut tasks: Vec<(usize, usize, usize, &mut [u32])> = Vec::with_capacity(chunks.len());
+    let mut rem_to = to_nodes.as_mut_slice();
+    for &(bs, be, rs, re) in &chunks {
+        let len = re - rs;
+        let (to_head, to_tail) = rem_to.split_at_mut(len);
+        rem_to = to_tail;
+        tasks.push((bs, be, rs, to_head));
+    }
+
+    let type_off = offsets.type_;
+    let to_off = offsets.to_node;
+    let nfc_div = nfc.max(1);
+
+    let ok = tasks.into_par_iter().all(|(bs, be, _rs, out_to)| {
+        let slice = &data[bs..be];
+        let expected_recs = out_to.len();
+        let mut i = 0usize;
+        let len = slice.len();
+        let mut rec = [0u32; 8];
+        if efc > rec.len() {
+            return false;
+        }
+        let mut field = 0usize;
+        let mut out_i = 0usize;
+        while i < len {
+            let ch = slice[i];
+            if ch == b']' {
+                break;
+            }
+            if ch.is_ascii_digit() {
+                if out_i == expected_recs {
+                    return false;
+                }
+                let mut val = (ch - b'0') as u32;
+                i += 1;
+                while i < len && slice[i].is_ascii_digit() {
+                    val = val * 10 + (slice[i] - b'0') as u32;
+                    i += 1;
+                }
+                rec[field] = val;
+                field += 1;
+                if field == efc {
+                    field = 0;
+                    out_to[out_i] = if rec[type_off] as u8 == weak_type {
+                        u32::MAX
+                    } else {
+                        rec[to_off] / nfc_div
+                    };
+                    out_i += 1;
+                }
+                continue;
+            }
+            i += 1;
+        }
+        out_i == expected_recs && field == 0
+    });
+
+    if !ok {
+        return None;
+    }
+
+    Some(to_nodes)
+}
+
 /// Stream the flat edge array directly into pre-allocated `EdgeColumns`
 /// (`types: Vec<u8>`, `to_nodes: Vec<u32>`, and `sync_offsets` every 1,024
 /// edges) without materializing `name_or_index` or a flat `Vec<u32>`.
