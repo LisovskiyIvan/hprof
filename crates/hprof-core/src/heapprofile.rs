@@ -178,8 +178,14 @@ impl HeapProfile {
             .as_ref()
             .and_then(|s| regex::Regex::new(s).ok());
 
+        let subtree_hits = focus_re.as_ref().map(|re| {
+            let mut hits = std::collections::HashSet::new();
+            collect_subtree_matches(&data.head, re, &mut hits);
+            hits
+        });
+
         Ok(
-            build_flame_frame(&data.head, focus_re.as_ref(), hide_re.as_ref()).unwrap_or(
+            build_flame_frame(&data.head, subtree_hits.as_ref(), hide_re.as_ref()).unwrap_or(
                 FlamegraphFrame {
                     name: "root".to_string(),
                     self_size: 0,
@@ -637,12 +643,14 @@ fn walk_flatten(node: &HeapProfileNode, stack: &mut Vec<String>, result: &mut Ve
 /// empty (after focus/hide filtering).
 fn build_flame_frame(
     node: &HeapProfileNode,
-    focus_re: Option<&regex::Regex>,
+    subtree_hits: Option<&std::collections::HashSet<usize>>,
     hide_re: Option<&regex::Regex>,
 ) -> Option<FlamegraphFrame> {
     // Focus: skip if neither this node nor any descendant matches.
-    if let Some(re) = focus_re {
-        if !subtree_contains_match(node, re) {
+    // Membership comes from the precomputed `collect_subtree_matches` set —
+    // re-scanning the subtree per node was O(n^2) on focused builds.
+    if let Some(hits) = subtree_hits {
+        if !hits.contains(&(node as *const HeapProfileNode as usize)) {
             return None;
         }
     }
@@ -664,7 +672,7 @@ fn build_flame_frame(
         let results: Vec<Option<FlamegraphFrame>> = node
             .children
             .par_iter()
-            .map(|c| build_flame_frame(c, focus_re, hide_re))
+            .map(|c| build_flame_frame(c, subtree_hits, hide_re))
             .collect();
         for cf in results.into_iter().flatten() {
             if is_hidden {
@@ -676,7 +684,7 @@ fn build_flame_frame(
         }
     } else {
         for child in &node.children {
-            if let Some(cf) = build_flame_frame(child, focus_re, hide_re) {
+            if let Some(cf) = build_flame_frame(child, subtree_hits, hide_re) {
                 if is_hidden {
                     self_size += cf.self_size;
                     children.extend(cf.children);
@@ -706,18 +714,24 @@ fn matches(node: &HeapProfileNode, re: &regex::Regex) -> bool {
         || re.is_match(&frame_label(&node.call_frame))
 }
 
-fn subtree_contains_match(node: &HeapProfileNode, re: &regex::Regex) -> bool {
-    if matches(node, re) {
-        return true;
+/// One post-order pass marking every node whose subtree contains a focus
+/// match. The flame builder then answers "does this subtree match?" with a
+/// set lookup instead of re-scanning the subtree at every node.
+fn collect_subtree_matches(
+    node: &HeapProfileNode,
+    re: &regex::Regex,
+    out: &mut std::collections::HashSet<usize>,
+) -> bool {
+    let mut hit = matches(node, re);
+    for child in &node.children {
+        if collect_subtree_matches(child, re, out) {
+            hit = true;
+        }
     }
-    // Use rayon for wide trees.
-    if node.children.len() >= 16 {
-        node.children
-            .par_iter()
-            .any(|c| subtree_contains_match(c, re))
-    } else {
-        node.children.iter().any(|c| subtree_contains_match(c, re))
+    if hit {
+        out.insert(node as *const HeapProfileNode as usize);
     }
+    hit
 }
 
 fn walk_collect(
