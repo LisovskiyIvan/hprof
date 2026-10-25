@@ -881,7 +881,11 @@ impl HeapSnapshot {
                     children: Vec::new(),
                 })
                 .collect();
-            type_children.sort_by(|a, b| b.total_size.cmp(&a.total_size));
+            type_children.sort_by(|a, b| {
+                b.total_size
+                    .cmp(&a.total_size)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
 
             let type_total: usize = type_children.iter().map(|c| c.total_size).sum();
             children.push(FlamegraphFrame {
@@ -892,7 +896,11 @@ impl HeapSnapshot {
             });
         }
 
-        children.sort_by(|a, b| b.total_size.cmp(&a.total_size));
+        children.sort_by(|a, b| {
+            b.total_size
+                .cmp(&a.total_size)
+                .then_with(|| a.name.cmp(&b.name))
+        });
 
         Ok(FlamegraphFrame {
             name: "Heap".to_string(),
@@ -925,7 +933,7 @@ impl HeapSnapshot {
             };
             type_nodes.push(type_node);
         }
-        type_nodes.sort_by(|a, b| b.size.cmp(&a.size));
+        type_nodes.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
 
         let mut all_names = TreemapNode {
             name: "all".to_string(),
@@ -941,7 +949,7 @@ impl HeapSnapshot {
                 children: Vec::new(),
             })
             .collect();
-        name_nodes.sort_by(|a, b| b.size.cmp(&a.size));
+        name_nodes.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
         all_names.children = name_nodes;
         all_names.size = all_names.children.iter().map(|c| c.size).sum();
 
@@ -1076,7 +1084,7 @@ fn slice_summary(
         names[..top].sort_unstable_by(cmp);
         names.truncate(top);
     } else {
-        names.sort_by(|a, b| b.1.size.cmp(&a.1.size));
+        names.sort_by(|a, b| b.1.size.cmp(&a.1.size).then_with(|| a.0.cmp(&b.0)));
         if top != usize::MAX {
             names.truncate(top);
         }

@@ -215,7 +215,7 @@ impl HeapProfile {
 
         // Sort by size desc, keep top-N.
         let mut sorted_nodes: Vec<(String, usize)> = node_sizes.into_iter().collect();
-        sorted_nodes.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted_nodes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         if let Some(ref kept_set) = kept {
             sorted_nodes.retain(|(k, _)| kept_set.contains(k));
         }
@@ -250,7 +250,7 @@ impl HeapProfile {
 
         // Sort edges by weight desc; keep up to 4x top.
         let mut sorted_edges: Vec<((String, String), usize)> = edges.into_iter().collect();
-        sorted_edges.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted_edges.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let edge_cap = top.saturating_mul(4);
         for ((from, to), w) in sorted_edges.iter().take(edge_cap) {
             if !kept_names.contains(from) || !kept_names.contains(to) {
@@ -292,7 +292,7 @@ impl HeapProfile {
         };
 
         let mut hosts: Vec<(String, TreemapAccum)> = by_host.into_iter().collect();
-        hosts.sort_by(|a, b| b.1.size.cmp(&a.1.size));
+        hosts.sort_by(|a, b| b.1.size.cmp(&a.1.size).then_with(|| a.0.cmp(&b.0)));
         for (host, accum) in hosts {
             let mut host_node = TreemapNode {
                 name: host,
@@ -300,7 +300,7 @@ impl HeapProfile {
                 children: Vec::new(),
             };
             let mut fns: Vec<(String, usize)> = accum.fns.into_iter().collect();
-            fns.sort_by(|a, b| b.1.cmp(&a.1));
+            fns.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             for (fn_key, size) in fns {
                 host_node.children.push(TreemapNode {
                     name: fn_key,
@@ -430,7 +430,7 @@ fn slice_flat_summary(
             })
             .map(|(k, v)| (k.clone(), *v))
             .collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         if top != usize::MAX {
             v.truncate(top);
         }
@@ -858,7 +858,12 @@ fn diff_maps(
         })
         .collect();
 
-    entries.sort_by(|a, b| b.delta.abs().cmp(&a.delta.abs()));
+    entries.sort_by(|a, b| {
+        b.delta
+            .abs()
+            .cmp(&a.delta.abs())
+            .then_with(|| a.name.cmp(&b.name))
+    });
     entries
 }
 

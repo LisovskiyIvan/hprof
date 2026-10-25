@@ -267,6 +267,11 @@ pub(crate) fn diff_snapshot_maps(
             }
         })
         .collect();
-    entries.sort_by(|a, b| b.delta.abs().cmp(&a.delta.abs()));
+    entries.sort_by(|a, b| {
+        b.delta
+            .abs()
+            .cmp(&a.delta.abs())
+            .then_with(|| a.name.cmp(&b.name))
+    });
     entries
 }

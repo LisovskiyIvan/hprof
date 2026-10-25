@@ -225,7 +225,7 @@ impl SizeOf for usize {
 
 fn size_pairs(map: &HashMap<String, usize>) -> Vec<(String, usize)> {
     let mut v: Vec<(String, usize)> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     v
 }
 
@@ -324,7 +324,7 @@ fn analyze_heapsnapshot(file: &str, args: &Args) -> Result<(), String> {
                 rows.push((name, 0, 0, size, count));
             }
         }
-        rows.sort_by(|a, b| b.3.cmp(&a.3));
+        rows.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
         print_table(
             &["SELF", "SELF%", "RETAINED", "RET%", "COUNT", "NAME"],
             &rows
@@ -355,7 +355,7 @@ fn analyze_heapsnapshot(file: &str, args: &Args) -> Result<(), String> {
                 type_rows.push((name, 0, 0, size, count));
             }
         }
-        type_rows.sort_by(|a, b| b.3.cmp(&a.3));
+        type_rows.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
         print_table(
             &["SELF", "SELF%", "RETAINED", "RET%", "COUNT", "TYPE"],
             &type_rows
@@ -428,7 +428,7 @@ fn sorted_names(map: &HashMap<String, hprof_core::TypeSummary>) -> Vec<(String, 
         .iter()
         .map(|(k, v)| (k.clone(), v.size, v.count))
         .collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     v
 }
 
@@ -641,7 +641,7 @@ fn sorted_types(
         .iter()
         .map(|(k, e)| (k.clone(), e.allocated, e.freed, e.count))
         .collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     v
 }
 

@@ -183,7 +183,13 @@ fn render(
         .iter()
         .map(|c| (c, info[&(c as *const HeapProfileNode)].0))
         .collect();
-    children.sort_by(|a, b| b.1.cmp(&a.1));
+    children.sort_by(|a, b| {
+        b.1.cmp(&a.1).then_with(|| {
+            a.0.call_frame
+                .function_name
+                .cmp(&b.0.call_frame.function_name)
+        })
+    });
     for (child, _) in children {
         if *rendered >= budget {
             return;

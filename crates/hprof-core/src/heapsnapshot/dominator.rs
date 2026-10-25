@@ -516,7 +516,7 @@ impl HeapSnapshot {
                 Some((type_name, TypeSummary { size, count }))
             })
             .collect();
-        types.sort_by(|a, b| b.1.size.cmp(&a.1.size));
+        types.sort_by(|a, b| b.1.size.cmp(&a.1.size).then_with(|| a.0.cmp(&b.0)));
         if top != usize::MAX {
             types.truncate(top);
         }

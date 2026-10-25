@@ -555,7 +555,11 @@ impl HeapTimeline {
             by_type.insert(type_name, info);
         }
         let mut sorted: Vec<_> = by_type.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.allocated.cmp(&a.1.allocated));
+        sorted.sort_by(|a, b| {
+            b.1.allocated
+                .cmp(&a.1.allocated)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         sorted.truncate(top);
         Ok(HeapTimelineSummary {
             total_allocated: data.total_allocated,
@@ -700,6 +704,16 @@ impl HeapTimeline {
             b.size
                 .cmp(&a.size)
                 .then_with(|| stack_signature(&a.stack).cmp(&stack_signature(&b.stack)))
+                .then_with(|| {
+                    a.stack
+                        .iter()
+                        .map(|f| (&f.name, &f.script, f.line, f.column))
+                        .cmp(
+                            b.stack
+                                .iter()
+                                .map(|f| (&f.name, &f.script, f.line, f.column)),
+                        )
+                })
         });
         entries.truncate(top);
         Ok(TimelineStacksResult {
@@ -728,7 +742,7 @@ impl HeapTimeline {
             *agg.entry(names).or_insert(0) += size as u64;
         }
         let mut entries: Vec<(Vec<String>, u64)> = agg.into_iter().collect();
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let mut out = String::with_capacity(entries.len() * 64);
         for (stack, size) in entries {
             out.push_str(&stack.join(";"));
@@ -812,6 +826,16 @@ impl HeapTimeline {
             b.size
                 .cmp(&a.size)
                 .then_with(|| stack_signature(&a.stack).cmp(&stack_signature(&b.stack)))
+                .then_with(|| {
+                    a.stack
+                        .iter()
+                        .map(|f| (&f.name, &f.script, f.line, f.column))
+                        .cmp(
+                            b.stack
+                                .iter()
+                                .map(|f| (&f.name, &f.script, f.line, f.column)),
+                        )
+                })
         });
         entries.truncate(top);
         Ok(TimelineNameStacksResult {
@@ -852,7 +876,7 @@ impl HeapTimeline {
         }
         let mut sorted: Vec<(u32, u64, u64)> =
             agg.into_iter().map(|(k, (s, c))| (k, s, c)).collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let mut out = Vec::new();
         for (name_idx, size, count) in sorted {
             let name = self.resolve_string(name_idx);

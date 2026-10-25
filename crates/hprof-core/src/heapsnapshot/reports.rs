@@ -506,7 +506,12 @@ impl HeapSnapshot {
             });
         }
 
-        suspects.sort_unstable_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+        suspects.sort_unstable_by(|a, b| {
+            b.size_bytes
+                .cmp(&a.size_bytes)
+                .then_with(|| a.node_name.cmp(&b.node_name))
+                .then_with(|| a.node_index.cmp(&b.node_index))
+        });
         if limit > 0 && suspects.len() > limit {
             suspects.truncate(limit);
         }
@@ -599,7 +604,11 @@ impl HeapSnapshot {
         }
 
         let col = &raw.nodes;
-        buffer_indices.sort_unstable_by(|&a, &b| col.self_sizes[b].cmp(&col.self_sizes[a]));
+        buffer_indices.sort_unstable_by(|&a, &b| {
+            col.self_sizes[b]
+                .cmp(&col.self_sizes[a])
+                .then_with(|| a.cmp(&b))
+        });
 
         let total_count = buffer_indices.len();
         if limit > 0 && buffer_indices.len() > limit {
@@ -689,6 +698,7 @@ impl HeapSnapshot {
             raw.nodes.self_sizes[b]
                 .cmp(&raw.nodes.self_sizes[a])
                 .then_with(|| raw.nodes.edge_counts[b].cmp(&raw.nodes.edge_counts[a]))
+                .then_with(|| a.cmp(&b))
         });
 
         if limit > 0 && closure_indices.len() > limit {
@@ -925,6 +935,7 @@ impl HeapSnapshot {
                 .cmp(&a.size)
                 .then_with(|| b.count.cmp(&a.count))
                 .then_with(|| a.preview.cmp(&b.preview))
+                .then_with(|| a.category.cmp(&b.category))
         });
         if top > 0 && top_strings.len() > top {
             top_strings.truncate(top);

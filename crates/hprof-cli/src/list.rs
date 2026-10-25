@@ -95,7 +95,7 @@ pub fn run(file: &str, type_name: &str, args: &Args) -> Result<(), String> {
     );
 
     let mut sorted_urls: Vec<(&String, &(usize, HashMap<i32, LineInfo>))> = by_url.iter().collect();
-    sorted_urls.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    sorted_urls.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(b.0)));
     for (url, g) in sorted_urls.iter().take(args.top) {
         println!();
         println!(
@@ -104,7 +104,7 @@ pub fn run(file: &str, type_name: &str, args: &Args) -> Result<(), String> {
             dim(&format!("({})", pct(g.0, total)))
         );
         let mut sorted_lines: Vec<(&i32, &LineInfo)> = g.1.iter().collect();
-        sorted_lines.sort_by(|a, b| b.1.size.cmp(&a.1.size));
+        sorted_lines.sort_by(|a, b| b.1.size.cmp(&a.1.size).then_with(|| a.0.cmp(b.0)));
         let rows: Vec<Vec<String>> = sorted_lines
             .iter()
             .take(10)
