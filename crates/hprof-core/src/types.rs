@@ -436,6 +436,16 @@ fn sniff_profile_type(path: &str) -> crate::Result<Option<&'static str>> {
     let has_snapshot = contains(&head, b"\"snapshot\":");
     let has_nodes = contains(&head, b"\"nodes\":[");
     if has_snapshot && has_nodes {
+        // Timeline node records carry `trace_node_id`; snapshot records carry
+        // `detachedness`. The meta block sits in the head, so this is reliable
+        // even for small files whose 1MB tail still contains trace-section
+        // markers (both formats have `trace_tree`).
+        if contains(&head, b"\"trace_node_id\"") {
+            return Ok(Some("heaptimeline"));
+        }
+        if contains(&head, b"\"detachedness\"") {
+            return Ok(Some("heapsnapshot"));
+        }
         let len = file.metadata()?.len();
         let tail_len = len.min(1024 * 1024) as usize;
         let mut tail = vec![0u8; tail_len];
